@@ -58,7 +58,7 @@ Three failure classes, each with its own mechanism:
 - The ATeam repo is `~/Documents/GitHub/ateam`. It is nested inside an unrelated parent git repository at `~/Documents/GitHub`. Never stage or alter the parent. Confirm `git rev-parse --show-toplevel` ends in `ateam` before any git command.
 - Durable intent lives in the target repo under `.ateam/`. Operational state lives outside git.
 - Workers run in isolated git worktrees. The coordinator creates and removes them with plain git; headless runs do not clean up after themselves.
-- Workers run in bare mode so they inherit nothing from the target repo's own Claude configuration unless ATeam delivers it. Existing CLAUDE.md and AGENTS.md files are still read by discovery as sources of engineering knowledge.
+- Workers run in a clean room so they inherit nothing from the target repo's own Claude configuration unless ATeam delivers it. The spike showed that Claude Code's `--bare` flag only authenticates with an API key, not a claude.ai login, so the clean room is built from the SDK options instead: no setting sources, strict MCP config, slash commands disabled, auto-memory disabled. Under that set, neither CLAUDE.md nor `.claude/rules/` nor any hook from the target reaches the worker. Existing CLAUDE.md and AGENTS.md files are still read by discovery as sources of engineering knowledge.
 - Enforcement is layered: tool allow and deny lists, permission callbacks and hooks in Python, path deny rules, and a post-run diff and tree check. None of these is a complete security boundary and the design does not claim one.
 - Nothing is built on an assumption about SDK, bare-mode, hook or path-scoped-rule behaviour until the spike (below) has shown it.
 
@@ -93,7 +93,7 @@ Three failure classes, each with its own mechanism:
 - **Operational store is SQLite from day one.** Python ships it, it is transactional, and interrupt and resume need atomic writes. It lives at `~/.ateam/<target-repo-id>/state.db`, never inside the target repo. Nothing in it is authoritative; it can be rebuilt from `.ateam/` plus the worktrees.
 - **One record kind** with a `kind` field, rather than separate schemas for decisions, invariants and conventions.
 - **Records bind paths by glob only.** No component registry in v1. A record with no paths is global.
-- **Derived rules go into the worktree, untracked.** ATeam writes path-scoped rules into the worktree's `.claude/rules/` and lists them in that worktree's own git exclude file. Nothing derived is committed to the target repo. If the spike shows bare mode skips rules, the same records are delivered through a session-start hook instead.
+- **Records are delivered by ATeam, not by Claude Code's rules.** The brief, carrying the selected records, goes in through the system prompt append. On top of that, a Python PreToolUse hook on Read, Edit and Write injects the records bound to a path at the moment the worker touches that path (verified in the spike, check E). Nothing is written into `.claude/` in the worktree and no worktree exclude mechanics are needed. The system prompt must state that text labelled "ATeam binding record" inside tool results is authoritative, because the spike showed the model otherwise treats injected text in a tool result with suspicion.
 - **Scope breach definition.** A worker's diff touching any file outside its contract's declared paths is "materially exceeds scope" and fails verification, except for files the contract explicitly allows as incidental (lockfiles, generated snapshots).
 - **TEST never drops below BUILD.** The TEST worker runs at a tier at least as capable as the BUILD worker it checks.
 - **Retry budget per contract** defaults to two BUILD attempts after the first, then pause.
@@ -108,7 +108,19 @@ Three failure classes, each with its own mechanism:
 - **Runtime environment is declared, not discovered.** `.ateam/config.yaml` carries `setup` commands run once per new worktree, `env` for workers and checks, and the deterministic `checks`. A failing setup command is an `environment` failure. Where checks share an external resource such as a database, config sets `serialize_checks: true` and deterministic checks and TEST workers run one at a time per target under a lock. BUILD workers still run concurrently.
 - **One running plan per target.** `ateam run` takes a target-level lock. A second plan can be investigated and approved while one runs, but not executed. This removes cross-plan integration ordering and most record-drift cases from v1.
 - **Target branch is configured.** `.ateam/config.yaml` names the target branch; `ateam init` defaults it to the repo's default branch. If the target branch moves during execution, nothing happens until final integration, where the integration branch is rebased or merged onto the new tip before the full check run.
-- **The target's own `.claude/` never reaches workers.** Worktrees exclude the target repo's `.claude/` directory from checkout (sparse checkout or removal, builder's choice), and `.claude/` in the worktree is ATeam-owned: generated rules, nothing else. Discovery reads the target's CLAUDE.md, AGENTS.md, rules, agents and skills as knowledge sources and may propose records from them. The diff and scope checks ignore `.claude/**`.
+- **The target's own `.claude/` never reaches workers.** With no setting sources loaded, the spike confirmed that the target's CLAUDE.md and `.claude/rules/` are not read, so no sparse checkout or removal is needed. Discovery reads the target's CLAUDE.md, AGENTS.md, rules, agents and skills as knowledge sources and may propose records from them. The diff and scope checks still ignore `.claude/**`.
+
+Spike findings folded in (see `spikes/2026-10-24-sdk-bare-hooks/report*.md`):
+
+- **Roles are option sets, not agent definitions.** Running a defined agent as the main session through `--agent` applied its prompt but broke structured output: the model wrote JSON into prose instead of calling the structured output tool. A role is therefore a system prompt append, a tool list, hooks and a permission callback, assembled by ATeam per run.
+- **Permission mode `default` plus the SDK permission callback is the policy gate.** Under `acceptEdits` the callback was never reached for Bash. Under `default`, every call that is not pre-approved reaches the Python callback, which can deny with a message the model sees. PreToolUse hooks on Edit, Write and Bash add a second deny with a reason, verified for both a protected-file edit and a shell redirect into `.ateam/`.
+- **Stop hook gate works.** A Python Stop hook returning `decision: block` with a reason keeps the session going until the condition holds; the `stop_hook_active` input field is the loop guard.
+- **Structured output is reliable.** Every clean-room run returned `structured_output` matching the schema. The SDK raises `ResultError` after yielding the result message when the subtype is an error (`error_max_turns`, `error_max_budget_usd`); the runner must catch it and still read the result.
+- **Resume after a turn cap works.** A session ended by `max_turns` resumed by session ID and finished the task, including writing the handoff file. Per-message usage is exposed on every assistant message; a PreCompact hook can be registered. No automated threshold is designed.
+- **Concurrency works.** Two queries gathered in one process ran in parallel with distinct sessions.
+- **The clean room is also a cost necessity.** One run that loaded the owner's user settings (MCP servers, plugins) exhausted a 0.60 dollar budget on a trivial task; clean-room runs cost fractions of a cent.
+- **Result envelope** on 2.1.310 carries `subtype`, `is_error`, `num_turns`, `terminal_reason`, `stop_reason`, `session_id`, `duration_ms`, `total_cost_usd`, `usage`, `model_usage` (per model: tokens, cache, cost, context window), `permission_denials`, `errors`.
+- **Nested launch.** The spike was run from inside a Claude Code session and stripped the inherited `CLAUDE*` environment variables before spawning workers. Whether leaving them in place causes problems was not tested; the runner builds a fresh environment regardless.
 
 ## Architecture
 
@@ -131,9 +143,10 @@ Native capabilities ATeam relies on and does not rebuild (verified against `clau
 - Dollar budget and turn caps per run.
 - Agent definitions with `tools`, `disallowedTools`, `model`, `effort`, `maxTurns`, `permissionMode`, `omitClaudeMd`, and per-agent hooks.
 - Tool allow and deny lists, `--restricted` mode, and permission modes. Path deny rules for `Edit`.
-- Bare mode: no CLAUDE.md discovery, no auto-memory, no settings hooks. Whether `.claude/rules/` loads under bare mode: *spike*.
-- Path-scoped rules: `.claude/rules/*.md` with `paths:` frontmatter, loaded when a matching file is read or edited. Context only, not enforcement.
-- Hooks in headless mode, including PreToolUse deny, Stop and SubagentStop block, and SessionStart context injection. Python callback return shape in the SDK: *spike*.
+- Clean room through SDK options: no setting sources, strict MCP config, slash commands disabled, auto-memory disabled. Verified: no CLAUDE.md, no rules, no target hooks reach the worker. (`--bare` is not usable with a claude.ai login.)
+- Path-scoped rules (`.claude/rules/*.md` with `paths:`) load only when project settings are loaded. Verified, but not used: ATeam delivers bound records itself through a PreToolUse hook.
+- Python hook callbacks in the SDK for PreToolUse (deny, allow, additionalContext), PostToolUse, Stop and SubagentStop (block with reason), UserPromptSubmit (additionalContext), PreCompact, PermissionRequest. There is no SessionStart hook in the SDK; the system prompt append covers that role. Verified.
+- SDK permission callback (`can_use_tool`) under permission mode `default`. Verified.
 - Session IDs, resume and fork for continuity.
 - Per-model usage and cost in the result envelope.
 
@@ -329,7 +342,7 @@ Four kinds of context, treated differently:
 
 | Kind | Where it lives | Authority | Reaches a worker as |
 |---|---|---|---|
-| Binding | approved records | authoritative | brief section "Binding", plus path-scoped rules |
+| Binding | approved records | authoritative | brief section "Binding", plus PreToolUse injection when a bound path is touched |
 | Task | frozen contract | authoritative for the task | brief section "Task" |
 | Working | the session, the worktree scratch directory | unreliable | never carried between sessions except through the handoff file |
 | Handoff | checkpoint per attempt | facts verified by the coordinator; notes unverified | brief sections "Verified prior work" and "Previous worker's notes" |
@@ -374,9 +387,9 @@ ateam telemetry [--csv]
 ateam doctor                      claude version, SDK version, target repo health
 ```
 
-## The spike (first deliverable, throwaway)
+## The spike (done 2026-10-24, throwaway)
 
-Before any coordinator code, a script in the ATeam repo under `spikes/` must demonstrate, against a scratch git repo, with the output captured as a markdown report:
+Completed. Scripts and reports are in `spikes/2026-10-24-sdk-bare-hooks/`; findings are folded into "Calls made by the assistant" above. The original brief, for the record: a script in the ATeam repo under `spikes/` must demonstrate, against a scratch git repo, with the output captured as a markdown report:
 
 1. An SDK `query()` with `cwd` set to a worktree, bare mode on, a role agent definition with restricted tools, and a JSON schema, returns `structured_output`.
 2. Whether a path-scoped rule in the worktree's `.claude/rules/` reaches the worker under bare mode. If not, that a SessionStart hook's `additionalContext` does.
