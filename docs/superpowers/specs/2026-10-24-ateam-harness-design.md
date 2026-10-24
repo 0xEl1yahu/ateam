@@ -1,0 +1,418 @@
+# ATeam harness design
+
+Date: 2026-10-24. Status: draft for owner approval.
+
+## Intent
+
+ATeam is an engineering system around coding agents, not a smarter agent. It is a standalone `ateam` command-line tool, pointed at a target git repository, that keeps engineering intent alive across agents, sessions and handoffs. The owner approves what gets built and what gets merged. ATeam decides how to build and verify it in between.
+
+The problem it solves is continuity of intent. Agent A implements something under an architectural decision or business rule. Agent B inherits the code without the reason, and removes the abstraction, hardcodes the dynamic thing, adds a silent fallback, fixes a local bug while breaking a wider invariant, or reports done without meeting the acceptance criteria. ATeam prevents those failures with mechanisms, not with agents remembering conversations.
+
+Three failure classes, each with its own mechanism:
+
+| Failure | Mechanism |
+|---|---|
+| Loss of *why* | Decision records in the target repo, selected per task and delivered to the worker |
+| Loss of *state* | One worktree per task, a coordinator that owns all shared state, an integration branch |
+| False *done* | Deterministic checks plus an independent TEST role, both reading the frozen contract |
+
+## Goals
+
+- Durable, version-controlled engineering intent in the target repo: decisions, invariants, conventions, task contracts.
+- Context selection: a replacement worker receives the decisions that bind the files it will touch, before it edits them.
+- Decision provenance: every record says why it exists, what evidence supports it, which paths it binds, and what superseded it.
+- Controlled revision: workers can propose changes to decisions; only the owner approves them.
+- Independent verification: a task is integrated only when deterministic checks pass and a separate TEST worker confirms the acceptance criteria.
+- Dynamic allocation: reasoning capacity from complexity, verification depth from risk, investigation from uncertainty.
+- Role separation: a worker is BUILD, INVESTIGATE or TEST, never more than one.
+- Interruptible: status can be inspected, execution stopped and resumed without losing progress.
+- Calibration data: predictions and actuals are recorded for every task.
+
+## Non-goals (v1)
+
+- Providers other than Claude. No adapters, no multi-model routing, no abstraction for future LLMs.
+- Go or Rust components. Python only until a concrete need appears.
+- A graph database, vector store or distributed infrastructure.
+- Requirements as first-class graph nodes (see Records: `serves`).
+- Automatic documentation generation or a large bootstrap of records.
+- A permissions framework. A small explicit state machine instead.
+- Sophisticated resource scheduling. A global worker cap and dependency order are enough.
+- Per-worktree provisioning of external resources (a database per worker, containers per contract). Targets whose checks share a resource serialise those checks instead.
+- More than one running plan per target repo at a time.
+- Driving interactive Claude Code sessions, background sessions (`--bg`), agent teams, or the Workflow tool. Workers are headless runs owned by the coordinator.
+
+## Anti-goals (failure even if it technically works)
+
+- **Workers redefining success.** A worker must never be able to change its contract, its acceptance criteria, or any approved record.
+- **Self-approval.** The worker that built a change never judges it.
+- **Inferred intent becoming binding without the owner.** Nothing discovered from code is a constraint until approved.
+- **Observed behaviour mistaken for requirement.** A bug or workaround found in code must be labelled as observation, never silently promoted to invariant.
+- **Contradictory instructions left behind.** Derived text (briefs, rules) is regenerated from approved records only; superseded records never reach a worker.
+- **Trusting the worker's report over the worktree.** Integration verifies the actual tree state, including staged, unstaged and untracked files.
+- **Silent escalation.** A failure is classified before any change in model or effort.
+- **Silent merges.** Nothing reaches the target branch without the owner's approval.
+
+## Constraints
+
+- Claude Code 2.1.310 and the Python Agent SDK (`claude-agent-sdk`, 0.2.174 at time of writing) are the execution layer. ATeam uses what they do natively and builds only what they do not.
+- The ATeam repo is `~/Documents/GitHub/ateam`. It is nested inside an unrelated parent git repository at `~/Documents/GitHub`. Never stage or alter the parent. Confirm `git rev-parse --show-toplevel` ends in `ateam` before any git command.
+- Durable intent lives in the target repo under `.ateam/`. Operational state lives outside git.
+- Workers run in isolated git worktrees. The coordinator creates and removes them with plain git; headless runs do not clean up after themselves.
+- Workers run in bare mode so they inherit nothing from the target repo's own Claude configuration unless ATeam delivers it. Existing CLAUDE.md and AGENTS.md files are still read by discovery as sources of engineering knowledge.
+- Enforcement is layered: tool allow and deny lists, permission callbacks and hooks in Python, path deny rules, and a post-run diff and tree check. None of these is a complete security boundary and the design does not claim one.
+- Nothing is built on an assumption about SDK, bare-mode, hook or path-scoped-rule behaviour until the spike (below) has shown it.
+
+## Decisions made by the owner
+
+- **Scope.** Own repo, own CLI, pointed at any target repository. Not tied to any one project.
+- **Ecosystem.** Claude only in v1: headless Claude Code through the Python Agent SDK, subagent definitions, hooks, skills.
+- **Coordinator.** Python owns orchestration, task state, worker lifecycle, context assembly and verification.
+- **Two homes for truth.** Git for durable intent. A separate transactional store for runtime state (assignments, status, retries, leases). Operational state is never forced into git.
+- **Two mandatory approval gates.** Plan approval before any implementation. Merge approval before anything reaches the target branch.
+- **Autonomous between gates**, within approved boundaries: allocate workers, create worktrees, implement, test, investigate failures, retry within limits.
+- **Pause conditions.** ATeam stops and asks when: a binding decision or invariant needs changing; work materially exceeds approved scope; retries or budgets are exhausted; a destructive operation, deployment or sensitive resource is needed; a critical verification failure cannot be resolved within the contract.
+- **Integration branch.** Work integrates on an isolated branch, never directly on the target branch.
+- **State machine, not permissions framework.** Simple and explicit.
+- **Independent verification includes deterministic checks.** Tests, type checks, linting and integration checks are evidence; the TEST role is not the sole authority.
+- **Task completion is not integration.** A finished BUILD is a candidate, nothing more.
+- **Records are small, scoped, machine-readable**, with explicit ownership and references. No long project-memory documents.
+- **Discovery is progressive and task-driven.** `ateam init` proposes a small baseline. Later plans propose records relevant to the components they touch. Five accurate records beat fifty speculative ones.
+- **Discovery classifies** each proposal as explicitly documented or inferred, and as requirement or observation, with evidence. Nothing inferred binds without approval.
+- **Requirements are free text in v1.** Promotable to nodes later.
+- **Allocation uses three dimensions**: complexity, risk, uncertainty, each Low, Medium or High, from a fixed rubric, repository evidence and planner judgment. Complexity sets reasoning capacity. Risk sets verification depth. Uncertainty sets investigation. Shown per contract at plan approval, overridable by the owner.
+- **No automatic escalation.** Failures are classified as implementation, requirements, environment or invariant violation. Model capability escalates only when there is evidence more reasoning would help.
+- **Concurrency** is bounded by a global worker cap and task dependencies.
+- **Calibration.** Predicted complexity, risk and uncertainty are recorded with actual token use, retries, execution time and verification outcome.
+- **Tree verification.** The worktree's real state is checked, not the worker's reported commit.
+- **Protected files.** Contracts and approved records are protected from worker modification.
+- **Spike first.** SDK, bare mode, hooks and path-scoped rules are validated by a small executable spike before the integration is committed to.
+- **Approval commits land on the target branch in the owner's checkout.** `ateam approve`, `ateam reject` and `ateam supersede` stage only `.ateam/` paths and commit on the configured target branch. They refuse to act if the checkout is on another branch or `.ateam/` already has uncommitted changes.
+
+## Calls made by the assistant (owner to check)
+
+- **Operational store is SQLite from day one.** Python ships it, it is transactional, and interrupt and resume need atomic writes. It lives at `~/.ateam/<target-repo-id>/state.db`, never inside the target repo. Nothing in it is authoritative; it can be rebuilt from `.ateam/` plus the worktrees.
+- **One record kind** with a `kind` field, rather than separate schemas for decisions, invariants and conventions.
+- **Records bind paths by glob only.** No component registry in v1. A record with no paths is global.
+- **Derived rules go into the worktree, untracked.** ATeam writes path-scoped rules into the worktree's `.claude/rules/` and lists them in that worktree's own git exclude file. Nothing derived is committed to the target repo. If the spike shows bare mode skips rules, the same records are delivered through a session-start hook instead.
+- **Scope breach definition.** A worker's diff touching any file outside its contract's declared paths is "materially exceeds scope" and fails verification, except for files the contract explicitly allows as incidental (lockfiles, generated snapshots).
+- **TEST never drops below BUILD.** The TEST worker runs at a tier at least as capable as the BUILD worker it checks.
+- **Retry budget per contract** defaults to two BUILD attempts after the first, then pause.
+- **Worker reports are typed.** Every worker ends with a structured output validated against a JSON schema. Prose is never parsed.
+- **Records are written only by ATeam.** Approval and rejection go through the CLI, which edits the YAML and commits. Hand edits are detected by the validator and reported.
+- **IDs are sequential** (`R-0007`, `C-0012`, `P-0003`) and ATeam is the sole allocator, so there is no collision in v1.
+- **Rejected records are kept**, with the owner's reason, keyed by an evidence fingerprint, so discovery never re-proposes them.
+- **Global records are capped** at discovery time (default five) to keep every worker's brief short.
+- **`claude` binary pinning.** ATeam records the Claude Code version it was spiked against and warns on a different version, because headless defaults are changing (bare mode is due to become the default for `-p`; permission mode defaults to manual, which denies prompts).
+- **Two planning passes.** The implementation plan is written in two passes. Pass one covers the spike and the parts that do not depend on its outcome: record schema and validator, contract schema, state store, CLI skeleton. Pass two, written after the spike's findings are folded into this document, covers the runner, enforcement, verification and integration.
+- **Integration is incremental.** The plan's integration branch `ateam/<plan-id>` is created from the target branch when execution starts. Each contract's worktree branches from the integration branch tip at the moment the contract becomes `ready`. When a contract is `verified`, it is merged onto the integration branch immediately. Dependents therefore see the code they depend on, "diff against base" means the worktree's recorded base commit, and a merge conflict only arises when two independent contracts touched the same lines. The final integration step is the full check run on the integration branch, after a merge or rebase with the current target branch.
+- **Runtime environment is declared, not discovered.** `.ateam/config.yaml` carries `setup` commands run once per new worktree, `env` for workers and checks, and the deterministic `checks`. A failing setup command is an `environment` failure. Where checks share an external resource such as a database, config sets `serialize_checks: true` and deterministic checks and TEST workers run one at a time per target under a lock. BUILD workers still run concurrently.
+- **One running plan per target.** `ateam run` takes a target-level lock. A second plan can be investigated and approved while one runs, but not executed. This removes cross-plan integration ordering and most record-drift cases from v1.
+- **Target branch is configured.** `.ateam/config.yaml` names the target branch; `ateam init` defaults it to the repo's default branch. If the target branch moves during execution, nothing happens until final integration, where the integration branch is rebased or merged onto the new tip before the full check run.
+- **The target's own `.claude/` never reaches workers.** Worktrees exclude the target repo's `.claude/` directory from checkout (sparse checkout or removal, builder's choice), and `.claude/` in the worktree is ATeam-owned: generated rules, nothing else. Discovery reads the target's CLAUDE.md, AGENTS.md, rules, agents and skills as knowledge sources and may propose records from them. The diff and scope checks ignore `.claude/**`.
+
+## Architecture
+
+```
+ateam (CLI)
+  └── coordinator (Python)
+        ├── records       load, validate, graph queries, generate derived text
+        ├── discovery     init and per-plan proposals (uses INVESTIGATE workers)
+        ├── planner       request -> contracts with dependencies, criteria, tiers
+        ├── state         SQLite: features, contracts, attempts, leases, telemetry
+        ├── scheduler     worker cap, dependency order, worktree lifecycle
+        ├── runner        Agent SDK sessions: role, tools, hooks, schema, budget
+        ├── verifier      deterministic checks, tree check, scope check, TEST role
+        └── integrator    integration branch, re-verification, merge proposal
+```
+
+Native capabilities ATeam relies on and does not rebuild (verified against `claude --help` on 2.1.310 and the official docs on 2026-10-24; items marked *spike* must be confirmed by the spike):
+
+- Headless runs with a JSON result envelope and `structured_output` validated against a schema, with retries on mismatch. Branch on the result `subtype`, not the exit code.
+- Dollar budget and turn caps per run.
+- Agent definitions with `tools`, `disallowedTools`, `model`, `effort`, `maxTurns`, `permissionMode`, `omitClaudeMd`, and per-agent hooks.
+- Tool allow and deny lists, `--restricted` mode, and permission modes. Path deny rules for `Edit`.
+- Bare mode: no CLAUDE.md discovery, no auto-memory, no settings hooks. Whether `.claude/rules/` loads under bare mode: *spike*.
+- Path-scoped rules: `.claude/rules/*.md` with `paths:` frontmatter, loaded when a matching file is read or edited. Context only, not enforcement.
+- Hooks in headless mode, including PreToolUse deny, Stop and SubagentStop block, and SessionStart context injection. Python callback return shape in the SDK: *spike*.
+- Session IDs, resume and fork for continuity.
+- Per-model usage and cost in the result envelope.
+
+ATeam's own machinery, with no native equivalent:
+
+- Record schema, lifecycle, graph queries, derived text generation.
+- Contract schema and freezing.
+- Context selection and brief assembly.
+- Feature and contract state machines, persisted.
+- Worktree lifecycle and the worker process pool.
+- Allocation rubric and tier mapping.
+- Verification gate and integration.
+- Discovery with classification and idempotence.
+- Telemetry for calibration.
+
+## Target repo layout
+
+```
+<target>/
+  .ateam/
+    config.yaml          target_branch, setup commands, env, checks, serialize_checks,
+                         protected paths, worker cap, tier map overrides
+    records/             R-0001-reading-state-owner-only.yaml ...
+    plans/               P-0001-<slug>.yaml  (feature request, contracts list, approvals)
+    contracts/           C-0001-<slug>.yaml ...
+    reports/             merge proposals and verification evidence summaries (committed)
+  .claude/worktrees/     not used by ATeam; ATeam uses ../<target>-ateam-worktrees/ or a configured path
+```
+
+Worktrees live outside the target checkout by default, under `~/.ateam/<target-repo-id>/worktrees/<contract-id>/`, so they never appear as untracked files in the target.
+
+## Records
+
+One YAML file per record in `.ateam/records/`.
+
+```yaml
+id: R-0007
+kind: invariant              # decision | invariant | convention
+status: approved             # proposed | approved | rejected | superseded | retired
+origin: inferred             # documented | inferred
+basis: requirement           # requirement | observation
+statement: >
+  Reading state is only ever set by the owner; nothing infers it.
+rationale: >
+  Inferred progress produced false confidence in an earlier version.
+evidence:
+  - {type: doc, ref: docs/specs/2026-10-24-shelf-design.md#anti-goals}
+  - {type: test, ref: tests/test_reading_state.py::test_no_inference}
+binds:
+  paths: ["src/data/books.py", "src/api/books/**"]
+  incidental: []             # paths a worker may touch without breaching scope
+supersedes: []
+serves: ["owner controls their own data"]
+fingerprint: sha256-of-normalised-evidence
+history:
+  - {at: 2026-10-24T10:12Z, by: ateam-init, to: proposed, why: "found in spec anti-goals"}
+  - {at: 2026-10-24T11:03Z, by: owner, to: approved}
+```
+
+Field rules:
+
+- `origin: documented` requires at least one `evidence` entry of type `doc`, `claude-md`, `agents-md` or `commit-message`. Otherwise `inferred`.
+- Discovery from code alone always produces `inferred` plus `observation`. The approval prompt states, in plain words, that this describes what the code does and asks whether it is intended. Approval may set `basis: requirement`.
+- `serves` is a list of short reusable phrases. The validator reports identical phrases across records. This is the seed for requirement nodes later; v1 does nothing else with it.
+- `history` is append-only.
+
+Lifecycle:
+
+- **proposed**: created by `ateam init`, by a plan's investigation, or from a worker's structured report that proposes a change. Not binding. Never delivered to workers.
+- **approved**: by the owner through `ateam approve R-0007`. The CLI shows the record next to every approved record whose globs overlap, so a potential contradiction is visible at the moment it could enter. Optionally an INVESTIGATE worker compares the proposal with the overlapping records and flags conflicts; the owner decides.
+- **rejected**: kept with the owner's reason. Discovery checks fingerprints and never re-proposes a rejected record.
+- **superseded**: only as one transaction with approving a replacement. The new record lists the old in `supersedes`; the old record's status flips; both commit together; derived text is regenerated. The validator refuses a state where a superseded record is still approved or a `supersedes` target is missing.
+- **retired**: supersession with no replacement.
+
+Graph: `binds`, `supersedes` and contract references are the edges. At runtime the records are loaded into an in-memory graph (networkx or plain dictionaries, builder's choice) with five queries: records binding a path, supersession chain, acyclicity, dangling references, and impact (every approved contract and path that references a record). No graph store in v1. If load time ever matters, a SQLite index derived from the YAML is the next step and stays disposable.
+
+Validator (runs on every CLI command that reads records): schema, unique IDs, status consistency, dangling references, acyclic supersession, every glob matches at least one file (dead globs are reported, not fatal), duplicate `serves` phrases, hand edits (file hash differs from the hash recorded in state).
+
+## Contracts
+
+One YAML file per contract in `.ateam/contracts/`. Frozen at plan approval; a frozen contract's content hash is stored in state, and any later change fails validation.
+
+```yaml
+id: C-0012
+plan: P-0003
+title: Expose reading state through the books API
+status: ready                # draft | ready | building | verifying | verified | failed | paused | integrated
+depends_on: ["C-0011"]
+paths: ["src/api/books/**", "tests/api/test_books.py"]
+incidental: ["requirements.txt"]
+records:                     # frozen selection with content hashes
+  - {id: R-0007, hash: "..."}
+  - {id: R-0002, hash: "..."}
+acceptance:
+  - id: A1
+    statement: GET /books/{id} returns reading_state for every book
+    check: {type: test, ref: tests/api/test_books.py::test_reading_state_present}
+  - id: A2
+    statement: PATCH with an invalid state returns 422 and changes nothing
+    check: {type: test, ref: tests/api/test_books.py::test_invalid_state}
+  - id: A3
+    statement: No code path infers reading state (R-0007)
+    check: {type: judgment}  # TEST worker decides, with evidence
+checks:                      # deterministic, from .ateam/config.yaml plus contract additions
+  - {name: unit, cmd: "python -m unittest discover -s tests"}
+  - {name: types, cmd: "mypy src"}
+allocation:
+  complexity: medium
+  risk: high
+  uncertainty: low
+  reasoning: >
+    Touches an API boundary bound by R-0007; existing tests cover the model
+    layer but not the API; requirements are explicit in the plan.
+  tier: {build: standard, test: careful, investigate: none}
+budget: {attempts: 3, usd_per_attempt: 2.00, max_turns: 60}
+```
+
+Workers receive contracts read-only. The contract's `records` list is what the brief contains. Acceptance criteria with a `check` of type `test` must be satisfied by that named test passing; criteria of type `judgment` are decided by the TEST worker with cited evidence.
+
+## State machines
+
+Feature (one per plan):
+
+```
+requested -> investigating -> plan_proposed -> plan_approved -> executing
+executing -> integrating -> merge_proposed -> merged
+executing -> paused(reason) -> executing | abandoned
+plan_proposed -> plan_rejected
+```
+
+Pause reasons are an enum: `decision_change_needed`, `scope_exceeded`, `budget_exhausted`, `verification_unresolvable`, `sensitive_action`, `environment_failure`, `records_drifted`.
+
+Contract: `draft -> ready -> building -> verifying -> verified -> integrated`, with `failed` (retry possible) and `paused` as side exits. A contract becomes `ready` when every dependency is `verified`.
+
+Every transition is a row in SQLite with timestamp, actor and reason. `ateam status` reads only this table plus the live worker list. `ateam stop` sends interrupt to running sessions, marks their attempts `interrupted`, and leaves worktrees in place. `ateam resume` re-enters `executing` and either resumes the interrupted session by ID or starts a fresh attempt from the worktree, builder's choice per failure class.
+
+## Roles
+
+| Role | May | May not | Ends with |
+|---|---|---|---|
+| INVESTIGATE | read, search, run read-only commands | edit, write, run tests that mutate state | findings report with evidence and proposed records |
+| BUILD | read, edit, write, run checks, commit in its worktree | edit `.ateam/**` or `.claude/**`, touch files outside `paths` plus `incidental`, push, merge | build report: commits, files, checks run, risks, record proposals |
+| TEST | read, run checks and tests, write only under a scratch directory | edit source, edit tests that the contract names, see the builder's transcript | verdict per acceptance criterion with evidence |
+
+Enforcement, in layers:
+
+1. Agent definition: `tools` and `disallowedTools` per role.
+2. SDK permission callback: deny any file write outside the contract's paths, any edit under `.ateam/` or `.claude/`, and any Bash matching a configurable destructive list (`git push`, `git merge`, `rm -rf`, deploy commands).
+3. Path deny rules for `Edit` on `.ateam/**` and `.claude/**` in the session settings.
+4. Post-run tree check: the worktree must be clean except for committed changes (staged, unstaged and untracked files are reported and fail the attempt); the diff against the base must touch only `paths` plus `incidental`.
+
+Layers 1 to 3 stop built-in tools and recognised shell commands. They do not stop a script the worker writes and runs. Layer 4 catches the result. This is integrity verification, not a security boundary.
+
+The TEST worker receives the contract, the diff, the deterministic check results and the records. It does not receive the BUILD worker's report, so it cannot be anchored by the builder's claims.
+
+## Allocation
+
+Three dimensions, each Low, Medium or High. The rubric lives in `ateam/rubric.md` and is short enough to read in a minute. Signals the planner must cite: component boundaries crossed, approved records bound, test coverage of the touched paths, migrations, concurrency, security surface, ambiguity in the request. File count alone is not a signal.
+
+- **Complexity** picks the BUILD tier (model, effort, turn cap, budget).
+- **Risk** picks verification depth: which checks are mandatory, whether a TEST worker runs at all for trivial changes (my call: it always runs in v1), whether an extra INVESTIGATE review of the diff is added, and whether the contract is flagged for the owner's attention at merge approval.
+- **Uncertainty** decides whether an INVESTIGATE worker runs before BUILD and what questions it must answer. High uncertainty with unanswered questions after investigation pauses the plan for the owner.
+
+Tiers are named in `ateam/config/tiers.yaml` and mapped per role to a Claude model alias, effort, max turns and budget. Three tiers in v1: `light`, `standard`, `careful`. The owner can override any tier per contract at plan approval. Model aliases are the builder's choice at build time from the current Claude Code aliases; the design does not pin them.
+
+Failure classification runs after every failed attempt, by the coordinator from the structured report and check output, with an INVESTIGATE worker when the cause is unclear: `implementation`, `requirements`, `environment`, `invariant_violation`. Only `implementation` with evidence that reasoning was the limit may escalate one tier, once. `requirements` and `invariant_violation` pause for the owner. `environment` retries without escalation.
+
+Telemetry row per attempt: contract, role, tier, predicted dimensions, model, tokens in and out, cost, turns, wall time, outcome, failure class. Stored in SQLite and exportable as CSV.
+
+## Verification and integration
+
+Per contract, in order:
+
+1. Tree check (layer 4 above).
+2. Deterministic checks from the contract, in the worktree. Any failure ends the attempt as `failed(implementation)` unless the check itself errored, which is `environment`.
+3. TEST worker. Verdict per criterion: `met`, `not_met`, `cannot_determine`, each with evidence. Any `not_met` fails the attempt. `cannot_determine` on a judgment criterion pauses for the owner if it survives a retry.
+4. Contract becomes `verified`.
+
+Integration, incremental per contract and final per plan:
+
+1. When execution starts, create `ateam/<plan-id>` from the configured target branch.
+2. Each contract's worktree is created from the integration branch tip when the contract becomes `ready`, and that commit is recorded as the contract's base.
+3. When a contract is `verified`, merge its branch onto the integration branch at once. If the integration branch moved since the contract's base and the merge conflicts, that is an `environment` failure for this contract: one BUILD attempt rebases it with the conflict as its only task, then it is re-verified.
+4. When every contract is `integrated`, rebase or merge the integration branch onto the current target branch tip, then run the full deterministic check set on it. A failure here pauses with `verification_unresolvable` and the evidence.
+5. Write the merge proposal to `.ateam/reports/<plan-id>-merge.md`: diff summary, evidence per contract, records proposed or changed, unresolved risks, telemetry summary.
+6. `merge_proposed`. The owner runs `ateam merge P-0003` to fast-forward or merge into the target branch, or `ateam reject`.
+
+## Context lifecycle, handoffs and recovery
+
+Principle: a Claude session is temporary working memory. ATeam's records and contracts are durable engineering memory. Nothing in the system depends on a particular session surviving.
+
+Four kinds of context, treated differently:
+
+| Kind | Where it lives | Authority | Reaches a worker as |
+|---|---|---|---|
+| Binding | approved records | authoritative | brief section "Binding", plus path-scoped rules |
+| Task | frozen contract | authoritative for the task | brief section "Task" |
+| Working | the session, the worktree scratch directory | unreliable | never carried between sessions except through the handoff file |
+| Handoff | checkpoint per attempt | facts verified by the coordinator; notes unverified | brief sections "Verified prior work" and "Previous worker's notes" |
+
+Checkpoint per attempt, two layers:
+
+1. **Coordinator-derived facts**, always available even after a crash: worktree base commit and HEAD, list of commits, diff summary, deterministic check results so far, contract hash, record hashes, Claude session ID, tokens and cost. Written to SQLite at every state transition and at attempt end.
+2. **Worker-authored notes**: a small typed `handoff.yaml` in the worktree's untracked scratch directory (`.ateam-scratch/`, excluded in the worktree) that the brief instructs the worker to update at milestones: progress, unresolved issues, files of interest, hypotheses, next actions. The schema is short. The coordinator reads it after the session ends, whatever the reason.
+
+Brief assembly labels its sections by authority. The TEST role receives Binding, Task and Verified prior work only; it never sees a previous worker's notes or report.
+
+Resume policy for an interrupted or budget-stopped attempt: native session resume is used when the contract hash, record hashes and worktree HEAD all match the checkpoint; otherwise a fresh session starts from the worktree with the checkpoint in its brief. Compaction inside a session is left to Claude Code; ATeam bounds sessions with turn and budget caps rather than managing context pressure.
+
+Downstream revalidation: after a verified contract merges onto the integration branch, its deterministic checks run again on the integration branch. A failure there is an `environment` failure for that contract and blocks dependents from becoming `ready` until resolved.
+
+Deferred until real failures are observed: token-budget allocation, context-pressure detection and session rotation, semantic retrieval or embeddings, summarisation hierarchies, live context sync between concurrent workers, custom compression. Auto-memory stays off for workers: it is shared across all worktrees of a repo and has no approval step, so it would be an unreviewed back-channel.
+
+## Discovery
+
+`ateam init <target>`:
+
+1. Read docs, CLAUDE.md, AGENTS.md, README, configuration, tests, and recent git history. This is an INVESTIGATE worker with a fixed brief and a structured output schema of candidate records.
+2. Classify each candidate (`origin`, `basis`), attach evidence, bind the narrowest glob the evidence supports, compute the fingerprint.
+3. Drop candidates whose fingerprint matches a rejected record. Cap global candidates.
+4. Write candidates as `proposed` and print an approval walk-through. Unknowns (things the worker could not determine) are listed in the init report, not stored as records.
+
+`ateam plan <request>`: the same, scoped to the components the plan touches, producing both the contracts and any new proposed records. Plan approval and record approval happen in the same walk-through.
+
+## CLI surface
+
+```
+ateam init <path>                 discover and propose a baseline
+ateam plan <path> "<request>"     investigate and propose contracts
+ateam approve P-0003 [--tier C-0012=careful] [--reject-record R-0009 "reason"]
+ateam run P-0003                  execute until a gate or pause
+ateam status [P-0003]
+ateam stop P-0003 / ateam resume P-0003
+ateam records [--path src/api/**] [--impact R-0007]
+ateam approve R-0012 / ateam reject R-0012 "reason" / ateam supersede R-0007 --with R-0012
+ateam merge P-0003 / ateam reject P-0003 "reason"
+ateam telemetry [--csv]
+ateam doctor                      claude version, SDK version, target repo health
+```
+
+## The spike (first deliverable, throwaway)
+
+Before any coordinator code, a script in the ATeam repo under `spikes/` must demonstrate, against a scratch git repo, with the output captured as a markdown report:
+
+1. An SDK `query()` with `cwd` set to a worktree, bare mode on, a role agent definition with restricted tools, and a JSON schema, returns `structured_output`.
+2. Whether a path-scoped rule in the worktree's `.claude/rules/` reaches the worker under bare mode. If not, that a SessionStart hook's `additionalContext` does.
+3. A Python PreToolUse hook or `can_use_tool` callback denies an `Edit` under `.ateam/` and the worker reports the denial rather than retrying through Bash.
+4. A Stop hook can block the session ending until a named condition holds, and the Python return shape for that.
+5. A Bash write outside the declared paths is caught by the post-run tree check even when layers 1 to 3 miss it.
+6. The result envelope fields actually present (`subtype`, `structured_output`, cost, usage, `num_turns`, `is_error`) on 2.1.310.
+7. Two concurrent `query()` calls from one process complete independently.
+8. What the SDK exposes about context usage and compaction during a run: per-message usage, whether PreCompact and PostCompact hook events fire in headless mode and what they carry, and whether a session ended by turn cap or budget can still be resumed. No automated threshold is designed until this is known.
+
+The spike's findings update this document's "Calls made by the assistant" section before the second planning pass is written (see "Two planning passes" above).
+
+## Failure modes and mitigations
+
+- **Records rot.** Globs die on refactor; statements go stale. Dead globs are reported at every plan. Each plan re-shows the records it selected for approval. Records bind narrowly.
+- **Workers skim long briefs.** Global records are capped; path-scoped rules repeat the record at the point of use.
+- **Semantic contradiction between records.** Overlap display at approval, optional INVESTIGATE comparison, owner as last check.
+- **Mid-run supersession.** Frozen hashes in the contract; drift pauses with `records_drifted`.
+- **Worker escapes enforcement with a script.** Tree and scope check fails the attempt. Not a security boundary; stated as such.
+- **Headless defaults change between Claude Code versions.** Explicit flags for bare mode and permission mode; `ateam doctor` warns on version drift.
+- **SQLite state and git disagree after a crash.** State is a cache; `ateam doctor --rebuild` reconstructs it from `.ateam/` and the worktrees.
+- **Cost runaway.** Per-attempt and per-plan budgets; `budget_exhausted` pauses.
+
+## What's left to the builder
+
+- Python packaging, CLI framework, test layout for the ATeam repo itself.
+- Exact JSON schemas for each role's report and for discovery candidates.
+- The rubric text, kept to one page.
+- Tier to model alias mapping at build time.
+- Brief template wording per role.
+- Whether to use networkx or plain dictionaries for the record graph.
+- SQLite schema details.
+- Worktree naming and the exclude-file mechanics.
+- How `ateam status` renders (plain text is fine).
+- Which deterministic checks are discovered automatically from a target repo versus declared in `.ateam/config.yaml`.
+
+## Open questions for the owner
+
+None outstanding. The spike may reopen the rules-under-bare-mode question, which this document already covers both ways.
