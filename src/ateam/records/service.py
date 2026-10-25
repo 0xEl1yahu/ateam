@@ -1,0 +1,65 @@
+"""Record transitions with guards and a git commit of only .ateam/ paths."""
+
+from __future__ import annotations
+
+from ateam.config import TargetConfig
+from ateam.gitops import GitRepo
+from ateam.paths import TargetPaths
+from ateam.records import lifecycle
+from ateam.records.lifecycle import LifecycleError
+from ateam.records.model import Basis, Record
+from ateam.records.store import load_records, save_record
+
+
+class RecordService:
+    def __init__(self, paths: TargetPaths, git: GitRepo, config: TargetConfig) -> None:
+        self.paths = paths
+        self.git = git
+        self.config = config
+
+    def _guard(self) -> None:
+        branch = self.git.current_branch()
+        if branch != self.config.target_branch:
+            raise LifecycleError(f"checkout is on {branch!r}, expected target branch {self.config.target_branch!r}")
+        if not self.git.is_clean([".ateam"]):
+            raise LifecycleError(".ateam/ has uncommitted changes; commit or discard them first")
+
+    def _load(self, *ids: str) -> list[Record]:
+        records = load_records(self.paths.records)
+        missing = [i for i in ids if i not in records]
+        if missing:
+            raise LifecycleError(f"unknown record id(s): {', '.join(missing)}")
+        return [records[i] for i in ids]
+
+    def _commit(self, message: str, *records: Record) -> None:
+        for r in records:
+            save_record(self.paths.records, r)
+        self.git.commit_paths([".ateam/records"], message)
+
+    def approve(self, record_id: str, basis: Basis | None = None) -> Record:
+        self._guard()
+        (record,) = self._load(record_id)
+        new = lifecycle.approve(record, basis=basis)
+        self._commit(f"ateam: approve {record_id}", new)
+        return new
+
+    def reject(self, record_id: str, reason: str) -> Record:
+        self._guard()
+        (record,) = self._load(record_id)
+        new = lifecycle.reject(record, reason)
+        self._commit(f"ateam: reject {record_id}", new)
+        return new
+
+    def supersede(self, old_id: str, new_id: str) -> tuple[Record, Record]:
+        self._guard()
+        old, new = self._load(old_id, new_id)
+        old2, new2 = lifecycle.supersede(old, new)
+        self._commit(f"ateam: supersede {old_id} with {new_id}", old2, new2)
+        return old2, new2
+
+    def retire(self, record_id: str, reason: str) -> Record:
+        self._guard()
+        (record,) = self._load(record_id)
+        new = lifecycle.retire(record, reason)
+        self._commit(f"ateam: retire {record_id}", new)
+        return new

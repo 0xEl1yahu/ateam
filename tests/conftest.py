@@ -83,3 +83,18 @@ def records_three(sample_record):
         "evidence": ev3, "fingerprint": compute_fingerprint(ev3), "binds": Binds(paths=["src/**"]), "serves": ["friendly api"],
     })
     return {"R-0001": r1, "R-0002": r2, "R-0003": r3}
+
+
+@pytest.fixture
+def record_service(target_repo, sample_record):
+    """RecordService over target_repo with sample_record saved and committed as proposed."""
+    from ateam.config import TargetConfig
+    from ateam.gitops import GitRepo
+    from ateam.paths import TargetPaths
+    from ateam.records.service import RecordService
+    from ateam.records.store import save_record
+
+    save_record(target_repo / ".ateam/records", sample_record)
+    git = GitRepo(target_repo)
+    git.commit_paths([".ateam"], "seed record")
+    return RecordService(TargetPaths.from_root(target_repo), git, TargetConfig())
