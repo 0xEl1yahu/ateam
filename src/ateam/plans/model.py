@@ -42,6 +42,10 @@ class Plan(BaseModel):
     contracts: list[str] = Field(default_factory=list)
     proposed_records: list[str] = Field(default_factory=list)
     unknowns: list[str] = Field(default_factory=list)
+    depends_on_plans: list[str] = Field(default_factory=list)
+    files_read: list[str] = Field(default_factory=list)
+    out_of_scope: list[str] = Field(default_factory=list)
+    verification_approach: str = ""
     tier_overrides: dict[str, dict[str, str]] = Field(default_factory=dict)
     history: list[PlanHistoryEntry] = Field(default_factory=list)
 
