@@ -8,13 +8,11 @@ def test_tree_state_and_scope(target_repo):
     (target_repo / "src/api/x.py").write_text("changed\n")
     (target_repo / "notes").mkdir()
     (target_repo / "notes/out.txt").write_text("x\n")
-    (target_repo / ".ateam-scratch").mkdir()
-    (target_repo / ".ateam-scratch/handoff.yaml").write_text("progress: x\n")
     st = tree_state(g, base)
     assert st.base == base and st.head == base and st.changed_vs_base == ["src/api/x.py"]
     r = scope_check(st, allowed=["src/api/**"], incidental=[])
     assert r.outside == ["notes/out.txt"]
-    assert "src/api/x.py" in r.dirty and ".ateam-scratch/handoff.yaml" not in r.dirty
+    assert "src/api/x.py" in r.dirty
     assert not r.ok
 
     g.run("add", "src/api/x.py"); g.run("commit", "-q", "-m", "c")

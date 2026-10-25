@@ -8,6 +8,12 @@ def _cp(notes):
                       contract_hash="h", record_hashes={}, session_id=None, notes=notes, warnings=[])
 
 
+def test_brief_names_absolute_handoff_path(sample_contract, tmp_path):
+    b = assemble_brief(sample_contract, [], None, Role.build, scratch_dir=tmp_path / "scratch")
+    assert f"Handoff file: {tmp_path / 'scratch' / 'handoff.yaml'}" in b.task
+    assert ".ateam-scratch" not in render_brief(b)
+
+
 def test_sections_for_build(sample_contract, records_three):
     b = assemble_brief(sample_contract, [records_three["R-0001"]], _cp({"next": "write the PATCH test"}), Role.build)
     assert "### ATeam binding record R-0001 (invariant)" in b.binding and "Reading state is only ever set" in b.binding

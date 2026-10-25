@@ -12,7 +12,7 @@ from ateam.contracts.model import Contract
 from ateam.gitops import GitRepo
 from ateam.records.model import Record
 
-HANDOFF_FILE = Path(".ateam-scratch") / "handoff.yaml"
+HANDOFF_FILE = Path("handoff.yaml")
 
 
 @dataclass
@@ -39,9 +39,9 @@ class Checkpoint:
         return cls(**data)
 
 
-def load_handoff(worktree: Path) -> tuple[dict | None, list[str]]:
-    """The worker's handoff notes, or None with a warning when absent, empty, invalid or not a mapping."""
-    path = worktree / HANDOFF_FILE
+def load_handoff(scratch_dir: Path) -> tuple[dict | None, list[str]]:
+    """The worker's handoff notes from its scratch dir, or None with a warning when absent, empty, invalid or not a mapping."""
+    path = scratch_dir / HANDOFF_FILE
     if not path.is_file():
         return None, [f"no handoff file at {HANDOFF_FILE}"]
     try:
@@ -56,12 +56,12 @@ def load_handoff(worktree: Path) -> tuple[dict | None, list[str]]:
 
 
 def collect(
-    git: GitRepo, worktree: Path, base: str, contract: Contract, records: dict[str, Record],
+    git: GitRepo, scratch_dir: Path, base: str, contract: Contract, records: dict[str, Record],
     session_id: str | None, checks: list[dict],
 ) -> Checkpoint:
     head = git.head()
     log = git.run("log", "--format=%h %s", f"{base}..{head}") if head != base else ""
-    notes, warnings = load_handoff(worktree)
+    notes, warnings = load_handoff(scratch_dir)
     return Checkpoint(
         base=base,
         head=head,

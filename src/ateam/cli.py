@@ -375,7 +375,7 @@ def brief(contract_id: str, role: str, target: Path) -> None:
     selected = [recs[ref.id] for ref in cs[contract_id].records if ref.id in recs]
     prev_raw = ctx.db.latest_checkpoint(contract_id)
     prev = Checkpoint.from_dict(prev_raw) if prev_raw else None
-    click.echo(render_brief(assemble_brief(cs[contract_id], selected, prev, Role(role))))
+    click.echo(render_brief(assemble_brief(cs[contract_id], selected, prev, Role(role), scratch_dir=ctx.paths.scratch_root / contract_id)))
 
 
 @main.group()
@@ -399,7 +399,7 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
     from ateam.contracts.store import load_contracts
     from ateam.records.store import load_records
     from ateam.roles import Role
-    from ateam.runner.run import WorktreeNotPrepared, default_base, run_contract_attempt
+    from ateam.runner.run import default_base, run_contract_attempt
     from ateam.tiers import load_tiers
 
     from ateam.gitops import GitError
@@ -435,7 +435,7 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
             contract=contract, records=load_records(ctx.paths.records), role=Role(role), tiers=tiers,
             db=ctx.db, resume=resume, prompt=prompt, tier_override=tier,
         ))
-    except (ContractNotBinding, WorktreeNotPrepared) as e:
+    except ContractNotBinding as e:
         _fail(str(e), code=4)
     except ValueError as e:
         _fail(str(e))
