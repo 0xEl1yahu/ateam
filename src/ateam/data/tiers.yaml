@@ -1,0 +1,14 @@
+# Allocation tiers: model alias, effort, turn cap and dollar cap per role.
+# Order (for escalation and "TEST never below BUILD"): light < standard < careful.
+light:
+  build:       {model: haiku,  effort: low,    max_turns: 40, usd: 1.0}
+  investigate: {model: haiku,  effort: low,    max_turns: 40, usd: 1.0}
+  test:        {model: haiku,  effort: low,    max_turns: 40, usd: 1.0}
+standard:
+  build:       {model: sonnet, effort: medium, max_turns: 60, usd: 2.0}
+  investigate: {model: sonnet, effort: medium, max_turns: 60, usd: 2.0}
+  test:        {model: sonnet, effort: medium, max_turns: 60, usd: 2.0}
+careful:
+  build:       {model: opus,   effort: high,   max_turns: 80, usd: 5.0}
+  investigate: {model: opus,   effort: high,   max_turns: 80, usd: 5.0}
+  test:        {model: opus,   effort: high,   max_turns: 80, usd: 5.0}
