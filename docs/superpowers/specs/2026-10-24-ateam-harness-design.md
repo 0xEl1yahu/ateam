@@ -86,6 +86,9 @@ Three failure classes, each with its own mechanism:
 - **Tree verification.** The worktree's real state is checked, not the worker's reported commit.
 - **Protected files.** Contracts and approved records are protected from worker modification.
 - **Spike first.** SDK, bare mode, hooks and path-scoped rules are validated by a small executable spike before the integration is committed to.
+- **Feature work happens in git worktrees**, for ATeam's own development as much as for its workers. Never on a branch in the main checkout. (Owner, 2026-10-25.)
+- **Git-native mechanisms only.** Nothing ATeam depends on may live in clone-local state such as `.git/info/exclude` or local config; a fresh clone on another machine must behave identically. Ignore rules go in the target's tracked `.gitignore`. (Owner, 2026-10-25.)
+- **Workers never run `rm`.** Deletion is an integration-time action. A tracked file a worker must remove goes through `git rm`, so the deletion is in the reviewed diff. (Owner, 2026-10-25.)
 - **Approval commits land on the target branch in the owner's checkout.** `ateam approve`, `ateam reject` and `ateam supersede` stage only `.ateam/` paths and commit on the configured target branch. They refuse to act if the checkout is on another branch or `.ateam/` already has uncommitted changes.
 
 ## Calls made by the assistant (owner to check)
