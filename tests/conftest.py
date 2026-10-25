@@ -39,3 +39,28 @@ def ateam_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home = tmp_path / "ateam-home"
     monkeypatch.setenv("ATEAM_HOME", str(home))
     return home
+
+
+@pytest.fixture
+def sample_record():
+    from datetime import UTC, datetime
+
+    from ateam.records.model import (
+        Basis, Binds, Evidence, HistoryEntry, Kind, Origin, Record, Status, compute_fingerprint,
+    )
+
+    evidence = [Evidence(type="doc", ref="docs/spec.md#anti-goals")]
+    return Record(
+        id="R-0001",
+        kind=Kind.invariant,
+        status=Status.proposed,
+        origin=Origin.documented,
+        basis=Basis.requirement,
+        statement="Reading state is only ever set by the owner",
+        rationale="Inferred progress produced false confidence before.",
+        evidence=evidence,
+        binds=Binds(paths=["src/data/books.py", "src/api/**"]),
+        serves=["owner controls their own data"],
+        fingerprint=compute_fingerprint(evidence),
+        history=[HistoryEntry(at=datetime(2026, 10, 24, 10, 12, tzinfo=UTC), by="ateam-init", to=Status.proposed, why="found in spec")],
+    )
