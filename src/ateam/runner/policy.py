@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -67,6 +68,7 @@ _HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n(.*?)(?:^|\n)\2(?:\n|$)", 
 _GIT_GLOBAL_OPTS = re.compile(r"^(\s*git)(?:\s+(?:-[cC]\s*\S+|--?\S+))+(\s+)")
 _WRAPPERS = {"command", "env", "exec", "nice", "nohup", "time", "builtin"}
 _CD = re.compile(r"^\s*(?:cd|pushd)\b")
+_CD_WORKTREE_REASON = "INVESTIGATE may cd only to a directory inside the worktree"
 _GIT_BRANCH = re.compile(r"^\s*git\s+branch\b(?P<rest>.*)$")
 
 
@@ -285,6 +287,23 @@ class Policy:
 
     # -- commands -----------------------------------------------------------
 
+    def _cd_target(self, segment: str, cwd: Path) -> Path | None:
+        """The directory a plain `cd <path>` or `pushd <path>` segment moves to, resolved against cwd; None for any other shape."""
+        try:
+            words = shlex.split(segment)
+        except ValueError:
+            return None
+        if len(words) != 2 or words[0] not in ("cd", "pushd"):
+            return None
+        arg = words[1]
+        if arg.startswith(("-", "~")) or _WILDCARD.search(arg) or "$" in arg or "`" in arg:
+            return None
+        return (cwd / arg).resolve()
+
+    def _inside_worktree(self, path: Path) -> bool:
+        root = self.worktree.resolve()
+        return path.is_dir() and (path == root or root in path.parents)
+
     def command_allowed(self, cmd: str) -> tuple[bool, str]:
         for pattern in DESTRUCTIVE_PATTERNS:
             if re.search(pattern, cmd):
@@ -327,7 +346,17 @@ class Policy:
                 return False, "INVESTIGATE may not use command or process substitution"
             if _PAGER.search(unquoted):
                 return False, "INVESTIGATE may not set pagers, editors or diff drivers"
+            cwd = self.worktree
             for seg in segments:
+                if _CD.match(seg):
+                    if "$" in seg or "`" in seg:
+                        pass  # not a plain path: falls through to the allow-list, which denies it
+                    else:
+                        target = self._cd_target(seg, cwd)
+                        if target is None or not self._inside_worktree(target):
+                            return False, _CD_WORKTREE_REASON
+                        cwd = target
+                        continue
                 if _ENV_PREFIX.match(seg):
                     return False, f"INVESTIGATE may not set environment variables for a command; {seg.strip()[:40]!r}"
                 if _GIT_DASH_C.match(seg):

@@ -195,6 +195,7 @@ INVESTIGATE_MUST_DENY = [
     "catx file",
     "ls; touch x",
     "git log | xargs rm",
+    'cd "$PWD" && ls',
 ]
 
 INVESTIGATE_MUST_ALLOW = [
@@ -207,7 +208,62 @@ INVESTIGATE_MUST_ALLOW = [
     "cat src/app.py | head -5",
     "grep -rn greet src | wc -l",
     "find src -name '*.py'",
+    "cd src && ls",
+    "cd src/api; grep -n ROUTES x.py",
+    "pushd tests && ls",
+    "cd src && cd api && ls",
 ]
+
+CD_WORKTREE_REASON = "INVESTIGATE may cd only to a directory inside the worktree"
+
+INVESTIGATE_CD_DENY = [
+    "cd",
+    "cd -",
+    "cd ~",
+    "cd ..",
+    "cd src/../..",
+    "cd /tmp && ls",
+    "cd src && cd ../.. && ls",
+    "pushd .. && ls",
+    "cd nonexistent && ls",
+    "cd src/app.py && ls",
+    "cd src tests && ls",
+    "cd -P src && ls",
+    "cd s* && ls",
+]
+
+
+@pytest.mark.parametrize("cmd", INVESTIGATE_CD_DENY)
+def test_investigate_cd_outside_worktree_denied(policy_investigate, cmd):
+    ok, reason = policy_investigate.command_allowed(cmd)
+    assert not ok, f"should deny: {cmd!r}"
+    assert reason == CD_WORKTREE_REASON
+
+
+def test_investigate_cd_absolute_inside_worktree_allowed(policy_investigate):
+    root = policy_investigate.worktree
+    for cmd in (f"cd {root}/src && ls", f"cd {root} && ls", f"pushd {root}/tests; ls"):
+        ok, reason = policy_investigate.command_allowed(cmd)
+        assert ok, f"should allow: {cmd!r} ({reason})"
+
+
+def test_investigate_cd_into_protected_dir_keeps_its_own_reason(policy_investigate):
+    ok, reason = policy_investigate.command_allowed("cd .ateam && ls")
+    assert not ok
+    assert reason == "changing directory into .ateam/ or .claude/ is not allowed"
+
+
+def test_investigate_cd_symlink_out_of_worktree_denied(policy_investigate, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (policy_investigate.worktree / "link").symlink_to(outside, target_is_directory=True)
+    ok, reason = policy_investigate.command_allowed("cd link && ls")
+    assert not ok
+    assert reason == CD_WORKTREE_REASON
+
+
+def test_non_investigate_roles_keep_cd_behaviour(policy_build):
+    assert policy_build.command_allowed("cd src && ls")[0]
 
 
 @pytest.mark.parametrize("cmd", INVESTIGATE_MUST_DENY)
