@@ -581,3 +581,48 @@ async def test_hook_matcher_covers_glob_and_grep_and_glob_pattern_into_home(poli
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
     out = await policy_inplace.pre_tool_use({"tool_name": "Glob", "tool_input": {"pattern": "src/**/*.py"}}, None, None)
     assert out == {} or out.get("hookSpecificOutput", {}).get("permissionDecision") != "deny"
+
+
+# ---- review round 1: cd must not bypass the ATeam-home rule; logical `..` through a symlink
+
+@pytest.fixture
+def investigate_with_home(target_repo, policy_investigate):
+    home = target_repo.parent / ".ateam"
+    pol = policy_investigate
+    pol.ateam_home = home
+    pol.scratch_dir = home / "scratch" / "C-0001"
+    (home / "scratch" / "C-0001").mkdir(parents=True, exist_ok=True)
+    (home / "state.db").write_text("secret")
+    (target_repo / "README.md").write_text("hi")
+    return pol
+
+
+@pytest.mark.parametrize("cmd", [
+    "cd src && cat ../../.ateam/state.db",
+    "cd src\ncat ../../.ateam/state.db",
+    "cd src; ls ../../.ateam/*",
+])
+def test_investigate_cd_cannot_reach_ateam_home(investigate_with_home, cmd):
+    ok, reason = investigate_with_home.command_allowed(cmd)
+    assert not ok, f"should deny: {cmd!r}"
+    assert "ATeam's home" in reason
+
+
+def test_investigate_cwd_persists_across_calls_for_home_rule(investigate_with_home):
+    assert investigate_with_home.command_allowed("cd src")[0]
+    ok, reason = investigate_with_home.command_allowed("cat ../../.ateam/state.db")
+    assert not ok and "ATeam's home" in reason
+
+
+def test_investigate_cd_still_allows_ordinary_relative_reads(investigate_with_home):
+    ok, reason = investigate_with_home.command_allowed("cd src && cat ../README.md")
+    assert ok, reason
+
+
+def test_investigate_cd_logical_dotdot_through_symlink_denied(policy_investigate):
+    root = policy_investigate.worktree
+    (root / "deep" / "a" / "b").mkdir(parents=True)
+    (root / "lnk").symlink_to(root / "deep" / "a" / "b", target_is_directory=True)
+    ok, reason = policy_investigate.command_allowed("cd lnk/../.. && ls")
+    assert not ok and reason == CD_WORKTREE_REASON
+    assert policy_investigate.command_allowed("cd lnk && ls")[0]

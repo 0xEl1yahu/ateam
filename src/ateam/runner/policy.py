@@ -168,6 +168,8 @@ class Policy:
     ateam_home: Path | None = None    # the ATeam home base ($ATEAM_HOME or ~/.ateam); everything in it except scratch_dir is off limits
     denials: list[str] = field(default_factory=list)
     injected: set[str] = field(default_factory=set)
+    cwds: set[Path] = field(default_factory=set)  # directories INVESTIGATE has cd'd into (the Bash tool keeps its cwd between calls)
+    _pending_cwds: list[Path] = field(default_factory=list, repr=False)  # cd targets of the command being checked
 
     # -- paths --------------------------------------------------------------
 
@@ -202,6 +204,10 @@ class Policy:
         out = {str(path), str(path.resolve())}
         return sorted(out, key=len, reverse=True)
 
+    def _bases(self) -> list[Path]:
+        """Every directory a relative path in a command might be resolved from."""
+        return [self.worktree, *sorted(self.cwds), *self._pending_cwds]
+
     def _under_home_not_scratch(self, file_path: str) -> bool:
         """True when a path resolves into ATeam's home but not into this worker's scratch dir."""
         home = self.ateam_home or Path(os.environ.get("ATEAM_HOME") or (Path.home() / ".ateam"))
@@ -211,17 +217,19 @@ class Policy:
         raw = raw.replace("$HOME", str(Path.home())).replace("${HOME}", str(Path.home()))
         raw = raw.replace("$ATEAM_HOME", str(home)).replace("${ATEAM_HOME}", str(home))
         candidate = Path(raw)
-        if not candidate.is_absolute():
-            candidate = self.worktree / candidate
-        try:
-            resolved = candidate.resolve()
-        except OSError:
-            return False
-        try:
-            resolved.relative_to(home.resolve())
-        except ValueError:
-            return False
-        return not self._in_scratch(str(resolved))
+        candidates = [candidate] if candidate.is_absolute() else [base / candidate for base in self._bases()]
+        for cand in candidates:
+            try:
+                resolved = cand.resolve()
+            except OSError:
+                continue
+            try:
+                resolved.relative_to(home.resolve())
+            except ValueError:
+                continue
+            if not self._in_scratch(str(resolved)):
+                return True
+        return False
 
     def _wildcard_reaches_home(self, token: str) -> bool:
         """A wildcard token whose literal directory part is ATeam's home or one of its ancestors could expand into it."""
@@ -237,15 +245,15 @@ class Policy:
         raw = raw.replace("$HOME", str(Path.home())).replace("${HOME}", str(Path.home()))
         raw = raw.replace("$ATEAM_HOME", str(home)).replace("${ATEAM_HOME}", str(home))
         candidate = Path(raw)
-        if not candidate.is_absolute():
-            candidate = self.worktree / candidate
-        try:
-            resolved = candidate.resolve()
-        except OSError:
-            return False
-        if resolved == home or resolved in home.parents:
-            return True
-        return self._under_home_not_scratch(str(resolved))
+        candidates = [candidate] if candidate.is_absolute() else [base / candidate for base in self._bases()]
+        for cand in candidates:
+            try:
+                resolved = cand.resolve()
+            except OSError:
+                continue
+            if resolved == home or resolved in home.parents or self._under_home_not_scratch(str(resolved)):
+                return True
+        return False
 
     def _token_paths(self, token: str) -> list[str]:
         """Path-like pieces of a shell token, including the value side of --flag=value and -Cpath forms."""
@@ -298,6 +306,9 @@ class Policy:
         arg = words[1]
         if arg.startswith(("-", "~")) or _WILDCARD.search(arg) or "$" in arg or "`" in arg:
             return None
+        logical = Path(os.path.normpath(cwd / arg))  # bash cd -L removes `..` textually before following links
+        if not any(r == logical or r in logical.parents for r in {self.worktree, self.worktree.resolve()}):
+            return None
         return (cwd / arg).resolve()
 
     def _inside_worktree(self, path: Path) -> bool:
@@ -305,6 +316,26 @@ class Policy:
         return path.is_dir() and (path == root or root in path.parents)
 
     def command_allowed(self, cmd: str) -> tuple[bool, str]:
+        self._pending_cwds = []
+        if self.role == Role.investigate:
+            cwd = self.worktree
+            for seg in _split_segments(_strip_heredocs(cmd)):
+                if not _CD.match(seg) or "$" in seg or "`" in seg:
+                    continue
+                target = self._cd_target(seg, cwd)
+                if target is None or not self._inside_worktree(target):
+                    break
+                cwd = target
+                self._pending_cwds.append(target)
+        try:
+            ok, reason = self._command_allowed(cmd)
+            if ok:
+                self.cwds.update(self._pending_cwds)
+            return ok, reason
+        finally:
+            self._pending_cwds = []
+
+    def _command_allowed(self, cmd: str) -> tuple[bool, str]:
         for pattern in DESTRUCTIVE_PATTERNS:
             if re.search(pattern, cmd):
                 return False, f"destructive command matched {pattern!r}"
