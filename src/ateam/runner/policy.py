@@ -33,11 +33,10 @@ DESTRUCTIVE_PATTERNS: list[str] = [
 ]
 
 INVESTIGATE_ALLOWED_PREFIXES: list[str] = [
-    "git log", "git show", "git diff", "git blame", "git status", "git branch", "git rev-parse", "git ls-files",
-    "git stash list", "git stash show", "git grep",
-    "ls", "cat", "head", "tail", "grep", "rg", "find", "wc", "tree", "du", "file", "stat", "pwd", "sort", "uniq", "cut", "awk", "sed -n",
-    'python -c "import', "python -m pytest --collect-only", "python --version",
-    'python3 -c "import', "python3 -m pytest --collect-only", "python3 --version",
+    # Read-only inspection only. Nothing here can write a file: no interpreters, no sed/awk, no xargs/env/sh.
+    "git log", "git show", "git diff", "git blame", "git status", "git ls-files", "git grep",
+    "git branch --list", "git branch -a", "git branch --show-current", "git rev-parse", "git stash list",
+    "ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "tree", "du", "stat", "file", "pwd", "sort", "uniq", "cut",
 ]
 
 # A mention of a protected directory: at the start or after a separator-like character, any case.

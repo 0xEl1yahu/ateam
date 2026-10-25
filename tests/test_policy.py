@@ -199,8 +199,6 @@ INVESTIGATE_MUST_ALLOW = [
     "git --no-pager log --oneline -5",
     "git -C src log --oneline",
     "git stash list",
-    "python3 --version",
-    'python3 -c "import sys; print(sys.version)"',
     "git log --oneline && ls src",
     "git branch --list",
     "git branch -a",
@@ -326,3 +324,58 @@ def test_home_denial_covers_env_tilde_traversal_and_spelling(real_layout, tmp_pa
         ok, _ = pol.command_allowed(cmd)
         assert not ok, f"should deny: {cmd!r}"
     assert not pol.path_writable_abs(str(scratch / ".." / ".." / "intent" / "records" / "R.yaml"))[0]
+
+
+# ---- stage 1/2: investigations run in the owner's checkout; the allow-list must not be able to write
+
+INVESTIGATE_IN_PLACE_DENY = [
+    'python -c "open(\'x\',\'w\')"',
+    "python3 -m pytest --collect-only",
+    "python --version",
+    "sed -n 'w out.txt' f",
+    "awk '{print > \"f\"}' f",
+    "cat f | tee out",
+    "ls > out",
+    "find . -fprint out",
+    "env X=1 ls",
+    "xargs rm",
+    "bash -c ls",
+    "sh -c 'ls'",
+    "git branch new",
+    "git stash",
+    "git checkout main",
+]
+
+INVESTIGATE_IN_PLACE_ALLOW = [
+    "git --no-pager log -5",
+    "git stash list",
+    "git branch --list",
+    "git branch -a",
+    "git branch --show-current",
+    "git ls-files src",
+    "git grep -n greet",
+    "find src -name '*.py'",
+    "cat src/app.py | head",
+    "du -sh src && tree src",
+    "stat src/app.py; file src/app.py; pwd",
+    "sort f | uniq | cut -d: -f1",
+]
+
+
+@pytest.mark.parametrize("cmd", INVESTIGATE_IN_PLACE_DENY)
+def test_investigate_in_place_denied(policy_investigate, cmd):
+    assert not policy_investigate.command_allowed(cmd)[0], f"should deny: {cmd!r}"
+
+
+@pytest.mark.parametrize("cmd", INVESTIGATE_IN_PLACE_ALLOW)
+def test_investigate_in_place_allowed(policy_investigate, cmd):
+    ok, reason = policy_investigate.command_allowed(cmd)
+    assert ok, f"should allow: {cmd!r} ({reason})"
+
+
+def test_investigate_allowlist_has_no_interpreters_or_stream_editors():
+    from ateam.runner.policy import INVESTIGATE_ALLOWED_PREFIXES
+
+    joined = " ".join(INVESTIGATE_ALLOWED_PREFIXES)
+    for bad in ("python", "sed", "awk", "xargs", "env", "sh", "bash", "perl", "ruby", "node"):
+        assert not any(p.split()[0] == bad for p in INVESTIGATE_ALLOWED_PREFIXES), f"{bad} must not be allow-listed: {joined}"
