@@ -359,3 +359,44 @@ def test_records_review_approve_reject_skip_via_input(cli_target, sample_record)
     assert recs["R-0002"].status == "rejected" and recs["R-0002"].history[-1].why == "not needed"
     assert recs["R-0003"].status == "proposed"
     assert "approved 1" in r.output and "rejected 1" in r.output and "skipped 1" in r.output
+
+
+# ---- stage 2: ateam plan
+
+def _canned_plan():
+    return {"title": "Health endpoint", "contracts": [{
+        "title": "Add health", "paths": ["src/api/**", "tests/**"], "incidental": [], "depends_on": [],
+        "acceptance": [{"id": "A1", "statement": "health() returns ok", "check": {"type": "test", "ref": "tests/test_routes.py::RoutesTest::test_health"}}],
+        "checks": [], "allocation": {"complexity": "low", "risk": "low", "uncertainty": "low", "reasoning": "one function",
+                                     "tier": {"build": "light", "test": "light", "investigate": "none"}}}],
+        "proposed_records": [], "unknowns": ["which port"], "notes": "n"}
+
+
+def test_plan_command_writes_plan_contracts_and_transitions(monkeypatch, cli_target):
+    from ateam.plans.store import load_plans
+    _patch_investigation(monkeypatch, _canned_plan())
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    p = TargetPaths.from_root(cli_target)
+    plans = load_plans(p.plans)
+    assert plans["P-0001"].status == "plan_proposed" and plans["P-0001"].contracts == ["C-0002"]   # C-0001 exists from the fixture
+    assert load_contracts(p.contracts)["C-0002"].status == "draft"
+    db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
+    assert db.feature_status("P-0001") == "plan_proposed"
+    assert GitRepo(p.intent).is_clean() and "propose plan P-0001" in GitRepo(p.intent).run("log", "-1", "--format=%s")
+    assert "ateam approve P-0001" in r.output and "which port" in r.output
+    assert run("plans", "list", "--target", str(cli_target)).output.count("P-0001") == 1
+    assert "add a health function" in run("plans", "show", "P-0001", "--target", str(cli_target)).output
+
+
+def test_plan_command_invalid_report_rejects_and_writes_nothing(monkeypatch, cli_target):
+    from ateam.plans.store import load_plans
+    bad = _canned_plan(); bad["contracts"][0]["depends_on"] = [0]
+    _patch_investigation(monkeypatch, bad)
+    p = TargetPaths.from_root(cli_target)
+    before = GitRepo(p.intent).head()
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 1 and "cycle" in r.output
+    assert "P-0001" not in load_plans(p.plans) and "C-0002" not in load_contracts(p.contracts) and GitRepo(p.intent).head() == before
+    db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
+    assert db.feature_status("P-0001") == "plan_rejected"

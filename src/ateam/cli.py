@@ -232,6 +232,106 @@ def init(remote: str | None, max_candidates: int, tier: str, target: Path) -> No
     click.echo(f"\nsession {result.res.session_id}: {result.res.num_turns} turns, ${result.res.cost_usd:.4f}")
 
 
+# ---------------------------------------------------------------- plan
+
+
+@main.command()
+@click.argument("request")
+@click.option("--tier", default="standard", show_default=True, type=click.Choice(["light", "standard", "careful"]))
+@TARGET_OPTION
+def plan(request: str, tier: str, target: Path) -> None:
+    """Turn a feature request into contracts and a plan for approval."""
+    import asyncio
+
+    from ateam.allocation import rubric_text
+    from ateam.contracts.store import save_contract
+    from ateam.intent import commit_intent
+    from ateam.planner import PlanError, render_plan_review, report_to_plan
+    from ateam.plans.store import next_id as next_plan_id
+    from ateam.plans.store import save_plan
+    from ateam.records.store import load_records, save_record
+    from ateam.roles import PLANNER_SPEC, Role
+    from ateam.tiers import load_tiers
+
+    ctx = _context(target)
+    pid = next_plan_id(ctx.paths.plans)
+    ctx.db.transition("feature", pid, "requested", by="owner", reason=request[:200])
+    ctx.db.transition("feature", pid, "investigating", by="ateam")
+    records = load_records(ctx.paths.records)
+    tiers = load_tiers(ctx.config.tiers)
+    brief = "\n\n".join([
+        f"Feature request from the owner:\n{request}",
+        _records_index(records),
+        "Configured deterministic checks (use only these names): " + (", ".join(f"{c.name} (`{c.cmd}`)" for c in ctx.config.checks) or "none"),
+        "Tier names: light, standard, careful; investigate may also be none.",
+        "Allocation rubric:\n" + rubric_text(),
+    ])
+    result = asyncio.run(run_investigation(
+        paths=ctx.paths, config=ctx.config, target_git=ctx.git, name=pid, spec=PLANNER_SPEC,
+        prompt="Produce the plan for the feature request in your brief.", brief_text=brief,
+        tier=tiers[tier][Role.investigate], db=ctx.db, tier_name=tier,
+    ))
+
+    def _rejected(reason: str) -> None:
+        ctx.db.transition("feature", pid, "plan_proposed", by="ateam")
+        ctx.db.transition("feature", pid, "plan_rejected", by="ateam", reason=reason)
+
+    if result.tampered:
+        _rejected("planner changed the checkout or intent repo")
+        _fail("planning changed the checkout or the intent repo; report discarded: " + "; ".join(result.tampered))
+    if result.res.report is None:
+        _rejected("planner produced no report")
+        _fail(f"planning produced no report (subtype {result.res.subtype}{', ' + result.res.error if result.res.error else ''})")
+    try:
+        pr = report_to_plan(result.res.report, request, pid, ctx.paths.contracts, records, ctx.config, ctx.paths.root, ctx.paths.records)
+    except PlanError as e:
+        _rejected("planner output invalid")
+        click.echo("The planner's output is not usable; nothing was written. Problems:")
+        for problem in e.problems:
+            click.echo(f"  - {problem}")
+        click.echo(f"Re-run: ateam plan \"{request}\"")
+        sys.exit(1)
+    for c in pr.contracts:
+        save_contract(ctx.paths.contracts, c)
+    for r in pr.proposed.proposed:
+        save_record(ctx.paths.records, r)
+    save_plan(ctx.paths.plans, pr.plan)
+    commit_intent(ctx.paths, f"ateam: propose plan {pid}", ["plans", "contracts", "records"])
+    ctx.db.transition("feature", pid, "plan_proposed", by="ateam")
+    click.echo(render_plan_review(pr, tiers))
+    click.echo(f"\nsession {result.res.session_id}: {result.res.num_turns} turns, ${result.res.cost_usd:.4f}")
+
+
+@main.group()
+def plans() -> None:
+    """Plans (feature requests and their contracts)."""
+
+
+@plans.command("list")
+@TARGET_OPTION
+def plans_list(target: Path) -> None:
+    from ateam.plans.store import load_plans
+
+    ctx = _context(target)
+    for pid, p in sorted(load_plans(ctx.paths.plans).items()):
+        click.echo(f"{pid}  {p.status:<14} {len(p.contracts)} contract(s)  {p.title}")
+
+
+@plans.command("show")
+@click.argument("plan_id")
+@TARGET_OPTION
+def plans_show(plan_id: str, target: Path) -> None:
+    import yaml
+
+    from ateam.plans.store import load_plans
+
+    ctx = _context(target)
+    ps = load_plans(ctx.paths.plans)
+    if plan_id not in ps:
+        _fail(f"unknown plan {plan_id}")
+    click.echo(yaml.safe_dump(ps[plan_id].model_dump(mode="json"), sort_keys=False))
+
+
 # ---------------------------------------------------------------- records
 
 
