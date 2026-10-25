@@ -10,7 +10,7 @@ import click
 from ateam import SPIKED_CLI_VERSION, __version__
 from ateam.config import TargetConfig, load_config
 from ateam.gitops import GitRepo
-from ateam.paths import TargetPaths, home_dir
+from ateam.paths import TargetPaths, home_dir, lookup_target, normalise_remote, origin_url, record_target, repo_id, repo_id_source
 from ateam.state.db import StateDB
 
 TARGET_OPTION = click.option(
@@ -28,9 +28,25 @@ class Context:
         self.db.init_schema()
 
 
+def _previous_home(target: Path) -> tuple[dict, Path] | None:
+    """(registry entry, old home dir) when this target's id changed and the old home still has an intent repo."""
+    previous = lookup_target(target)
+    if not previous or previous["id"] == repo_id(target):
+        return None
+    old_home = home_dir(target).parent / previous["id"]
+    return (previous, old_home) if (old_home / "intent" / ".git").exists() else None
+
+
 def _context(target: Path, require_ateam: bool = True) -> Context:
     if require_ateam and not TargetPaths.from_root(target).exists():
-        click.echo(f"No .ateam/ directory in {target}. Create .ateam/records/ and .ateam/contracts/ (see README, Your first record and contract); ateam init arrives in pass two.")
+        moved = _previous_home(target)
+        if moved:
+            previous, old_home = moved
+            click.echo(f"The intent repo for {target} exists under a previous id {previous['id']} (derived from {previous['source']}); "
+                       f"the id is now {repo_id(target)} (from {_derivation(target)}). Run: ateam intent init --adopt  to move it, "
+                       f"or ateam intent init --fresh to start a new one and keep {old_home} as is")
+        else:
+            click.echo(f"No intent repo for {target}. Run: ateam intent init")
         sys.exit(2)
     return Context(target)
 
@@ -58,6 +74,98 @@ class _Group(click.Group):
 @click.version_option(__version__, prog_name="ateam")
 def main() -> None:
     """ATeam: durable intent, role-separated workers, human approval gates."""
+
+
+# ---------------------------------------------------------------- intent
+
+
+@main.group()
+def intent() -> None:
+    """The private intent repo for a target (records, contracts, config)."""
+
+
+@intent.command("init")
+@click.option("--remote", default=None, help="Private git remote to pull from and push to.")
+@click.option("--adopt", is_flag=True, help="After the target's id changed (for example a new origin), move the existing home to the new id.")
+@click.option("--fresh", is_flag=True, help="After the target's id changed, start a new intent repo and leave the old home alone.")
+@TARGET_OPTION
+def intent_init(remote: str | None, adopt: bool, fresh: bool, target: Path) -> None:
+    """Create the intent repo for this target under ATeam's home. Idempotent."""
+    from ateam.intent import IntentError, adopt_home, init_intent
+
+    paths = TargetPaths.from_root(target)
+    moved = _previous_home(target) if not paths.exists() else None
+    if moved:
+        previous, old_home = moved
+        if adopt:
+            try:
+                adopt_home(old_home, paths.intent.parent)
+            except IntentError as e:
+                _fail(str(e))
+            click.echo(f"adopted {old_home} as {paths.intent.parent}")
+        elif not fresh:
+            _fail(f"this target's id changed from {previous['id']} ({previous['source']}) to {repo_id(target)} ({_derivation(target)}) "
+                  f"and {old_home / 'intent'} still exists. Pass --adopt to move it to the new id, or --fresh to start a new intent repo")
+    try:
+        git = init_intent(paths, remote=remote)
+    except IntentError as e:
+        _fail(str(e))
+    record_target(target)
+    click.echo(f"intent repo {paths.intent} ({git.current_branch()}, {'remote ' + remote if remote else 'no remote'})")
+    click.echo(f"repo id {repo_id(target)} derived from {_derivation(target)}")
+    click.echo("nothing was written into the target repository")
+
+
+@intent.command("path")
+@TARGET_OPTION
+def intent_path(target: Path) -> None:
+    """Print the intent repo location."""
+    click.echo(str(TargetPaths.from_root(target).intent))
+
+
+@intent.command("remote")
+@click.argument("url")
+@TARGET_OPTION
+def intent_remote(url: str, target: Path) -> None:
+    """Set the private remote."""
+    from ateam.intent import IntentError, set_remote
+
+    try:
+        set_remote(TargetPaths.from_root(target), url)
+    except IntentError as e:
+        _fail(str(e))
+    click.echo(f"origin -> {url}")
+
+
+@intent.command("push")
+@TARGET_OPTION
+def intent_push(target: Path) -> None:
+    """Push the intent repo to its private remote."""
+    from ateam.gitops import GitError
+    from ateam.intent import IntentError, push
+
+    try:
+        click.echo(push(TargetPaths.from_root(target)).strip() or "pushed")
+    except (IntentError, GitError) as e:
+        _fail(str(e))
+
+
+@intent.command("pull")
+@TARGET_OPTION
+def intent_pull(target: Path) -> None:
+    """Fast-forward the intent repo from its private remote."""
+    from ateam.gitops import GitError
+    from ateam.intent import IntentError, pull
+
+    try:
+        click.echo(pull(TargetPaths.from_root(target)).strip() or "pulled")
+    except (IntentError, GitError) as e:
+        _fail(str(e))
+
+
+def _derivation(target: Path) -> str:
+    url = origin_url(target)
+    return f"origin {normalise_remote(url)}" if url else "path"
 
 
 # ---------------------------------------------------------------- records
@@ -121,7 +229,7 @@ def records_show(record_id: str, target: Path) -> None:
 def _service(ctx: Context):
     from ateam.records.service import RecordService
 
-    return RecordService(ctx.paths, ctx.git, ctx.config)
+    return RecordService(ctx.paths, ctx.config)
 
 
 def _print_overlaps(ctx: Context, record_id: str) -> None:
@@ -245,10 +353,22 @@ def contracts_freeze(contract_id: str, force: bool, target: Path) -> None:
         _fail(f"unknown contract {contract_id}")
     if cs[contract_id].status != ContractStatus.draft and not force:
         _fail(f"{contract_id} is already frozen ({cs[contract_id].status}); pass --force to re-freeze and reset it")
-    graph = RecordGraph(load_records(ctx.paths.records))
+    from ateam.intent import IntentError, commit_intent, require_clean
+
+    recs = load_records(ctx.paths.records)
+    try:
+        require_clean(ctx.paths)
+    except IntentError as e:
+        _fail(str(e))
+    graph = RecordGraph(recs)
     selected = select_records(cs[contract_id].paths, graph, ctx.paths.root)
     frozen = freeze(cs[contract_id], selected)
-    save_contract(ctx.paths.contracts, frozen)
+    saved = save_contract(ctx.paths.contracts, frozen)
+    try:
+        commit_intent(ctx.paths, f"ateam: freeze {frozen.id}", [f"contracts/{saved.name}"])
+    except IntentError as e:
+        if "nothing to commit" not in str(e):
+            _fail(f"{e}. The frozen file is saved but not committed; commit it in {ctx.paths.intent} or re-run with --force")
     ctx.db.upsert_contract(frozen.id, frozen.plan, frozen.status, frozen.content_hash())
     for r in selected:
         ctx.db.set_record_hash(r.id, r.content_hash())
@@ -336,11 +456,23 @@ def doctor(target: Path) -> None:
     if __cli_version__ != SPIKED_CLI_VERSION:
         click.echo("WARN bundled Claude Code differs from the spiked version; re-run the spike before trusting the clean room")
     paths = TargetPaths.from_root(target)
-    click.echo(f"target {target}: .ateam/ {'present' if paths.exists() else 'missing'}")
+    click.echo(f"repo id {repo_id(target)} (from {_derivation(target)})")
+    moved = _previous_home(target)
+    if moved:
+        previous, old_home = moved
+        click.echo(f"WARN repo id derivation changed: now from {_derivation(target)} ({repo_id(target)}), was {previous['source']} "
+                   f"({previous['id']}). The intent repo for the old id is still at {old_home / 'intent'}; nothing was moved. "
+                   f"Run: ateam intent init --adopt  to move it, or --fresh to start over")
+    else:
+        record_target(target)
+    click.echo(f"intent repo {paths.intent}: {'present' if paths.exists() else 'missing (run: ateam intent init)'}")
+    if paths.exists():
+        remotes = GitRepo(paths.intent).run("remote", "-v").strip().splitlines()
+        click.echo("intent remote " + (remotes[0].split()[1] if remotes else "none"))
     try:
         git = GitRepo.discover(target)
         cfg = load_config(paths)
-        click.echo(f"branch {git.current_branch()} (target branch {cfg.target_branch})")
+        click.echo(f"target branch {git.current_branch()} (configured target branch {cfg.target_branch})")
     except Exception as e:  # noqa: BLE001
         click.echo(f"git: {e}")
 
@@ -368,7 +500,7 @@ def brief(contract_id: str, role: str, target: Path) -> None:
     selected = [recs[ref.id] for ref in cs[contract_id].records if ref.id in recs]
     prev_raw = ctx.db.latest_checkpoint(contract_id)
     prev = Checkpoint.from_dict(prev_raw) if prev_raw else None
-    click.echo(render_brief(assemble_brief(cs[contract_id], selected, prev, Role(role))))
+    click.echo(render_brief(assemble_brief(cs[contract_id], selected, prev, Role(role), scratch_dir=ctx.paths.scratch_root / contract_id)))
 
 
 @main.group()
@@ -392,7 +524,7 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
     from ateam.contracts.store import load_contracts
     from ateam.records.store import load_records
     from ateam.roles import Role
-    from ateam.runner.run import WorktreeNotPrepared, default_base, run_contract_attempt
+    from ateam.runner.run import default_base, run_contract_attempt
     from ateam.tiers import load_tiers
 
     from ateam.gitops import GitError
@@ -428,7 +560,7 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
             contract=contract, records=load_records(ctx.paths.records), role=Role(role), tiers=tiers,
             db=ctx.db, resume=resume, prompt=prompt, tier_override=tier,
         ))
-    except (ContractNotBinding, WorktreeNotPrepared) as e:
+    except ContractNotBinding as e:
         _fail(str(e), code=4)
     except ValueError as e:
         _fail(str(e))

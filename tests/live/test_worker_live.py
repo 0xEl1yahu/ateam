@@ -9,7 +9,8 @@ from ateam.contracts.model import Acceptance, Check
 from ateam.contracts.select import freeze, select_records
 from ateam.contracts.store import load_contracts, save_contract
 from ateam.gitops import GitRepo
-from ateam.paths import TargetPaths, home_dir
+from ateam.intent import commit_intent
+from ateam.paths import home_dir
 from ateam.records.graph import RecordGraph
 from ateam.records.service import RecordService
 from ateam.records.store import load_records
@@ -22,10 +23,10 @@ pytestmark = pytest.mark.skipif(not os.environ.get("ATEAM_LIVE_TESTS"), reason="
 
 
 @pytest.fixture
-def live_target(cli_target, sample_contract, tmp_path):
-    paths = TargetPaths.from_root(cli_target)
+def live_target(cli_target, target_paths, sample_contract, tmp_path):
+    paths = target_paths
     git = GitRepo(cli_target)
-    RecordService(paths, git, TargetConfig()).approve("R-0001")
+    RecordService(paths, TargetConfig()).approve("R-0001")
     records = load_records(paths.records)
     contract = sample_contract.model_copy(update={
         "title": "Add a routes comment",
@@ -35,7 +36,7 @@ def live_target(cli_target, sample_contract, tmp_path):
     })
     frozen = freeze(contract, select_records(contract.paths, RecordGraph(records), cli_target))
     save_contract(paths.contracts, frozen)
-    git.commit_paths([".ateam"], "ateam: freeze C-0001")
+    commit_intent(paths, "ateam: freeze C-0001", ["contracts"])
     db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
     db.upsert_contract(frozen.id, frozen.plan, frozen.status, frozen.content_hash())
     wt = tmp_path / "wt-C-0001"
@@ -52,7 +53,7 @@ async def test_build_worker_end_to_end(live_target):
     res, tree, scope, cp = await run_contract_attempt(
         paths=t["paths"], config=t["config"], git_worktree=wt_git, worktree=t["wt"], base=base,
         contract=t["contract"], records=t["records"], role=Role.build, tiers=tiers, db=t["db"],
-        prompt="Implement the contract: add the comment line as the first line of src/api/x.py, update .ateam-scratch/handoff.yaml, commit in this worktree, then report.",
+        prompt="Implement the contract: add the comment line as the first line of src/api/x.py, update the handoff file named in your brief, commit in this worktree, then report.",
     )
     print("\nsubtype", res.subtype, "turns", res.num_turns, "cost", res.cost_usd, "denials", res.denials)
     print("report", res.report)

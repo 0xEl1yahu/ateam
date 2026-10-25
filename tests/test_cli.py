@@ -13,7 +13,8 @@ import yaml
 
 from ateam.contracts.store import load_contracts
 from ateam.gitops import GitRepo
-from ateam.paths import home_dir
+from ateam.intent import commit_intent
+from ateam.paths import TargetPaths, home_dir
 from ateam.records.store import load_records, save_record
 from ateam.state.db import StateDB
 
@@ -25,7 +26,7 @@ def run(*args):
 def test_records_validate_reports_errors(cli_target, sample_record):
     bad = sample_record.model_copy(update={"id": "R-0002"})
     bad.binds.paths = ["./src/**"]
-    save_record(cli_target / ".ateam/records", bad)
+    save_record(TargetPaths.from_root(cli_target).records, bad)
     r = run("records", "validate", "--target", str(cli_target))
     assert r.exit_code == 1 and "ERROR R-0002" in r.output and "invalid glob" in r.output
 
@@ -44,7 +45,7 @@ def test_records_list_and_show(cli_target):
 def test_records_approve_commits_and_stores_hash(cli_target):
     r = run("records", "approve", "R-0001", "--target", str(cli_target))
     assert r.exit_code == 0, r.output
-    assert GitRepo(cli_target).run("log", "-1", "--format=%s").strip() == "ateam: approve R-0001"
+    assert GitRepo(TargetPaths.from_root(cli_target).intent).run("log", "-1", "--format=%s").strip() == "ateam: approve R-0001"
     db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
     assert "R-0001" in db.record_hashes()
 
@@ -52,8 +53,8 @@ def test_records_approve_commits_and_stores_hash(cli_target):
 def test_records_approve_shows_overlaps(cli_target, sample_record):
     run("records", "approve", "R-0001", "--target", str(cli_target))
     second = sample_record.model_copy(update={"id": "R-0002", "statement": "Books API returns JSON only"})
-    save_record(cli_target / ".ateam/records", second)
-    GitRepo(cli_target).commit_paths([".ateam"], "seed 2")
+    save_record(TargetPaths.from_root(cli_target).records, second)
+    commit_intent(TargetPaths.from_root(cli_target), "seed 2", ["records"])
     r = run("records", "approve", "R-0002", "--target", str(cli_target))
     assert r.exit_code == 0, r.output
     assert "Overlapping approved records:" in r.output and "R-0001" in r.output
@@ -61,7 +62,7 @@ def test_records_approve_shows_overlaps(cli_target, sample_record):
 
 def test_records_reject_and_guard_message(cli_target):
     r = run("records", "reject", "R-0001", "covered elsewhere", "--target", str(cli_target))
-    assert r.exit_code == 0 and load_records(cli_target / ".ateam/records")["R-0001"].status == "rejected"
+    assert r.exit_code == 0 and load_records(TargetPaths.from_root(cli_target).records)["R-0001"].status == "rejected"
     r2 = run("records", "approve", "R-0001", "--target", str(cli_target))
     assert r2.exit_code == 1 and "expected proposed" in r2.output
 
@@ -71,7 +72,7 @@ def test_contracts_show_and_freeze_selects_records(cli_target):
     assert "Expose reading state" in run("contracts", "show", "C-0001", "--target", str(cli_target)).output
     r = run("contracts", "freeze", "C-0001", "--target", str(cli_target))
     assert r.exit_code == 0 and "R-0001" in r.output, r.output
-    c = load_contracts(cli_target / ".ateam/contracts")["C-0001"]
+    c = load_contracts(TargetPaths.from_root(cli_target).contracts)["C-0001"]
     assert c.records[0].id == "R-0001" and c.records[0].hash and c.status == "ready"
     db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
     assert db.contract_status("C-0001") == "ready"
@@ -79,7 +80,7 @@ def test_contracts_show_and_freeze_selects_records(cli_target):
 
 def test_status_without_ateam_dir(tmp_path, ateam_home):
     r = run("status", "--target", str(tmp_path))
-    assert r.exit_code == 2 and "No .ateam/ directory" in r.output and "see README" in r.output
+    assert r.exit_code == 2 and "No intent repo" in r.output and "ateam intent init" in r.output
 
 
 def test_status_lists_contracts(cli_target):
@@ -94,7 +95,7 @@ def test_doctor_mentions_versions(cli_target):
 
 
 def test_records_validate_reports_malformed_file_without_traceback(cli_target):
-    (cli_target / ".ateam/records/notes.yaml").write_text("just: notes\n")
+    (TargetPaths.from_root(cli_target).records / "notes.yaml").write_text("just: notes\n")
     r = run("records", "validate", "--target", str(cli_target))
     assert r.exit_code == 1 and "ERROR" in r.output and "notes.yaml" in r.output and "Traceback" not in r.output
 
@@ -127,13 +128,13 @@ def test_contracts_validate_reports_hand_edit_and_drift(cli_target, sample_recor
     run("records", "approve", "R-0001", "--target", str(cli_target))
     run("contracts", "freeze", "C-0001", "--target", str(cli_target))
     assert run("contracts", "validate", "--target", str(cli_target)).exit_code == 0
-    c = load_contracts(cli_target / ".ateam/contracts")["C-0001"]
+    c = load_contracts(TargetPaths.from_root(cli_target).contracts)["C-0001"]
     from ateam.contracts.store import save_contract
-    save_contract(cli_target / ".ateam/contracts", c.model_copy(update={"title": "edited by hand"}))
+    save_contract(TargetPaths.from_root(cli_target).contracts, c.model_copy(update={"title": "edited by hand"}))
     r = run("contracts", "validate", "--target", str(cli_target))
     assert r.exit_code == 1 and "C-0001" in r.output and "hand edit" in r.output
-    save_contract(cli_target / ".ateam/contracts", c)
-    save_record(cli_target / ".ateam/records", load_records(cli_target / ".ateam/records")["R-0001"].model_copy(update={"statement": "changed"}))
+    save_contract(TargetPaths.from_root(cli_target).contracts, c)
+    save_record(TargetPaths.from_root(cli_target).records, load_records(TargetPaths.from_root(cli_target).records)["R-0001"].model_copy(update={"statement": "changed"}))
     r2 = run("contracts", "validate", "--target", str(cli_target))
     assert r2.exit_code == 1 and "drift" in r2.output and "R-0001" in r2.output
 
@@ -182,7 +183,112 @@ def test_default_base_is_merge_base_with_target_branch(cli_target, tmp_path):
 
 
 def test_malformed_record_file_is_reported_by_every_command(cli_target):
-    (cli_target / ".ateam/records/notes.yaml").write_text("just: notes\n")
+    (TargetPaths.from_root(cli_target).records / "notes.yaml").write_text("just: notes\n")
     for args in (["records", "list"], ["records", "show", "R-0001"], ["records", "approve", "R-0001"], ["contracts", "freeze", "C-0001"], ["brief", "C-0001", "--role", "build"]):
         r = run(*args, "--target", str(cli_target))
         assert r.exit_code == 1 and "notes.yaml" in r.output and "Traceback" not in r.output, args
+
+
+# ---- Task 6: intent commands, doctor derivation, nothing written into the target
+
+def _fresh_target(tmp_path, ateam_home):
+    import subprocess
+    t = tmp_path / "fresh"; t.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=t, check=True)
+    subprocess.run(["git", "config", "user.email", "t@e"], cwd=t, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=t, check=True)
+    (t / "f").write_text("x"); subprocess.run(["git", "add", "f"], cwd=t, check=True); subprocess.run(["git", "commit", "-q", "-m", "i"], cwd=t, check=True)
+    return t
+
+
+def test_intent_init_then_status_ok(tmp_path, ateam_home):
+    t = _fresh_target(tmp_path, ateam_home)
+    assert run("status", "--target", str(t)).exit_code == 2
+    r = run("intent", "init", "--target", str(t))
+    assert r.exit_code == 0 and str(TargetPaths.from_root(t).intent) in r.output, r.output
+    assert run("status", "--target", str(t)).exit_code == 0
+    assert run("intent", "init", "--target", str(t)).exit_code == 0  # idempotent
+    assert GitRepo(t).is_clean() and not (t / ".ateam").exists() and not (t / ".gitignore").exists()
+    assert run("intent", "path", "--target", str(t)).output.strip() == str(TargetPaths.from_root(t).intent)
+
+
+def test_intent_remote_push_pull(tmp_path, ateam_home):
+    import subprocess
+    t = _fresh_target(tmp_path, ateam_home)
+    bare = tmp_path / "private.git"; subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    assert run("intent", "init", "--remote", str(bare), "--target", str(t)).exit_code == 0
+    assert run("intent", "push", "--target", str(t)).exit_code == 0
+    assert subprocess.run(["git", "log", "-1", "--format=%s", "main"], cwd=bare, text=True, capture_output=True).stdout.strip() == "ateam: initialise intent repo"
+    assert run("intent", "pull", "--target", str(t)).exit_code == 0
+    assert run("intent", "remote", str(bare), "--target", str(t)).exit_code == 0
+
+
+def test_doctor_shows_id_source_and_intent_path(cli_target):
+    r = run("doctor", "--target", str(cli_target))
+    p = TargetPaths.from_root(cli_target)
+    assert r.exit_code == 0 and "from path" in r.output and str(p.intent) in r.output and "WARN" not in r.output
+
+
+def test_doctor_warns_when_id_source_changed(cli_target):
+    run("doctor", "--target", str(cli_target))  # records the current derivation
+    GitRepo(cli_target).run("remote", "add", "origin", "git@github.com:a/b.git")
+    r = run("doctor", "--target", str(cli_target))
+    assert "WARN" in r.output and "from origin" in r.output and "was path" in r.output
+
+
+def test_worker_run_leaves_target_and_worktree_free_of_ateam_files(cli_target, tmp_path):
+    _frozen_target(cli_target)
+    wt = tmp_path / "wt"; GitRepo(cli_target).worktree_add(wt, "wt-free", "main")
+    r = run("worker", "run", "C-0001", "--role", "investigate", "--cwd", str(wt), "--target", str(cli_target))
+    assert r.exit_code == 1 and "no investigate tier" in r.output
+    for root in (cli_target, wt):
+        assert not (root / ".ateam").exists() and not (root / ".ateam-scratch").exists()
+    assert GitRepo(cli_target).is_clean() and GitRepo(wt).is_clean()
+
+
+# ---- review: freeze guard, origin-change adoption, doctor detail
+
+def test_contracts_freeze_refuses_dirty_intent_and_commits_only_its_file(cli_target, sample_contract):
+    from ateam.contracts.store import save_contract
+    p = TargetPaths.from_root(cli_target)
+    run("records", "approve", "R-0001", "--target", str(cli_target))
+    (p.contracts / "stray.txt").write_text("x: 1\n")
+    r = run("contracts", "freeze", "C-0001", "--target", str(cli_target))
+    assert r.exit_code == 1 and "uncommitted" in r.output and str(p.intent) in r.output
+    (p.contracts / "stray.txt").unlink()
+    save_contract(p.contracts, sample_contract.model_copy(update={"id": "C-0002", "title": "Second"}))
+    commit_intent(p, "seed C-0002", ["contracts"])
+    assert run("contracts", "freeze", "C-0001", "--target", str(cli_target)).exit_code == 0
+    g = GitRepo(p.intent)
+    assert g.is_clean() and g.run("log", "-1", "--format=%s").strip() == "ateam: freeze C-0001"
+    assert g.run("show", "--stat", "--format=", "HEAD").count(".yaml") == 1
+
+
+def test_intent_init_refuses_orphaning_after_origin_change_unless_adopt(cli_target):
+    old = TargetPaths.from_root(cli_target)
+    assert old.exists()
+    GitRepo(cli_target).run("remote", "add", "origin", "git@github.com:a/b.git")
+    new = TargetPaths.from_root(cli_target)
+    assert new.intent != old.intent
+    r = run("status", "--target", str(cli_target))
+    assert r.exit_code == 2 and "--adopt" in r.output and old.intent.parent.name in r.output
+    r2 = run("intent", "init", "--target", str(cli_target))
+    assert r2.exit_code == 1 and "--adopt" in r2.output and old.intent.parent.name in r2.output and new.intent.parent.name in r2.output
+    assert old.exists() and not new.exists()
+    r3 = run("intent", "init", "--adopt", "--target", str(cli_target))
+    assert r3.exit_code == 0, r3.output
+    assert new.exists() and not old.intent.exists()
+    assert (new.records / "R-0001-reading-state-is-only-ever-set.yaml").is_file()
+    assert run("status", "--target", str(cli_target)).exit_code == 0
+
+
+def test_doctor_names_both_ids_and_leaves_old_repo(cli_target):
+    old = TargetPaths.from_root(cli_target)
+    run("doctor", "--target", str(cli_target))
+    GitRepo(cli_target).run("remote", "add", "origin", "git@github.com:a/b.git")
+    new = TargetPaths.from_root(cli_target)
+    r = run("doctor", "--target", str(cli_target))
+    assert "WARN" in r.output and old.intent.parent.name in r.output and new.intent.parent.name in r.output and "--adopt" in r.output
+    assert old.exists()
+    r2 = run("doctor", "--target", str(cli_target))
+    assert "WARN" in r2.output  # the warning persists until the owner resolves it

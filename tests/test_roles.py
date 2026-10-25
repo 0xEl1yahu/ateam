@@ -12,7 +12,7 @@ def test_role_tools():
 def test_authority_sentence_and_handoff_instruction():
     for spec in ROLE_SPECS.values():
         assert AUTHORITY in spec.system_prompt
-        assert ".ateam-scratch/handoff.yaml" in spec.system_prompt and "unresolved" in spec.system_prompt
+        assert "handoff" in spec.system_prompt and "unresolved" in spec.system_prompt and ".ateam-scratch" not in spec.system_prompt
 
 
 def test_report_schemas_are_strict():

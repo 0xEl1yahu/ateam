@@ -88,6 +88,7 @@ Three failure classes, each with its own mechanism:
 - **Spike first.** SDK, bare mode, hooks and path-scoped rules are validated by a small executable spike before the integration is committed to.
 - **Feature work happens in git worktrees**, for ATeam's own development as much as for its workers. Never on a branch in the main checkout. (Owner, 2026-10-25.)
 - **Git-native mechanisms only.** Nothing ATeam depends on may live in clone-local state such as `.git/info/exclude` or local config; a fresh clone on another machine must behave identically. Ignore rules go in the target's tracked `.gitignore`. (Owner, 2026-10-25.)
+- **Durable intent lives in a private intent repo, not in the target.** (Owner, 2026-10-25.) Target repos are often public; records and contracts are private engineering notes. The target carries nothing of ATeam's: no `.ateam/` directory, no ignore lines, no scratch files. Records, contracts, plans, reports and `config.yaml` live in their own git repository under ATeam's home, `~/.ateam/<repo-id>/intent/`, created by `ateam intent init`, optionally pushed to a private remote so another machine gets the same intent by pulling it. Approval commits land in the intent repo. The target branch is still where integration happens; the target itself carries no ATeam files. See "Intent repo" below. This supersedes the earlier "Two homes for truth" wording that placed `.ateam/` inside the target, and the "Target repo layout" section.
 - **Workers never run `rm`.** Deletion is an integration-time action. A tracked file a worker must remove goes through `git rm`, so the deletion is in the reviewed diff. (Owner, 2026-10-25.)
 - **Approval commits land on the target branch in the owner's checkout.** `ateam approve`, `ateam reject` and `ateam supersede` stage only `.ateam/` paths and commit on the configured target branch. They refuse to act if the checkout is on another branch or `.ateam/` already has uncommitted changes.
 
@@ -165,21 +166,30 @@ ATeam's own machinery, with no native equivalent:
 - Discovery with classification and idempotence.
 - Telemetry for calibration.
 
+## Intent repo (supersedes "Target repo layout" below for the location of `.ateam/`)
+
+```
+~/.ateam/<repo-id>/
+  intent/                 a git repository, created by `ateam intent init`, optional private remote
+    config.yaml           target_branch, setup, env, checks, serialize_checks, protected_paths, max_workers, tiers
+    records/              R-0001-<slug>.yaml ...
+    contracts/            C-0001-<slug>.yaml ...
+    plans/                P-0001-<slug>.yaml   (pass two)
+    reports/              merge proposals      (pass two)
+  state.db                operational state, never versioned, rebuildable
+  scratch/<contract-id>/  the worker's handoff notes, outside the worktree
+  worktrees/              (pass two scheduler)
+~/.ateam/targets.json     which target path maps to which id and how it was derived; `doctor` warns and `intent init --adopt|--fresh` resolves a change
+<target>/                 nothing of ATeam's
+```
+
+The repo id must be the same on every machine that clones the target, or the intent repo cannot follow the code. It is derived from the target's `origin` remote URL when one exists (normalised: scheme, user and `.git` suffix removed), and from the resolved path only for repos with no remote. `ateam doctor` prints both the id and what it was derived from.
+
+Commands: `ateam intent init [--remote URL] [--adopt|--fresh]` (creates the repo, directories, default config and first commit; with a remote that already has content, adopts it; writes nothing into the target), `ateam intent path`, `ateam intent remote URL`, `ateam intent push`, `ateam intent pull`. Approval, reject, supersede, retire and freeze commit in the intent repo with the `ateam:` prefix and refuse when the intent repo is dirty. A worker attempt during which the intent repo's head or cleanliness changed is recorded as `tamper` and fails, whatever the worker reported: that is the integrity backstop for intent, since the worktree tree check cannot see it. The previous guard "checkout must be on the target branch" no longer applies to approvals; it still applies to integration.
+
 ## Target repo layout
 
-```
-<target>/
-  .ateam/
-    config.yaml          target_branch, setup commands, env, checks, serialize_checks,
-                         protected paths, worker cap, tier map overrides
-    records/             R-0001-reading-state-owner-only.yaml ...
-    plans/               P-0001-<slug>.yaml  (feature request, contracts list, approvals)
-    contracts/           C-0001-<slug>.yaml ...
-    reports/             merge proposals and verification evidence summaries (committed)
-  .claude/worktrees/     not used by ATeam; ATeam uses ../<target>-ateam-worktrees/ or a configured path
-```
-
-Worktrees live outside the target checkout by default, under `~/.ateam/<target-repo-id>/worktrees/<contract-id>/`, so they never appear as untracked files in the target.
+Superseded on 2026-10-25 by "Intent repo" above: the target carries nothing of ATeam's. Worker scratch directories live at `~/.ateam/<repo-id>/scratch/<contract-id>/`, outside the worktree, so no ignore rule is needed in the target.
 
 ## Records
 
@@ -364,6 +374,16 @@ Resume policy for an interrupted or budget-stopped attempt: native session resum
 Downstream revalidation: after a verified contract merges onto the integration branch, its deterministic checks run again on the integration branch. A failure there is an `environment` failure for that contract and blocks dependents from becoming `ready` until resolved.
 
 Deferred until real failures are observed: token-budget allocation, context-pressure detection and session rotation, semantic retrieval or embeddings, summarisation hierarchies, live context sync between concurrent workers, custom compression. Auto-memory stays off for workers: it is shared across all worktrees of a repo and has no approval step, so it would be an unreviewed back-channel.
+
+## Observability and provenance (pass two)
+
+Owner decision, 2026-10-25: every worker attempt leaves an event log that is the primary record of what happened, so an error, a mistake, a lesson or a memory can be traced to the specific event that produced it. tmux is an optional viewer over those logs, never the execution substrate: workers are headless SDK sessions and are not steered through a terminal.
+
+- **Event log per attempt.** `~/.ateam/<repo-id>/logs/<attempt-id>.jsonl`, append-only, one JSON object per line with `seq`, `at`, `attempt`, `contract`, `role`, `type` and a typed payload. Event types: `session_start`, `assistant_text`, `tool_call`, `tool_result` (truncated, with a hash of the full content), `policy_denial`, `record_injected`, `check_run`, `state_transition`, `pause`, `report`, `session_end`, `error`. The coordinator writes the log as the SDK stream arrives, so a crash mid-attempt still leaves everything up to the crash.
+- **Event references.** An event is addressed as `A-<attempt-id>#<seq>`. `evidence` entries on records gain the type `event`, so a record proposed from a failure cites the exact denial, check or report that motivated it. Telemetry rows, checkpoints and pause reasons carry the `seq` of the event that caused them.
+- **Lessons are evidence-based.** A line added to `CLAUDE.md`, a new record, or a change to the policy that follows a mistake cites its event reference in the commit message and, for records, in `evidence`. "We saw this go wrong" becomes "A-0042#17: PreToolUse denied `git push` after the worker reported done". The pass-two `ateam lessons` command lists proposed records and policy changes with their events.
+- **Viewer.** `ateam watch [P-0001]` opens a tmux session with one window per running attempt tailing its log, a status window, and a window for pauses awaiting the owner. Closing it changes nothing. `ateam log A-0042 [--type policy_denial] [--since seq]` prints events without tmux, for SSH or after the fact.
+- **Retention and privacy.** Logs live in ATeam's home next to the state store, not in the intent repo, because tool results contain code and secrets may pass through them. They are never pushed. Retention is a config value with a default measured in days; events referenced by a record are kept regardless.
 
 ## Discovery
 

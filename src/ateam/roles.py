@@ -26,9 +26,10 @@ AUTHORITY = (
 )
 
 HANDOFF = (
-    "Keep the file .ateam-scratch/handoff.yaml up to date at every milestone. It is a YAML mapping with the keys "
-    "progress, unresolved, files, hypotheses and next. A replacement worker reads it if you are interrupted; "
-    "write it before any long step and before you finish."
+    "Keep the handoff file named in your brief (under 'Handoff file:') up to date at every milestone. It lives "
+    "outside the repository, so it never appears in git status. It is a YAML mapping with the keys progress, "
+    "unresolved, files, hypotheses and next. A replacement worker reads it if you are interrupted; write it before "
+    "any long step and before you finish."
 )
 
 COMMON = (
@@ -153,7 +154,7 @@ ROLE_SPECS: dict[Role, RoleSpec] = {
         system_prompt=(
             "ROLE: TEST. You judge whether the diff in this worktree satisfies each acceptance criterion in the "
             "contract, independently of whoever built it. You may run checks and tests and write scratch files "
-            "only under .ateam-scratch/. You never edit source or the contract's named tests. For every criterion "
+            "only in your scratch directory (the one holding the handoff file). You never edit source or the contract's named tests. For every criterion "
             "return met, not_met or cannot_determine with concrete evidence. A builder's claims are not evidence. "
             + COMMON
         ),

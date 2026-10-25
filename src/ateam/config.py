@@ -1,4 +1,4 @@
-"""Per-target configuration stored at .ateam/config.yaml."""
+"""Per-target configuration, stored as config.yaml in the target's private intent repo."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ class TargetConfig(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
     checks: list[NamedCheck] = Field(default_factory=list)
     serialize_checks: bool = False
-    protected_paths: list[str] = Field(default_factory=lambda: [".ateam/**", ".claude/**"])
+    protected_paths: list[str] = Field(default_factory=lambda: [".claude/**"])
     max_workers: int = 2
     global_record_cap: int = 5
     tiers: dict[str, dict] = Field(default_factory=dict)
@@ -37,6 +37,6 @@ def load_config(paths: TargetPaths) -> TargetConfig:
 
 
 def save_config(paths: TargetPaths, cfg: TargetConfig) -> Path:
-    paths.ateam.mkdir(parents=True, exist_ok=True)
+    paths.intent.mkdir(parents=True, exist_ok=True)
     paths.config_file.write_text(yaml.safe_dump(cfg.model_dump(mode="json"), sort_keys=False))
     return paths.config_file

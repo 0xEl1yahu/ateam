@@ -21,18 +21,18 @@ def test_porcelain_keeps_leading_space(target_repo):
 def test_is_clean_scoped_to_paths(target_repo):
     (target_repo / "src/app.py").write_text("changed\n")
     g = GitRepo(target_repo)
-    assert not g.is_clean() and not g.is_clean(["src"]) and g.is_clean([".ateam"])
+    assert not g.is_clean() and not g.is_clean(["src"]) and g.is_clean(["tests"])
 
 
 def test_commit_paths_only_stages_given_paths(target_repo):
     g = GitRepo(target_repo)
-    (target_repo / ".ateam/records/x.yaml").write_text("id: x\n")
+    (target_repo / "docs").mkdir(); (target_repo / "docs/x.md").write_text("x\n")
     (target_repo / "src/app.py").write_text("changed\n")
-    sha = g.commit_paths([".ateam/records"], "ateam: test")
+    sha = g.commit_paths(["docs"], "ateam: test")
     assert len(sha) == 40 and g.run("log", "-1", "--format=%s").strip() == "ateam: test"
-    assert not g.is_clean(["src"]) and g.is_clean([".ateam"])
+    assert not g.is_clean(["src"]) and g.is_clean(["docs"])
     with pytest.raises(GitError):
-        g.commit_paths([".ateam/records"], "nothing to commit")
+        g.commit_paths(["docs"], "nothing to commit")
 
 
 def test_diff_names(target_repo):
@@ -53,13 +53,13 @@ def test_worktree_add_remove(target_repo, tmp_path):
 
 def test_is_ignored(target_repo):
     g = GitRepo(target_repo)
-    assert g.is_ignored(".ateam-scratch/handoff.yaml") and not g.is_ignored("src/app.py")
+    assert g.is_ignored("src/__pycache__/x.pyc") and not g.is_ignored("src/app.py")
 
 
 def test_is_clean_prefix_does_not_match_sibling_names(target_repo):
     g = GitRepo(target_repo)
-    (target_repo / ".ateam-scratch").mkdir(); (target_repo / ".ateam-scratch/h.yaml").write_text("x\n")
-    (target_repo / ".ateamrc").write_text("x\n")
-    assert g.is_clean([".ateam"]) and g.is_clean([".ateam/"])
-    (target_repo / ".ateam/records/new.yaml").write_text("x\n")
-    assert not g.is_clean([".ateam"])
+    (target_repo / "docs-extra").mkdir(); (target_repo / "docs-extra/h.md").write_text("x\n")
+    (target_repo / "docsrc").write_text("x\n")
+    assert g.is_clean(["docs"]) and g.is_clean(["docs/"])
+    (target_repo / "docs").mkdir(); (target_repo / "docs/new.md").write_text("x\n")
+    assert not g.is_clean(["docs"])

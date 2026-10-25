@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS attempts (
 CREATE TABLE IF NOT EXISTS checkpoints (
     seq INTEGER PRIMARY KEY AUTOINCREMENT, contract_id TEXT NOT NULL, attempt_id INTEGER,
     facts TEXT NOT NULL, at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS run_lock (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1), plan_id TEXT NOT NULL, acquired_at TEXT NOT NULL, pid INTEGER);
 """
@@ -92,6 +93,19 @@ class StateDB:
 
     def schema_version(self) -> int:
         return int(self.conn.execute("SELECT version FROM schema_version").fetchone()[0])
+
+    # -- meta ---------------------------------------------------------------
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO meta (key, value, at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, at=excluded.at",
+                (key, value, _now()),
+            )
+
+    def get_meta(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else None
 
     # -- records ------------------------------------------------------------
 

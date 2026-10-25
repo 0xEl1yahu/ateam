@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import yaml
 
@@ -30,12 +31,16 @@ def render_record(r: Record) -> str:
     return "\n".join(lines)
 
 
-def _task(contract: Contract) -> str:
+def _task(contract: Contract, scratch_dir: Path | None) -> str:
     lines = [
         f"Contract {contract.id} ({contract.plan}): {contract.title}",
         "Paths you may change: " + ", ".join(contract.paths),
         "Incidental paths also allowed: " + (", ".join(contract.incidental) or "none"),
         "Depends on: " + (", ".join(contract.depends_on) or "nothing"),
+    ]
+    if scratch_dir is not None:
+        lines.append(f"Handoff file: {scratch_dir / 'handoff.yaml'}  (your scratch directory: {scratch_dir})")
+    lines += [
         "",
         "Acceptance criteria (read-only; you cannot change these):",
     ]
@@ -67,12 +72,14 @@ def _prior(cp: Checkpoint | None) -> str:
     return "\n".join(lines)
 
 
-def assemble_brief(contract: Contract, records: list[Record], checkpoint: Checkpoint | None, role: Role) -> Brief:
+def assemble_brief(
+    contract: Contract, records: list[Record], checkpoint: Checkpoint | None, role: Role, scratch_dir: Path | None = None
+) -> Brief:
     binding = "\n\n".join(render_record(r) for r in records) or "No binding records apply to this contract."
     notes = None
     if role != Role.test and checkpoint is not None and checkpoint.notes:
         notes = yaml.safe_dump(checkpoint.notes, sort_keys=False).strip()
-    return Brief(binding=binding, task=_task(contract), prior_work=_prior(checkpoint), notes=notes)
+    return Brief(binding=binding, task=_task(contract, scratch_dir), prior_work=_prior(checkpoint), notes=notes)
 
 
 def render_brief(b: Brief) -> str:

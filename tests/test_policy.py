@@ -13,11 +13,12 @@ def test_relative_rejects_escape(policy_build):
 
 def test_path_rules_per_role(policy_build, policy_test, policy_investigate):
     assert policy_build.path_writable("src/api/x.py")[0]
-    assert policy_build.path_writable(".ateam-scratch/handoff.yaml")[0]
+    assert not policy_build.path_writable(".ateam-scratch/handoff.yaml")[0]  # scratch lives outside the worktree now
     assert not policy_build.path_writable("src/data/y.py")[0]
     assert not policy_build.path_writable(".ateam/contracts/C-0001.yaml")[0]
     assert not policy_build.path_writable(".claude/settings.json")[0]
-    assert policy_test.path_writable(".ateam-scratch/notes.md")[0] and not policy_test.path_writable("src/api/x.py")[0]
+    assert not policy_test.path_writable(".ateam-scratch/notes.md")[0] and not policy_test.path_writable("src/api/x.py")[0]
+    assert "scratch directory" in policy_test.path_writable("src/api/x.py")[1]
     assert not policy_investigate.path_writable(".ateam-scratch/notes.md")[0]
 
 
@@ -156,7 +157,6 @@ BUILD_MUST_ALLOW = [
     "git rm src/api/old.py",
     "git rm -q --cached src/api/old.py",
     "find src -name '*.py' | wc -l",
-    "echo 'progress: half' > .ateam-scratch/handoff.yaml",
     # second review: false positives that must stay allowed
     "cat > src/api/x.py <<'EOF'\nRECORDS = '.ateam/records'\nEOF",
     "find .ateam/records -name '*.yaml'",
@@ -224,3 +224,105 @@ def test_investigate_command_allowed(policy_investigate, cmd):
 def test_protected_paths_are_case_insensitive(policy_build):
     assert not policy_build.path_writable(".ATEAM/contracts/C-0001.yaml")[0]
     assert "protected" in policy_build.path_writable(".ATEAM/contracts/C-0001.yaml")[1]
+
+
+# ---- Task 5: the worker's own scratch dir is the only writable place outside the worktree
+
+def _with_scratch(policy, scratch):
+    from dataclasses import replace
+
+    return replace(policy, scratch_dir=scratch)
+
+
+def test_write_to_own_scratch_allowed_build_and_test(policy_build, policy_test, tmp_path):
+    scratch = tmp_path / "home" / "scratch" / "C-0001"; scratch.mkdir(parents=True)
+    for pol in (policy_build, policy_test):
+        p = _with_scratch(pol, scratch)
+        ok, _ = p.path_writable_abs(str(scratch / "handoff.yaml"))
+        assert ok, pol.role
+
+
+def test_investigate_never_writes_even_to_scratch(policy_investigate, tmp_path):
+    scratch = tmp_path / "home" / "scratch" / "C-0001"; scratch.mkdir(parents=True)
+    assert not _with_scratch(policy_investigate, scratch).path_writable_abs(str(scratch / "handoff.yaml"))[0]
+
+
+def test_write_to_other_contract_scratch_denied(policy_build, tmp_path):
+    scratch = tmp_path / "home" / "scratch" / "C-0001"; other = tmp_path / "home" / "scratch" / "C-0002"
+    scratch.mkdir(parents=True); other.mkdir(parents=True)
+    ok, reason = _with_scratch(policy_build, scratch).path_writable_abs(str(other / "handoff.yaml"))
+    assert not ok and "outside" in reason
+
+
+def test_write_to_intent_repo_denied(policy_build, target_paths, tmp_path):
+    scratch = tmp_path / "home" / "scratch" / "C-0001"; scratch.mkdir(parents=True)
+    ok, _ = _with_scratch(policy_build, scratch).path_writable_abs(str(target_paths.records / "R-0001-x.yaml"))
+    assert not ok
+
+
+@pytest.mark.asyncio
+async def test_can_use_tool_scratch_rules(policy_build, tmp_path):
+    scratch = tmp_path / "home" / "scratch" / "C-0001"; scratch.mkdir(parents=True)
+    p = _with_scratch(policy_build, scratch)
+    assert isinstance(await p.can_use_tool("Write", {"file_path": str(scratch / "handoff.yaml"), "content": "x"}, None), PermissionResultAllow)
+    assert isinstance(await p.can_use_tool("Write", {"file_path": str(scratch.parent / "C-0002" / "h.yaml"), "content": "x"}, None), PermissionResultDeny)
+
+
+def test_bash_touching_intent_repo_denied(policy_build, target_paths):
+    scratch = target_paths.scratch_root / "C-0001"; scratch.mkdir(parents=True)  # the real layout: home/scratch/<contract>
+    p = _with_scratch(policy_build, scratch)
+    assert not p.command_allowed(f"echo x > {target_paths.records / 'R-0001.yaml'}")[0]
+    assert not p.command_allowed(f"cat {target_paths.intent / 'config.yaml'}")[0]
+    assert not p.command_allowed(f"sqlite3 {target_paths.intent.parent / 'state.db'} 'select 1'")[0]
+    assert p.command_allowed(f"echo 'progress: x' > {scratch / 'handoff.yaml'}")[0]
+    assert p.command_allowed(f"cat {scratch / 'handoff.yaml'}")[0]
+
+
+# ---- review: the real home layout is ~/.ateam/<id>/scratch/<contract>
+
+@pytest.fixture
+def real_layout(tmp_path, monkeypatch, records_three):
+    from ateam.paths import TargetPaths
+    from ateam.roles import Role
+    from ateam.runner.policy import Policy
+
+    monkeypatch.setenv("ATEAM_HOME", str(tmp_path / ".ateam"))
+    target = tmp_path / "proj"; target.mkdir()
+    paths = TargetPaths.from_root(target)
+    scratch = paths.scratch_root / "C-0001"; scratch.mkdir(parents=True)
+    paths.records.mkdir(parents=True)
+    pol = Policy(worktree=target, role=Role.build, allowed_paths=["src/**"], protected=[".claude/**"], bound={},
+                 scratch_dir=scratch, ateam_home=tmp_path / ".ateam")
+    return pol, paths, scratch
+
+
+def test_shell_writes_to_own_scratch_allowed_under_real_home_layout(real_layout):
+    pol, paths, scratch = real_layout
+    for cmd in (
+        f"echo 'progress: x' > {scratch}/handoff.yaml",
+        f"cat > {scratch}/handoff.yaml <<'EOF'\nprogress: x\nEOF",
+        f"python3 -m pytest > {scratch}/pytest.log",
+        f"mkdir -p {scratch}/out",
+        f"cd {scratch} && ls",
+        f"cat {scratch}/handoff.yaml",
+    ):
+        ok, reason = pol.command_allowed(cmd)
+        assert ok, f"{cmd!r}: {reason}"
+    assert pol.path_writable_abs(str(scratch / "handoff.yaml"))[0]
+
+
+def test_home_denial_covers_env_tilde_traversal_and_spelling(real_layout, tmp_path):
+    pol, paths, scratch = real_layout
+    rid = paths.intent.parent.name
+    for cmd in (
+        f"echo x > {paths.records}/R-0001.yaml",
+        f"echo x > $ATEAM_HOME/{rid}/intent/records/R-0001.yaml",
+        f"echo x > ~/.ateam/{rid}/intent/records/R-0001.yaml",
+        f"echo x > $HOME/.ateam/{rid}/intent/records/R-0001.yaml",
+        f"echo x > {scratch}/../../intent/records/R-0001.yaml",
+        f"cat {tmp_path}/.ateam/targets.json",
+        f"sqlite3 {paths.intent.parent}/state.db 'select 1'",
+    ):
+        ok, _ = pol.command_allowed(cmd)
+        assert not ok, f"should deny: {cmd!r}"
+    assert not pol.path_writable_abs(str(scratch / ".." / ".." / "intent" / "records" / "R.yaml"))[0]

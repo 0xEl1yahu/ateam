@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from ateam.gitops import GitRepo
 from ateam.globs import matches
 
-DEFAULT_IGNORE: tuple[str, ...] = (".claude/**", ".ateam-scratch/**")
+DEFAULT_IGNORE: tuple[str, ...] = (".claude/**",)
 
 
 @dataclass

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ateam.config import TargetConfig
-from ateam.gitops import GitRepo
+from ateam.intent import IntentError, commit_intent, intent_git
 from ateam.paths import TargetPaths
 from ateam.records import lifecycle
 from ateam.records.lifecycle import LifecycleError
@@ -13,17 +13,19 @@ from ateam.records.validate import validate_records
 
 
 class RecordService:
-    def __init__(self, paths: TargetPaths, git: GitRepo, config: TargetConfig) -> None:
+    """Record transitions, committed in the target's private intent repo (never in the target)."""
+
+    def __init__(self, paths: TargetPaths, config: TargetConfig) -> None:
         self.paths = paths
-        self.git = git
         self.config = config
 
     def _guard(self) -> None:
-        branch = self.git.current_branch()
-        if branch != self.config.target_branch:
-            raise LifecycleError(f"checkout is on {branch!r}, expected target branch {self.config.target_branch!r}")
-        if not self.git.is_clean([".ateam"]):
-            raise LifecycleError(".ateam/ has uncommitted changes; commit or discard them first")
+        try:
+            git = intent_git(self.paths)
+        except IntentError as e:
+            raise LifecycleError(str(e)) from e
+        if not git.is_clean():
+            raise LifecycleError(f"intent repo {self.paths.intent} has uncommitted changes; commit or discard them first")
 
     def _load(self, *ids: str) -> list[Record]:
         records = load_records(self.paths.records)
@@ -44,7 +46,7 @@ class RecordService:
         self._check(*records)
         for r in records:
             save_record(self.paths.records, r)
-        self.git.commit_paths([".ateam/records"], message)
+        commit_intent(self.paths, message, ["records"])
 
     def approve(self, record_id: str, basis: Basis | None = None) -> Record:
         self._guard()

@@ -14,6 +14,7 @@ from ateam.checkpoint import Checkpoint, collect
 from ateam.config import TargetConfig
 from ateam.contracts.model import Contract
 from ateam.gitops import GitRepo
+from ateam.intent import intent_git
 from ateam.paths import TargetPaths
 from ateam.records.model import Record
 from ateam.roles import ROLE_SPECS, Role
@@ -71,7 +72,9 @@ async def run_worker(prompt: str, options: ClaudeAgentOptions, policy: Policy) -
     )
 
 
-def build_policy(worktree: Path, role: Role, contract: Contract, config: TargetConfig, records: dict[str, Record]) -> Policy:
+def build_policy(
+    worktree: Path, role: Role, contract: Contract, config: TargetConfig, records: dict[str, Record], scratch_dir: Path | None = None
+) -> Policy:
     bound: dict[str, list[Record]] = {}
     for ref in contract.records:
         r = records.get(ref.id)
@@ -79,7 +82,10 @@ def build_policy(worktree: Path, role: Role, contract: Contract, config: TargetC
             continue
         for g in r.binds.paths:
             bound.setdefault(g, []).append(r)
-    return Policy(worktree=worktree, role=role, allowed_paths=list(contract.paths), protected=list(config.protected_paths), bound=bound)
+    return Policy(
+        worktree=worktree, role=role, allowed_paths=list(contract.paths), protected=list(config.protected_paths),
+        bound=bound, scratch_dir=scratch_dir, ateam_home=scratch_dir.parent.parent.parent if scratch_dir else None,
+    )
 
 
 def default_base(git_worktree: GitRepo, target_branch: str) -> str:
@@ -90,21 +96,11 @@ def default_base(git_worktree: GitRepo, target_branch: str) -> str:
         return git_worktree.head()
 
 
-class WorktreeNotPrepared(Exception):
-    """The worktree cannot host a worker yet."""
-
-
-def prepare_worktree(worktree: Path) -> None:
-    """Create the worker's scratch directory. Requires the target to ignore it through its tracked .gitignore.
-
-    Only git's own mechanism is used: no clone-local exclude files, so a fresh clone on another
-    machine behaves the same. Pass-two `ateam init` adds the line; until then it is a manual step.
-    """
-    if not GitRepo(worktree).is_ignored(".ateam-scratch/handoff.yaml"):
-        raise WorktreeNotPrepared(
-            "the target does not ignore .ateam-scratch/; add the line `.ateam-scratch/` to its tracked .gitignore and commit it"
-        )
-    (worktree / ".ateam-scratch").mkdir(exist_ok=True)
+def prepare_scratch(paths: TargetPaths, contract_id: str) -> Path:
+    """The worker's scratch directory, under ATeam's home, never inside the worktree or the target."""
+    scratch = paths.scratch_root / contract_id
+    scratch.mkdir(parents=True, exist_ok=True)
+    return scratch
 
 
 def default_prompt(contract: Contract, role: Role) -> str:
@@ -124,17 +120,21 @@ async def run_contract_attempt(
         tier, tier_name = tiers[tier_override][role], tier_override
     else:
         tier, tier_name = resolve(contract, role, tiers), contract.allocation.tier[role.value]
-    prepare_worktree(worktree)
-    policy = build_policy(worktree, role, contract, config, records)
+    scratch = prepare_scratch(paths, contract.id)
+    policy = build_policy(worktree, role, contract, config, records, scratch_dir=scratch)
     selected = [records[ref.id] for ref in contract.records if ref.id in records]
     prev_raw = db.latest_checkpoint(contract.id)
     prev = Checkpoint.from_dict(prev_raw) if prev_raw else None
-    brief_text = render_brief(assemble_brief(contract, selected, prev, role))
+    brief_text = render_brief(assemble_brief(contract, selected, prev, role, scratch_dir=scratch))
     predicted = {k: contract.allocation.model_dump()[k] for k in ("complexity", "risk", "uncertainty")}
     attempt_id = db.start_attempt(contract.id, role.value, tier_name, tier.model, predicted)
 
+    intent = intent_git(paths)
+    intent_before = (intent.head(), intent.is_clean())
     options = worker_options(cwd=worktree, spec=ROLE_SPECS[role], brief_text=brief_text, policy=policy, tier=tier, resume=resume)
     res = await run_worker(prompt or default_prompt(contract, role), options, policy)
+    intent_after = (intent.head(), intent.is_clean())
+    tampered = intent_after != intent_before or not intent_after[1]
 
     usage = res.usage
     tokens_in = int(usage.get("input_tokens", 0) or 0) + int(usage.get("cache_read_input_tokens", 0) or 0)
@@ -142,12 +142,16 @@ async def run_contract_attempt(
     try:
         tree = tree_state(git_worktree, base)
         scope = scope_check(tree, contract.paths, contract.incidental)
-        cp = collect(git_worktree, worktree, base, contract, records, res.session_id, checks=[])
+        cp = collect(git_worktree, scratch, base, contract, records, res.session_id, checks=[])
         db.set_checkpoint(contract.id, attempt_id, cp.to_dict())
     except Exception:
         # The session was already paid for: close the attempt before propagating.
         db.finish_attempt(attempt_id, "failed", "environment", tokens_in, tokens_out, res.cost_usd, res.num_turns, res.wall_s, res.session_id)
         raise
-    outcome = "completed" if res.report and scope.ok else ("scope_breach" if res.report else "failed")
-    db.finish_attempt(attempt_id, outcome, None, tokens_in, tokens_out, res.cost_usd, res.num_turns, res.wall_s, res.session_id)
+    if tampered:
+        outcome, failure_class = "tamper", "tamper"   # the intent repo changed during the session; nothing a worker may do
+    else:
+        outcome = "completed" if res.report and scope.ok else ("scope_breach" if res.report else "failed")
+        failure_class = None
+    db.finish_attempt(attempt_id, outcome, failure_class, tokens_in, tokens_out, res.cost_usd, res.num_turns, res.wall_s, res.session_id)
     return res, tree, scope, cp

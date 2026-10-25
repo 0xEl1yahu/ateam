@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -15,7 +16,6 @@ from ateam.roles import Role
 
 WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 READ_OR_WRITE_TOOLS = WRITE_TOOLS | {"Read"}
-SCRATCH = ".ateam-scratch/**"
 
 DESTRUCTIVE_PATTERNS: list[str] = [
     # git <global options>* <verb>; global options cover -C <dir>, -c k=v, --no-pager, etc.
@@ -134,6 +134,8 @@ class Policy:
     allowed_paths: list[str]
     protected: list[str]
     bound: dict[str, list[Record]] = field(default_factory=dict)
+    scratch_dir: Path | None = None   # the worker's own scratch dir under ATeam home; the only writable place outside the worktree
+    ateam_home: Path | None = None    # the ATeam home base ($ATEAM_HOME or ~/.ateam); everything in it except scratch_dir is off limits
     denials: list[str] = field(default_factory=list)
     injected: set[str] = field(default_factory=set)
 
@@ -152,15 +154,45 @@ class Policy:
         rel_posix = PurePosixPath(rel).as_posix()
         return None if rel_posix == "." else rel_posix
 
+    def _in_scratch(self, file_path: str) -> bool:
+        if self.scratch_dir is None:
+            return False
+        candidate = Path(file_path)
+        if not candidate.is_absolute():
+            candidate = self.worktree / candidate
+        try:
+            candidate.resolve().relative_to(self.scratch_dir.resolve())
+            return True
+        except ValueError:
+            return False
+
+    def _spellings(self, path: Path | None) -> list[str]:
+        if path is None:
+            return []
+        out = {str(path), str(path.resolve())}
+        return sorted(out, key=len, reverse=True)
+
+    def _home_spellings(self) -> list[str]:
+        home = self.ateam_home or Path(os.environ.get("ATEAM_HOME") or (Path.home() / ".ateam"))
+        out = set(self._spellings(home)) | {"$ATEAM_HOME", "${ATEAM_HOME}", "~/.ateam", "$HOME/.ateam", "${HOME}/.ateam"}
+        return sorted(out, key=len, reverse=True)
+
+    def path_writable_abs(self, file_path: str) -> tuple[bool, str]:
+        """Writability for any path: inside the worktree by the role rules, inside the worker's scratch dir, nothing else."""
+        rel = self.relative(file_path)
+        if rel is not None:
+            return self.path_writable(rel)
+        if self._in_scratch(file_path):
+            return (self.role != Role.investigate, "INVESTIGATE never writes files")
+        return False, "path is outside the worktree and outside your scratch directory"
+
     def path_writable(self, rel: str) -> tuple[bool, str]:
         if any(matches(g.lower(), rel.lower()) for g in self.protected):
             return False, f"{rel} is protected; contracts and records are read-only for workers"
-        if matches(SCRATCH, rel):
-            return (self.role != Role.investigate, "INVESTIGATE never writes files")
         if self.role == Role.investigate:
             return False, "INVESTIGATE never writes files"
         if self.role == Role.test:
-            return False, "TEST may write only under .ateam-scratch/"
+            return False, "TEST may write only in its scratch directory (outside the worktree)"
         if any(matches(g, rel) for g in self.allowed_paths):
             return True, ""
         return False, f"{rel} is outside the contract's declared paths"
@@ -172,10 +204,21 @@ class Policy:
             if re.search(pattern, cmd):
                 return False, f"destructive command matched {pattern!r}"
         segments = _split_segments(_strip_heredocs(cmd))
+        scratch_spellings = self._spellings(self.scratch_dir)
+        home_spellings = self._home_spellings() if self.scratch_dir is not None or self.ateam_home is not None else []
         for seg in segments:
+            mentions_scratch = any(sp in seg for sp in scratch_spellings)
+            if mentions_scratch and ".." in seg:
+                return False, "paths that leave your scratch directory are not allowed"
+            if any(sp in seg for sp in home_spellings) and not mentions_scratch:
+                return False, "ATeam's home (intent repo, state store, logs) is off limits to workers; only your scratch directory is writable"
+            rest = seg
+            for sp in [*scratch_spellings, *home_spellings]:
+                rest = rest.replace(sp, " ")
             if _is_rm(seg):
                 return False, "rm is not allowed for workers; use `git rm` for tracked files, cleanup happens at integration"
-            if _PROTECTED_MENTION.search(seg):
+            if _PROTECTED_MENTION.search(rest):
+                seg = rest
                 if _CD.match(seg):
                     return False, "changing directory into .ateam/ or .claude/ is not allowed"
                 if _MUTATORS.search(seg):
@@ -197,10 +240,7 @@ class Policy:
 
     def _decide(self, tool_name: str, tool_input: dict[str, Any]) -> tuple[bool, str]:
         if tool_name in WRITE_TOOLS:
-            rel = self.relative(str(tool_input.get("file_path", "")))
-            if rel is None:
-                return False, "path is outside the worktree"
-            return self.path_writable(rel)
+            return self.path_writable_abs(str(tool_input.get("file_path", "")))
         if tool_name == "Bash":
             return self.command_allowed(str(tool_input.get("command", "")))
         return True, ""
