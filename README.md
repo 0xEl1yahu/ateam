@@ -20,21 +20,21 @@ Workers run in a clean room built from SDK options (no setting sources, strict M
 
 ## Setting up a fresh target repo
 
-Install once per machine (above). Then, per target repository, five steps; everything ATeam writes ends up committed in the target's private intent repo, never in the target:
+Install once per machine (above). Then, per target repository; everything ATeam writes ends up committed in the target's private intent repo, never in the target:
 
-1. **Bootstrap.** `ateam intent init [--remote git@github.com:you/private-intent.git]` creates the intent repo and prints its path; `ateam intent path` prints it again. Optionally copy `examples/CLAUDE.target.md` to the target's `CLAUDE.md` so a Claude session a person opens there knows the rules (this is the only file you may choose to add to the target, and it is yours to keep private or not). Edit `$(ateam intent path)/config.yaml` to name the target branch and the deterministic checks.
-2. **First records.** Copy `examples/record.example.yaml` into `$(ateam intent path)/records/`, once per decision or invariant you already hold, bound to the paths it governs. A handful, not fifty. Commit them in the intent repo (`git -C "$(ateam intent path)" add -A && git -C "$(ateam intent path)" commit -m "ateam: first records"`), then `ateam records validate` and `ateam records approve R-0001` for each; approvals commit in the intent repo.
-3. **One contract per task.** Copy `examples/contract.example.yaml` into `$(ateam intent path)/contracts/`: the paths a worker may touch, the acceptance criteria and their checks, the allocation tier. Commit it, then `ateam contracts freeze C-0001`, which selects the binding records, makes the contract binding and commits the frozen contract.
+1. **Bootstrap.** `ateam intent init [--remote git@github.com:you/private-intent.git]` creates the intent repo. Optionally copy `examples/CLAUDE.target.md` to the target's `CLAUDE.md` so a Claude session a person opens there knows the rules. Edit `$(ateam intent path)/config.yaml` to name the target branch and the deterministic checks the planner may use.
+2. **Discover.** `ateam init` runs a read-only INVESTIGATE worker in your checkout and proposes a small baseline of records, each marked documented or inferred, requirement or observation, with evidence and the paths it binds. `ateam records review` walks you through them: approve as requirement or observation, reject with a reason, or skip. Rejected proposals never come back.
+3. **Plan.** `ateam plan "<request>"` turns a feature request into draft contracts with dependencies, acceptance criteria and a complexity, risk and uncertainty allocation with the planner's reasoning, plus any records the plan introduces, and prints the review. `ateam approve P-0001 [--tier C-0002=careful]` walks the proposed records, applies your tier overrides, freezes the contracts in dependency order and marks the plan approved. `ateam reject P-0001 "reason"` records why.
 4. **Run a worker in a worktree.** `git worktree add ../repo-C-0001 -b ateam/C-0001 main`, then `ateam worker run C-0001 --role build --cwd ../repo-C-0001`. Read the report, the diff and `ateam status`.
-5. **Verify and merge yourself.** Run the contract's checks in the worktree, optionally a TEST worker (`--role test`), then merge the branch. This loop is manual until pass two.
+5. **Verify and merge yourself.** Run the contract's checks in the worktree, optionally a TEST worker (`--role test`), then merge the branch. Scheduling, verification as a gate and integration are the next stages.
 
-`docs/first-run-walkthrough.md` is the same sequence on a scratch repo with the expected output at every step.
+`docs/first-run-walkthrough.md` is the same sequence on a scratch repo with the expected output at every step. Records and contracts can also be written by hand from `examples/` when you want to seed intent directly.
 
 ## Using it for development today
 
-In pass one you are the planner and the integrator; ATeam is the enforcer. You decide the records and write the contracts. ATeam guarantees that a worker starts only under a frozen, unchanged contract, sees the binding records up front and again when it touches a bound file, cannot edit protected files, push, `rm` or leave its declared paths, and reports in a typed schema that the tree and scope check cross-examine. Telemetry per attempt (tier, model, tokens, cost, turns, wall time, outcome) accumulates in the state store for calibrating the tiers.
+Discovery and planning are automated and gated: ATeam proposes records and contracts, you approve them. You are still the scheduler and the integrator. ATeam guarantees that a worker starts only under a frozen, unchanged contract, sees the binding records up front and again when it touches a bound file, cannot edit protected files, push, `rm` or leave its declared paths, and reports in a typed schema that the tree and scope check cross-examine. Telemetry per attempt (tier, model, tokens, cost, turns, wall time, outcome) accumulates in the state store for calibrating the tiers.
 
-Not yet automated: discovering records from an existing codebase (`ateam init`), breaking a feature into contracts (`ateam plan`), scheduling several workers, running the deterministic checks plus the TEST role as a gate, and integrating onto a branch with a merge proposal for approval. Those are pass two; every interface they need exists.
+Not yet automated: scheduling several workers, running the deterministic checks plus the TEST role as a gate, integrating onto a branch with a merge proposal for approval, event logs and the tmux viewer, and the doctor's repair modes. Every interface they need exists.
 
 A good first real use: a small, well-understood feature in a throwaway clone of one of your repos. Three records, two contracts, one BUILD run each, then a TEST run on the same worktree with `--role test --tier light` to see the verdict format.
 
@@ -48,6 +48,12 @@ Every command except `ateam schema` takes `--target PATH` (default: the current 
 ateam doctor --target ~/code/myrepo            # versions, repo id derivation, intent repo, target branch
 ateam intent init [--remote URL]               # create the private intent repo for this target
 ateam intent path | remote URL | push | pull   # where it is; private remote; sync with another machine
+ateam init [--max-candidates 12] [--tier standard]   # discover and propose records (read-only worker in your checkout)
+ateam records review [--all]                   # approve as requirement/observation, reject with reason, skip
+ateam plan "<request>" [--tier standard]       # propose contracts and a plan; prints the review
+ateam approve P-0001 [--tier C-0002=careful] [--tier C-0002:investigate=light] [--skip-records]
+ateam reject P-0001 "reason"
+ateam plans list | show P-0001
 ateam records validate --target ~/code/myrepo  # schema, globs, supersession, dead globs, hand edits
 ateam records list [--status approved]
 ateam records show R-0001
@@ -115,6 +121,6 @@ ATEAM_LIVE_TESTS=1 .venv/bin/pytest tests/live -s   # one real haiku session, a 
 
 ## Status
 
-Pass one is complete: records, contracts, config, state store, git operations, brief assembly, the worker policy gate, the clean-room runner and a single verified worker run. Discovery (`ateam init`), the planner (`ateam plan`), the scheduler and worktree pool, the verifier (deterministic checks plus the TEST role) and the integrator with the merge gate are pass two.
+Done: records, contracts, config, the private intent repo, state store, git operations, brief assembly, the worker policy gate, the clean-room runner, a single verified worker run, discovery (`ateam init`), the planner (`ateam plan`) and plan approval. Next: the scheduler and worktree pool, the verifier (deterministic checks plus the TEST role as a gate), the integrator with the merge gate, event logs with the tmux viewer, the doctor's repair modes, calibration.
 
 The spike that validated the SDK integration is in `spikes/2026-10-24-sdk-bare-hooks/`.

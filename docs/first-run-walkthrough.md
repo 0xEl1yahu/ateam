@@ -55,89 +55,41 @@ ateam status               # Features: none / Contracts: none, exit 0
 git status --short         # still only your own files; nothing of ATeam's
 ```
 
-## 2. One record, one contract
-
-Write the record. The fingerprint identifies the proposal by its evidence; any hex string is accepted today, and the one-liner below computes the real one.
+## 2. Discover records, plan the task, approve
 
 ```bash
-FP=$(~/Documents/GitHub/ateam/.venv/bin/python -c "from ateam.records.model import Evidence, compute_fingerprint; print(compute_fingerprint([Evidence(type='doc', ref='README.md#rules')]))")
-cat > "$I/records/R-0001-routes-stay-declarative.yaml" <<EOF
-id: R-0001
-kind: invariant
-status: proposed
-origin: documented
-basis: requirement
-statement: >
-  Route handlers under src/api never read environment variables directly; configuration arrives through function arguments.
-rationale: >
-  Keeps handlers testable without a live environment.
-evidence:
-  - {type: doc, ref: README.md#rules}
-binds:
-  paths: ["src/api/**"]
-  incidental: []
-supersedes: []
-serves: ["handlers stay testable"]
-fingerprint: $FP
-history:
-  - {at: 2026-10-25T09:00:00Z, by: owner, to: proposed, why: "first record"}
-EOF
+printf '# Rules\n\nRoute handlers under src/api never read environment variables directly; configuration arrives through function arguments.\n' > README.md
+git add README.md && git commit -q -m "rules"
+ateam init --tier light
 ```
 
-Write the contract. Its paths are what a BUILD worker may touch; everything else is a scope breach.
+Expected: a read-only worker runs in this checkout (no worktree, no branch), then a report headed `N records proposed`. With this playground expect one or two candidates: the README rule should appear as `[documented, requirement]` with evidence `doc README.md...` bound to `src/api/**`; anything inferred only from code appears as `[inferred, observation]`. Dropped candidates (dead globs, global cap) are listed with reasons, unknowns are listed, and the last line is `Next: ateam records review`. `git status --short` is still clean: discovery wrote only into the intent repo, as the commit `ateam: propose N records from discovery` in `git -C "$I" log` shows.
 
 ```bash
-cat > "$I/contracts/C-0001-health-endpoint.yaml" <<'EOF'
-id: C-0001
-plan: P-0001
-title: Add a health function to the routes module
-status: draft
-depends_on: []
-paths: ["src/api/**", "tests/**"]
-incidental: []
-records: []
-acceptance:
-  - id: A1
-    statement: src/api/routes.py defines health() returning the string "ok"
-    check: {type: test, ref: tests/test_routes.py::RoutesTest::test_health}
-  - id: A2
-    statement: health() reads no environment variables (R-0001)
-    check: {type: judgment}
-checks:
-  - {name: unit, cmd: "python3 -m unittest discover -s tests -t . -q"}
-allocation:
-  complexity: low
-  risk: low
-  uncertainty: low
-  reasoning: One pure function and one test; no boundaries crossed.
-  tier: {build: light, test: light, investigate: none}
-budget: {attempts: 2, usd_per_attempt: 0.5, max_turns: 20}
-EOF
-git -C "$I" add -A && git -C "$I" commit -q -m "ateam: first record and contract"
+ateam records review
 ```
-
-## 3. Validate, approve, freeze, brief
+Expected: each proposed record printed in full with any overlapping approved records, then a prompt. Type `r` to approve as a requirement, `o` as an observation, `j` then a reason to reject, `s` to skip, `q` to stop. Approve the README rule with `r`. Each decision is its own commit in the intent repo. The summary line reads `approved 1, rejected 0, skipped 0`.
 
 ```bash
-ateam records validate
+ateam plan "Add a health() function to src/api/routes.py that returns the string ok, with a unit test" --tier light
 ```
-Expected: `0 error(s), 0 warning(s)`, exit 0. Try breaking it once: change `paths: ["src/api/**"]` to `["./src/api/**"]`, run again, and you should see `ERROR R-0001: invalid glob` and exit 1. Change it back.
+Expected: the planner runs read-only in this checkout and prints the review: `Plan P-0001: ...`, then one contract block (`C-0001`) with paths that include `src/api/**` and `tests/**`, acceptance criteria with a `test` check naming `tests/test_routes.py::...`, the `unit` check, `complexity: low   risk: low   uncertainty: low` with the planner's reasoning, the tiers with model names, and `bound records: R-0001`. Then open questions and notes, and the two commands `Approve: ateam approve P-0001 ...` and `Reject: ...`. The plan, the draft contract and any proposed records are committed in the intent repo as `ateam: propose plan P-0001`; `ateam status` shows `P-0001  plan_proposed  1 contract(s)`.
+
+If the planner's output is unusable (a dependency cycle, a check that isn't configured), the command prints the problems, writes nothing, marks the plan `plan_rejected`, and you re-run it.
 
 ```bash
-ateam records approve R-0001
+ateam approve P-0001
 ```
-Expected: `R-0001 -> approved`, and `git -C "$I" log -1 --format=%s` prints `ateam: approve R-0001`. The target's own log is unchanged. Two refusals worth seeing: run it again and you get `error: R-0001 is approved; expected proposed`; create an uncommitted file in the intent repo and any approval refuses, naming the intent repo path.
+Expected: if the plan proposed records, the same review prompts first. Then `Frozen contracts, in dependency order:` with `C-0001  ready  build=light test=light investigate=none  records: R-0001`, any notes (a TEST tier raised to the BUILD tier is printed, never silent), and `P-0001 -> plan_approved`. From here the contract is binding.
+
+## 3. Check what the worker will see
 
 ```bash
-ateam contracts freeze C-0001
-```
-Expected: `C-0001 frozen as ready with records: R-0001`. The contract file now carries `records: [{id: R-0001, hash: ...}]` and `status: ready`. ATeam also renames files to `<id>-<slug>.yaml` whenever it saves them, so the contract is now `C-0001-add-a-health-function-to-the.yaml` and the record became `R-0001-route-handlers-under-src-api-never.yaml` at approval; use `ls "$I"/*/` rather than the names you typed. The freeze commits in the intent repo (`ateam: freeze C-0001`). A second `freeze` refuses with "already frozen" unless you pass `--force`.
-
-```bash
+ateam records validate       # 0 error(s), 0 warning(s)
 ateam contracts validate     # 0 error(s)
 ateam brief C-0001 --role build
 ```
-Expected: four labelled sections. `## Binding` holds the record as `### ATeam binding record R-0001 (invariant)`. `## Task` lists the paths, both criteria and the check. `## Verified prior work` says this is the first attempt. There is no notes section yet.
+Expected: four labelled sections. `## Binding` holds the record as `### ATeam binding record R-0001 (invariant)`. `## Task` lists the paths, the acceptance criteria, the check, the budget and the absolute handoff path. `## Verified prior work` says this is the first attempt. There is no notes section yet. Files are named `<id>-<slug>.yaml` by ATeam, so use `ls "$I"/*/` rather than guessing names.
 
 ## 4. The worker run
 
@@ -194,3 +146,68 @@ Telemetry for calibration lives in `~/.ateam/<repo-id>/state.db`, next to the in
 - Any worker action that reached the worktree despite a denial, or any denial that blocked something legitimate.
 - Whether the brief would have been enough for you, as a human, to do the task without asking questions.
 - The cost and turn count of your runs, so the tier defaults can be calibrated.
+
+## Appendix: seeding records and contracts by hand
+
+When you already know the rules and the task, you can skip discovery and planning and write the files directly into the intent repo, then `ateam records approve` and `ateam contracts freeze` them. The templates in `examples/` are annotated; this is what the playground's record and contract look like:
+
+The record. The fingerprint identifies the proposal by its evidence; the one-liner computes the real one.
+
+```bash
+FP=$(~/Documents/GitHub/ateam/.venv/bin/python -c "from ateam.records.model import Evidence, compute_fingerprint; print(compute_fingerprint([Evidence(type='doc', ref='README.md#rules')]))")
+cat > "$I/records/R-0001-routes-stay-declarative.yaml" <<EOF
+id: R-0001
+kind: invariant
+status: proposed
+origin: documented
+basis: requirement
+statement: >
+  Route handlers under src/api never read environment variables directly; configuration arrives through function arguments.
+rationale: >
+  Keeps handlers testable without a live environment.
+evidence:
+  - {type: doc, ref: README.md#rules}
+binds:
+  paths: ["src/api/**"]
+  incidental: []
+supersedes: []
+serves: ["handlers stay testable"]
+fingerprint: $FP
+history:
+  - {at: 2026-10-25T09:00:00Z, by: owner, to: proposed, why: "first record"}
+EOF
+```
+
+The contract. Its paths are what a BUILD worker may touch; everything else is a scope breach. After committing, `ateam records approve R-0001` and `ateam contracts freeze C-0001` make them binding.
+
+```bash
+cat > "$I/contracts/C-0001-health-endpoint.yaml" <<'EOF'
+id: C-0001
+plan: P-0001
+title: Add a health function to the routes module
+status: draft
+depends_on: []
+paths: ["src/api/**", "tests/**"]
+incidental: []
+records: []
+acceptance:
+  - id: A1
+    statement: src/api/routes.py defines health() returning the string "ok"
+    check: {type: test, ref: tests/test_routes.py::RoutesTest::test_health}
+  - id: A2
+    statement: health() reads no environment variables (R-0001)
+    check: {type: judgment}
+checks:
+  - {name: unit, cmd: "python3 -m unittest discover -s tests -t . -q"}
+allocation:
+  complexity: low
+  risk: low
+  uncertainty: low
+  reasoning: One pure function and one test; no boundaries crossed.
+  tier: {build: light, test: light, investigate: none}
+budget: {attempts: 2, usd_per_attempt: 0.5, max_turns: 20}
+EOF
+git -C "$I" add -A && git -C "$I" commit -q -m "ateam: first record and contract"
+```
+
+
