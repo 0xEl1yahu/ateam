@@ -11,6 +11,8 @@ from ateam import SPIKED_CLI_VERSION, __version__
 from ateam.config import TargetConfig, load_config
 from ateam.gitops import GitRepo
 from ateam.paths import TargetPaths, home_dir, lookup_target, normalise_remote, origin_url, record_target, repo_id, repo_id_source
+from ateam.intent import IntentError, commit_intent, require_clean
+from ateam.runner.investigate import run_investigation
 from ateam.state.db import StateDB
 
 TARGET_OPTION = click.option(
@@ -168,6 +170,352 @@ def _derivation(target: Path) -> str:
     return f"origin {normalise_remote(url)}" if url else "path"
 
 
+# ---------------------------------------------------------------- init (discovery)
+
+
+def _records_index(records) -> str:
+    approved = [r for r in records.values() if r.status == "approved"]
+    if not approved:
+        return "Approved records: none yet; no approved records apply to any path in this target."
+    lines = ["Approved records (id, kind, binds, statement):"]
+    lines += [f"- {r.id} {r.kind} [{', '.join(r.binds.paths) or 'global'}] {r.statement.strip()}" for r in sorted(approved, key=lambda r: r.id)]
+    return "\n".join(lines)
+
+
+@main.command()
+@click.option("--remote", default=None, help="Private remote for the intent repo, when creating it.")
+@click.option("--max-candidates", default=12, show_default=True, type=int)
+@click.option("--tier", default="standard", show_default=True, type=click.Choice(["light", "standard", "careful"]))
+@TARGET_OPTION
+def init(remote: str | None, max_candidates: int, tier: str, target: Path) -> None:
+    """Discover a small baseline of records from the target and propose them for review."""
+    import asyncio
+
+    from ateam.discovery import candidates_to_records, render_discovery_report
+    from ateam.intent import init_intent
+    from ateam.records.store import load_records, save_record
+    from ateam.roles import DISCOVERY_SPEC, Role
+    from ateam.tiers import load_tiers
+
+    paths = TargetPaths.from_root(target)
+    if not paths.exists():
+        try:
+            init_intent(paths, remote=remote)
+        except IntentError as e:
+            _fail(str(e))
+        record_target(target)
+    ctx = Context(target)
+    records = load_records(ctx.paths.records)
+    brief = "\n\n".join([
+        f"Propose at most {max_candidates} candidate records; at most {ctx.config.global_record_cap} may be global (no paths).",
+        _records_index(records),
+        "Do not re-propose anything already covered above.",
+    ])
+    tiers = load_tiers(ctx.config.tiers)
+    result = asyncio.run(run_investigation(
+        paths=ctx.paths, config=ctx.config, target_git=ctx.git, name="init", spec=DISCOVERY_SPEC,
+        prompt="Discover this repository's existing engineering intent and report candidates.", brief_text=brief,
+        tier=tiers[tier][Role.investigate], db=ctx.db, tier_name=tier,
+    ))
+    if result.tampered:
+        _fail("discovery changed the checkout or the intent repo; report discarded: " + "; ".join(result.tampered))
+    if result.res.report is None:
+        _fail(f"discovery produced no report (subtype {result.res.subtype}{', ' + result.res.error if result.res.error else ''})")
+    report = result.res.report
+    disc = candidates_to_records(report.get("candidates", []), report.get("unknowns", []), records, ctx.paths.root,
+                                 ctx.paths.records, cap_global=ctx.config.global_record_cap)
+    for rec in disc.proposed:
+        save_record(ctx.paths.records, rec)
+    if disc.proposed:
+        n = len(disc.proposed)
+        commit_intent(ctx.paths, f"ateam: propose {n} record{'s' if n != 1 else ''} from discovery", ["records"])
+    click.echo(render_discovery_report(disc))
+    click.echo(f"\nsession {result.res.session_id}: {result.res.num_turns} turns, ${result.res.cost_usd:.4f}")
+
+
+# ---------------------------------------------------------------- plan
+
+
+@main.command()
+@click.argument("request")
+@click.option("--tier", default="standard", show_default=True, type=click.Choice(["light", "standard", "careful"]))
+@TARGET_OPTION
+def plan(request: str, tier: str, target: Path) -> None:
+    """Turn a feature request into contracts and a plan for approval."""
+    import asyncio
+
+    from ateam.allocation import rubric_text
+    from ateam.contracts.store import save_contract
+    from ateam.planner import PlanError, render_plan_review, report_to_plan
+    from ateam.plans.store import next_id as next_plan_id
+    from ateam.plans.store import save_plan
+    from ateam.records.store import load_records, save_record
+    from ateam.roles import PLANNER_SPEC, Role
+    from ateam.tiers import load_tiers
+
+    from datetime import UTC, datetime
+
+    from ateam.gitops import GitError
+    from ateam.plans.model import Plan, PlanHistoryEntry, PlanStatus
+
+    ctx = _context(target)
+    disk_next = int(next_plan_id(ctx.paths.plans).split("-")[1])
+    db_max = ctx.db.max_feature_id()
+    db_next = int(db_max.split("-")[1]) + 1 if db_max else 1
+    pid = f"P-{max(disk_next, db_next):04d}"
+    ctx.db.transition("feature", pid, "requested", by="owner", reason=request[:200])
+    ctx.db.transition("feature", pid, "investigating", by="ateam")
+    records = load_records(ctx.paths.records)
+    tiers = load_tiers(ctx.config.tiers)
+    brief = "\n\n".join([
+        f"Feature request from the owner:\n{request}",
+        _records_index(records),
+        "Configured deterministic checks (use only these names): " + (", ".join(f"{c.name} (`{c.cmd}`)" for c in ctx.config.checks) or "none"),
+        "Tier names: light, standard, careful; investigate may also be none.",
+        "Allocation rubric:\n" + rubric_text(),
+    ])
+    def _rejected(reason: str) -> None:
+        """Leave a visible, terminal trace: a rejected plan file (committed) and the feature state."""
+        rejected = Plan(id=pid, title=request[:80], request=request, status=PlanStatus.plan_rejected,
+                        history=[PlanHistoryEntry(at=datetime.now(UTC), by="ateam", to=PlanStatus.plan_rejected, why=reason)])
+        save_plan(ctx.paths.plans, rejected)
+        try:
+            commit_intent(ctx.paths, f"ateam: reject plan {pid} ({reason})", ["plans"])
+        except (IntentError, GitError):
+            pass
+        current = ctx.db.feature_status(pid)
+        if current == "investigating":
+            ctx.db.transition("feature", pid, "plan_proposed", by="ateam")
+        if ctx.db.feature_status(pid) == "plan_proposed":
+            ctx.db.transition("feature", pid, "plan_rejected", by="ateam", reason=reason)
+
+    try:
+        result = asyncio.run(run_investigation(
+            paths=ctx.paths, config=ctx.config, target_git=ctx.git, name=pid, spec=PLANNER_SPEC,
+            prompt="Produce the plan for the feature request in your brief.", brief_text=brief,
+            tier=tiers[tier][Role.investigate], db=ctx.db, tier_name=tier,
+        ))
+    except Exception as e:  # noqa: BLE001  the session is the untrusted part; never leave the plan half-open
+        _rejected(f"planner session failed: {type(e).__name__}")
+        _fail(f"planning failed before any report: {e}. Re-run: ateam plan \"{request}\"")
+
+    if result.tampered:
+        _rejected("planner changed the checkout or intent repo")
+        _fail("planning changed the checkout or the intent repo; report discarded: " + "; ".join(result.tampered))
+    if result.res.report is None:
+        _rejected("planner produced no report")
+        _fail(f"planning produced no report (subtype {result.res.subtype}{', ' + result.res.error if result.res.error else ''})")
+    try:
+        pr = report_to_plan(result.res.report, request, pid, ctx.paths.contracts, records, ctx.config, ctx.paths.root, ctx.paths.records)
+    except PlanError as e:
+        _rejected("planner output invalid")
+        click.echo("The planner's output is not usable; nothing was written. Problems:")
+        for problem in e.problems:
+            click.echo(f"  - {problem}")
+        click.echo(f"Re-run: ateam plan \"{request}\"")
+        sys.exit(1)
+    for c in pr.contracts:
+        save_contract(ctx.paths.contracts, c)
+    for r in pr.proposed.proposed:
+        save_record(ctx.paths.records, r)
+    save_plan(ctx.paths.plans, pr.plan)
+    commit_intent(ctx.paths, f"ateam: propose plan {pid}", ["plans", "contracts", "records"])
+    ctx.db.transition("feature", pid, "plan_proposed", by="ateam")
+    click.echo(render_plan_review(pr, tiers))
+    click.echo(f"\nsession {result.res.session_id}: {result.res.num_turns} turns, ${result.res.cost_usd:.4f}")
+
+
+def _dependency_order(contracts: dict) -> list[str]:
+    """Contract ids with dependencies first; ties by id. Cycles were rejected at planning time."""
+    remaining = dict(contracts)
+    order: list[str] = []
+    while remaining:
+        ready = sorted(cid for cid, c in remaining.items() if all(d not in remaining for d in c.depends_on))
+        if not ready:
+            ready = sorted(remaining)[:1]
+        for cid in ready:
+            order.append(cid)
+            remaining.pop(cid)
+    return order
+
+
+def _parse_tier_overrides(specs: tuple[str, ...], plan_contracts: list[str], tier_names: list[str]) -> dict[str, dict[str, str]]:
+    overrides: dict[str, dict[str, str]] = {}
+    for spec in specs:
+        if "=" not in spec:
+            _fail(f"bad --tier {spec!r}; use C-0002=careful or C-0002:test=careful")
+        lhs, name = spec.split("=", 1)
+        cid, _, role = lhs.partition(":")
+        if cid not in plan_contracts:
+            _fail(f"--tier {spec!r}: {cid} is not in this plan ({', '.join(plan_contracts)})")
+        if name not in tier_names:
+            _fail(f"--tier {spec!r}: unknown tier {name!r}; known: {', '.join(tier_names)}")
+        roles = [role] if role else ["build", "test"]   # investigate changes only when named; "none" is a real setting
+        if any(r not in ("build", "test", "investigate") for r in roles):
+            _fail(f"--tier {spec!r}: role must be build, test or investigate")
+        overrides.setdefault(cid, {}).update({r: name for r in roles})
+    return overrides
+
+
+@main.command()
+@click.argument("plan_id")
+@click.option("--tier", "tier_specs", multiple=True, help="Override tiers: C-0002=careful (build and test) or C-0002:investigate=light (one role); repeatable.")
+@click.option("--skip-records", is_flag=True, help="Do not walk the plan's proposed records now.")
+@TARGET_OPTION
+def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, target: Path) -> None:
+    """Approve a plan: review its proposed records, apply tier overrides, freeze its contracts."""
+    from datetime import UTC, datetime
+
+    from ateam.allocation import investigate_tier_for, tier_for_complexity, tier_for_test
+    from ateam.contracts.model import Level
+    from ateam.contracts.select import freeze, select_records
+    from ateam.contracts.store import load_contracts, save_contract
+    from ateam.gitops import GitError
+    from ateam.plans.model import PlanHistoryEntry, PlanStatus
+    from ateam.plans.store import load_plans, save_plan
+    from ateam.records.graph import RecordGraph
+    from ateam.records.store import load_records
+    from ateam.tiers import ORDER, at_least, load_tiers
+
+    ctx = _context(target)
+    plans_ = load_plans(ctx.paths.plans)
+    if plan_id not in plans_:
+        _fail(f"unknown plan {plan_id}")
+    plan_ = plans_[plan_id]
+    if plan_.status != PlanStatus.plan_proposed:
+        _fail(f"{plan_id} is {plan_.status}; only plan_proposed plans can be approved")
+    tiers = load_tiers(ctx.config.tiers)
+    overrides = _parse_tier_overrides(tier_specs, plan_.contracts, list(tiers))
+
+    counts = {"approved": 0, "rejected": 0, "skipped": 0}
+    if plan_.proposed_records and not skip_records:
+        click.echo(f"Records proposed by {plan_id}:")
+        _review_records(ctx, list(plan_.proposed_records), counts)
+        click.echo(f"records: approved {counts['approved']}, rejected {counts['rejected']}, skipped {counts['skipped']}")
+    try:
+        require_clean(ctx.paths)
+    except IntentError as e:
+        _fail(str(e))
+
+    cs = load_contracts(ctx.paths.contracts)
+    missing = [cid for cid in plan_.contracts if cid not in cs]
+    if missing:
+        _fail(f"{plan_id} names contracts that do not exist: {', '.join(missing)}")
+    records = load_records(ctx.paths.records)
+    graph = RecordGraph(records)
+    notes: list[str] = []
+    frozen_all: list[tuple] = []
+    click.echo("Frozen contracts, in dependency order:")
+    for cid in _dependency_order({cid: cs[cid] for cid in plan_.contracts}):
+        c = cs[cid]
+        tier = dict(c.allocation.tier)
+        tier.update(overrides.get(cid, {}))
+        build = tier.get("build") if tier.get("build") in ORDER else "standard"
+        wanted = at_least(build, tier.get("test") if tier.get("test") in ORDER else "light")
+        if wanted != tier.get("test"):
+            notes.append(f"{cid}: test tier raised from {tier.get('test')!r} to {wanted!r} (TEST never runs below BUILD)")
+            tier["test"] = wanted
+        if tier.get("investigate", "none") == "none" and Level(c.allocation.uncertainty) in (Level.medium, Level.high):
+            tier["investigate"] = investigate_tier_for(c.allocation.uncertainty)
+            notes.append(f"{cid}: investigate tier set to {tier['investigate']!r} for {c.allocation.uncertainty} uncertainty")
+        if cid in overrides:
+            build_floor = tier_for_complexity(c.allocation.complexity)
+            if ORDER.index(tier["build"]) < ORDER.index(build_floor):
+                notes.append(f"{cid}: build tier {tier['build']!r} is below the rubric floor {build_floor!r} ({c.allocation.complexity} complexity); owner override kept")
+            test_floor = tier_for_test(c.allocation.risk, tier["build"])
+            if ORDER.index(tier["test"]) < ORDER.index(test_floor):
+                notes.append(f"{cid}: test tier {tier['test']!r} is below the rubric floor {test_floor!r} ({c.allocation.risk} risk); owner override kept")
+        c = c.model_copy(update={"allocation": c.allocation.model_copy(update={"tier": tier})})
+        selected = select_records(c.paths, graph, ctx.paths.root)
+        frozen = freeze(c, selected)
+        save_contract(ctx.paths.contracts, frozen)
+        frozen_all.append((frozen, selected))
+        click.echo(f"  {frozen.id}  {frozen.status:<6} build={tier['build']} test={tier['test']} investigate={tier.get('investigate', 'none')}  records: {', '.join(r.id for r in selected) or 'none'}")
+    for n in notes:
+        click.echo(f"  note: {n}")
+    plan_ = plan_.model_copy(update={
+        "status": PlanStatus.plan_approved, "tier_overrides": overrides,
+        "history": [*plan_.history, PlanHistoryEntry(at=datetime.now(UTC), by="owner", to=PlanStatus.plan_approved)],
+    })
+    save_plan(ctx.paths.plans, plan_)
+    try:
+        commit_intent(ctx.paths, f"ateam: approve plan {plan_id}", ["plans", "contracts"])
+    except (IntentError, GitError) as e:
+        click.echo(f"error: could not commit the approval in the intent repo: {e}")
+        click.echo("Nothing was recorded in the state store. Restore the intent repo and re-run:")
+        click.echo(f"  git -C \"{ctx.paths.intent}\" checkout -- . && git -C \"{ctx.paths.intent}\" clean -fd plans contracts")
+        sys.exit(1)
+    # The intent repo is the truth; only now does the state store follow it.
+    for frozen, selected in frozen_all:
+        ctx.db.upsert_contract(frozen.id, frozen.plan, frozen.status, frozen.content_hash())
+        for r in selected:
+            ctx.db.set_record_hash(r.id, r.content_hash())
+    ctx.db.transition("feature", plan_id, "plan_approved", by="owner")
+    click.echo(f"{plan_id} -> plan_approved")
+
+
+@main.command()
+@click.argument("plan_id")
+@click.argument("reason")
+@TARGET_OPTION
+def reject(plan_id: str, reason: str, target: Path) -> None:
+    """Reject a proposed plan. Its contracts stay draft and are never frozen."""
+    from datetime import UTC, datetime
+
+    from ateam.plans.model import PlanHistoryEntry, PlanStatus
+    from ateam.plans.store import load_plans, save_plan
+
+    ctx = _context(target)
+    plans_ = load_plans(ctx.paths.plans)
+    if plan_id not in plans_:
+        _fail(f"unknown plan {plan_id}")
+    plan_ = plans_[plan_id]
+    if plan_.status != PlanStatus.plan_proposed:
+        _fail(f"{plan_id} is {plan_.status}; only plan_proposed plans can be rejected")
+    try:
+        require_clean(ctx.paths)
+    except IntentError as e:
+        _fail(str(e))
+    plan_ = plan_.model_copy(update={
+        "status": PlanStatus.plan_rejected,
+        "history": [*plan_.history, PlanHistoryEntry(at=datetime.now(UTC), by="owner", to=PlanStatus.plan_rejected, why=reason)],
+    })
+    save_plan(ctx.paths.plans, plan_)
+    commit_intent(ctx.paths, f"ateam: reject plan {plan_id}", ["plans"])
+    ctx.db.transition("feature", plan_id, "plan_rejected", by="owner", reason=reason)
+    click.echo(f"{plan_id} -> plan_rejected")
+
+
+@main.group()
+def plans() -> None:
+    """Plans (feature requests and their contracts)."""
+
+
+@plans.command("list")
+@TARGET_OPTION
+def plans_list(target: Path) -> None:
+    from ateam.plans.store import load_plans
+
+    ctx = _context(target)
+    for pid, p in sorted(load_plans(ctx.paths.plans).items()):
+        click.echo(f"{pid}  {p.status:<14} {len(p.contracts)} contract(s)  {p.title}")
+
+
+@plans.command("show")
+@click.argument("plan_id")
+@TARGET_OPTION
+def plans_show(plan_id: str, target: Path) -> None:
+    import yaml
+
+    from ateam.plans.store import load_plans
+
+    ctx = _context(target)
+    ps = load_plans(ctx.paths.plans)
+    if plan_id not in ps:
+        _fail(f"unknown plan {plan_id}")
+    click.echo(yaml.safe_dump(ps[plan_id].model_dump(mode="json"), sort_keys=False))
+
+
 # ---------------------------------------------------------------- records
 
 
@@ -274,6 +622,64 @@ def _lifecycle(ctx: Context, action, *records_out: str) -> None:
         click.echo(f"{r.id} -> {r.status}")
 
 
+@records.command("review")
+@click.option("--all", "review_all", is_flag=True, help="Review every record, not only proposed ones.")
+@TARGET_OPTION
+def records_review(review_all: bool, target: Path) -> None:
+    """Walk through proposed records: approve as requirement or observation, reject with a reason, or skip."""
+    from ateam.records.store import load_records
+
+    ctx = _context(target)
+    recs = load_records(ctx.paths.records)
+    proposed = [rid for rid, r in sorted(recs.items()) if r.status == "proposed"]
+    if review_all:
+        for rid, r in sorted(recs.items()):
+            if r.status != "proposed":
+                click.echo(f"{rid}  {r.status:<10} {r.statement.strip()[:90]}")
+        if not proposed:
+            click.echo("Nothing to decide: no proposed records.")
+            return
+    elif not proposed:
+        click.echo("Nothing proposed. Run ateam init or ateam plan to get proposals.")
+        return
+    counts = {"approved": 0, "rejected": 0, "skipped": 0}
+    _review_records(ctx, proposed, counts)
+    click.echo(f"approved {counts['approved']}, rejected {counts['rejected']}, skipped {counts['skipped']}")
+
+
+def _review_records(ctx: Context, record_ids: list[str], counts: dict[str, int]) -> None:
+    import yaml
+
+    from ateam.records.lifecycle import LifecycleError
+    from ateam.records.model import Basis
+    from ateam.records.store import load_records
+
+    svc = _service(ctx)
+    for rid in record_ids:
+        recs = load_records(ctx.paths.records)
+        if rid not in recs or recs[rid].status != "proposed":
+            continue
+        click.echo("\n" + yaml.safe_dump(recs[rid].model_dump(mode="json", exclude={"history", "fingerprint"}), sort_keys=False))
+        _print_overlaps(ctx, rid)
+        choice = click.prompt(f"{rid}: approve as [r]equirement, approve as [o]bservation, re[j]ect, [s]kip, [q]uit",
+                              type=click.Choice(["r", "o", "j", "s", "q"]), show_choices=False)
+        try:
+            if choice in ("r", "o"):
+                rec = svc.approve(rid, Basis.requirement if choice == "r" else Basis.observation)
+                ctx.db.set_record_hash(rec.id, rec.content_hash()); counts["approved"] += 1
+            elif choice == "j":
+                reason = click.prompt("reason")
+                rec = svc.reject(rid, reason)
+                ctx.db.set_record_hash(rec.id, rec.content_hash()); counts["rejected"] += 1
+            elif choice == "s":
+                counts["skipped"] += 1
+            else:
+                counts["skipped"] += len(record_ids) - record_ids.index(rid)
+                break
+        except LifecycleError as e:
+            click.echo(f"error: {e}")
+
+
 @records.command("approve")
 @click.argument("record_id")
 @click.option("--basis", type=click.Choice(["requirement", "observation"]), default=None)
@@ -353,8 +759,6 @@ def contracts_freeze(contract_id: str, force: bool, target: Path) -> None:
         _fail(f"unknown contract {contract_id}")
     if cs[contract_id].status != ContractStatus.draft and not force:
         _fail(f"{contract_id} is already frozen ({cs[contract_id].status}); pass --force to re-freeze and reset it")
-    from ateam.intent import IntentError, commit_intent, require_clean
-
     recs = load_records(ctx.paths.records)
     try:
         require_clean(ctx.paths)
@@ -428,11 +832,14 @@ def schema(kind: str) -> None:
 @TARGET_OPTION
 def status(target: Path) -> None:
     """Feature and contract state from the operational store."""
+    from ateam.plans.store import load_plans
+
     ctx = _context(target)
-    rows = ctx.db.conn.execute("SELECT feature_id, status FROM features ORDER BY feature_id").fetchall()
-    click.echo("Features:" if rows else "Features: none")
-    for r in rows:
-        click.echo(f"  {r['feature_id']}  {r['status']}")
+    plans_ = load_plans(ctx.paths.plans)
+    click.echo("Plans:" if plans_ else "Plans: none")
+    for pid, p in sorted(plans_.items()):
+        live = ctx.db.feature_status(pid) or p.status
+        click.echo(f"  {pid}  {live:<14} {len(p.contracts)} contract(s)  {p.title}")
     crow = ctx.db.conn.execute("SELECT contract_id, plan_id, status FROM contracts ORDER BY contract_id").fetchall()
     click.echo("Contracts:" if crow else "Contracts: none")
     for r in crow:

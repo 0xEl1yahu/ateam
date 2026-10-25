@@ -38,3 +38,10 @@ def test_target_claude_md_mentions_every_command_it_lists_exists():
     for cmd in commands:
         r = CliRunner().invoke(main, [*cmd.split(), "--help"])
         assert r.exit_code == 0, f"`ateam {cmd}` is not a real command"
+
+
+def test_plan_example_loads():
+    from ateam.plans.model import Plan
+
+    p = Plan.model_validate(yaml.safe_load((EXAMPLES / "plan.example.yaml").read_text()))
+    assert p.id == "P-0001" and p.contracts and p.status == "plan_proposed"

@@ -143,6 +143,10 @@ class StateDB:
         row = self.conn.execute("SELECT status FROM features WHERE feature_id=?", (feature_id,)).fetchone()
         return row["status"] if row else None
 
+    def max_feature_id(self) -> str | None:
+        row = self.conn.execute("SELECT MAX(feature_id) AS m FROM features").fetchone()
+        return row["m"] if row and row["m"] else None
+
     def contracts_for_plan(self, plan_id: str) -> list[dict[str, Any]]:
         return [dict(r) for r in self.conn.execute("SELECT * FROM contracts WHERE plan_id=? ORDER BY contract_id", (plan_id,))]
 

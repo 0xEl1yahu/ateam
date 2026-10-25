@@ -19,8 +19,8 @@ from ateam.records.store import load_records, save_record
 from ateam.state.db import StateDB
 
 
-def run(*args):
-    return CliRunner().invoke(main, list(args))
+def run(*args, input=None):
+    return CliRunner().invoke(main, list(args), input=input)
 
 
 def test_records_validate_reports_errors(cli_target, sample_record):
@@ -292,3 +292,278 @@ def test_doctor_names_both_ids_and_leaves_old_repo(cli_target):
     assert old.exists()
     r2 = run("doctor", "--target", str(cli_target))
     assert "WARN" in r2.output  # the warning persists until the owner resolves it
+
+
+# ---- stage 1: ateam init and records review
+
+def _canned_discovery(**over):
+    report = {"candidates": [{
+        "kind": "invariant", "statement": "Routes never read environment variables directly", "rationale": "testability",
+        "origin": "documented", "basis": "requirement", "evidence": [{"type": "doc", "ref": "README.md#rules"}],
+        "paths": ["src/api/**"], "serves": ["testable handlers"], "confidence": "high"}], "unknowns": ["which port"], "notes": "n"}
+    report.update(over)
+    return report
+
+
+def _patch_investigation(monkeypatch, report):
+    from ateam.runner import investigate as inv_mod
+    from ateam.runner.run import WorkerResult
+
+    async def fake(**kw):
+        db = kw["db"]
+        a = db.start_attempt(kw["name"], "investigate", "light", "haiku", {})
+        db.finish_attempt(a, "completed", None, 1, 1, 0.001, 1, 0.1, "s")
+        res = WorkerResult("success", False, "completed", "s", 1, 0.001, {}, {}, report, [], [], None, 0.1)
+        return inv_mod.InvestigationResult(res=res, attempt_id=a, tampered=[])
+
+    monkeypatch.setattr("ateam.cli.run_investigation", fake, raising=False)
+    monkeypatch.setattr("ateam.discovery.run_investigation", fake, raising=False)
+    monkeypatch.setattr(inv_mod, "run_investigation", fake)
+
+
+def test_init_writes_proposed_records_and_commits(monkeypatch, target_repo, target_paths):
+    (target_repo / "README.md").write_text("# rules\nRoutes never read env.\n")
+    GitRepo(target_repo).run("add", "README.md"); GitRepo(target_repo).run("commit", "-q", "-m", "readme")
+    _patch_investigation(monkeypatch, _canned_discovery())
+    r = run("init", "--target", str(target_repo))
+    assert r.exit_code == 0, r.output
+    assert "R-0001" in r.output and "ateam records review" in r.output and "which port" in r.output
+    recs = load_records(target_paths.records)
+    assert recs["R-0001"].status == "proposed"
+    g = GitRepo(target_paths.intent)
+    assert g.is_clean() and "propose 1 record" in g.run("log", "-1", "--format=%s")
+    assert GitRepo(target_repo).is_clean()
+
+
+def test_init_with_zero_candidates_exits_zero(monkeypatch, target_repo, target_paths):
+    _patch_investigation(monkeypatch, _canned_discovery(candidates=[]))
+    r = run("init", "--target", str(target_repo))
+    assert r.exit_code == 0 and "0 records" in r.output and load_records(target_paths.records) == {}
+
+
+def test_init_creates_intent_repo_when_missing(monkeypatch, tmp_path, ateam_home):
+    t = _fresh_target(tmp_path, ateam_home)
+    _patch_investigation(monkeypatch, _canned_discovery(candidates=[]))
+    assert run("init", "--target", str(t)).exit_code == 0 and TargetPaths.from_root(t).exists()
+
+
+def test_records_review_approve_reject_skip_via_input(cli_target, sample_record):
+    p = TargetPaths.from_root(cli_target)
+    for rid in ("R-0002", "R-0003"):
+        save_record(p.records, sample_record.model_copy(update={"id": rid, "statement": f"Rule {rid}"}))
+    commit_intent(p, "seed", ["records"])
+    r = run("records", "review", "--target", str(cli_target), input="r\nj\nnot needed\ns\n")
+    assert r.exit_code == 0, r.output
+    recs = load_records(p.records)
+    assert recs["R-0001"].status == "approved" and recs["R-0001"].basis == "requirement"
+    assert recs["R-0002"].status == "rejected" and recs["R-0002"].history[-1].why == "not needed"
+    assert recs["R-0003"].status == "proposed"
+    assert "approved 1" in r.output and "rejected 1" in r.output and "skipped 1" in r.output
+
+
+# ---- stage 2: ateam plan
+
+def _canned_plan():
+    return {"title": "Health endpoint", "contracts": [{
+        "title": "Add health", "paths": ["src/api/**", "tests/**"], "incidental": [], "depends_on": [],
+        "acceptance": [{"id": "A1", "statement": "health() returns ok", "check": {"type": "test", "ref": "tests/test_routes.py::RoutesTest::test_health"}}],
+        "checks": [], "allocation": {"complexity": "low", "risk": "low", "uncertainty": "low", "reasoning": "one function",
+                                     "tier": {"build": "light", "test": "light", "investigate": "none"}}}],
+        "proposed_records": [], "unknowns": ["which port"], "notes": "n"}
+
+
+def test_plan_command_writes_plan_contracts_and_transitions(monkeypatch, cli_target):
+    from ateam.plans.store import load_plans
+    _patch_investigation(monkeypatch, _canned_plan())
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    p = TargetPaths.from_root(cli_target)
+    plans = load_plans(p.plans)
+    assert plans["P-0001"].status == "plan_proposed" and plans["P-0001"].contracts == ["C-0002"]   # C-0001 exists from the fixture
+    assert load_contracts(p.contracts)["C-0002"].status == "draft"
+    db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
+    assert db.feature_status("P-0001") == "plan_proposed"
+    assert GitRepo(p.intent).is_clean() and "propose plan P-0001" in GitRepo(p.intent).run("log", "-1", "--format=%s")
+    assert "ateam approve P-0001" in r.output and "which port" in r.output
+    assert run("plans", "list", "--target", str(cli_target)).output.count("P-0001") == 1
+    assert "add a health function" in run("plans", "show", "P-0001", "--target", str(cli_target)).output
+
+
+def test_plan_command_invalid_report_rejects_and_writes_nothing(monkeypatch, cli_target):
+    from ateam.plans.store import load_plans
+    bad = _canned_plan(); bad["contracts"][0]["depends_on"] = [0]
+    _patch_investigation(monkeypatch, bad)
+    p = TargetPaths.from_root(cli_target)
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 1 and "cycle" in r.output
+    # no contract and no proposed record is written; the plan itself is recorded as rejected so the id is not reused
+    assert "C-0002" not in load_contracts(p.contracts) and load_plans(p.plans)["P-0001"].status == "plan_rejected"
+    assert load_plans(p.plans)["P-0001"].contracts == [] and GitRepo(p.intent).is_clean()
+    db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
+    assert db.feature_status("P-0001") == "plan_rejected" and db.contract_hash("C-0002") is None
+
+
+# ---- stage 2: approve and reject a plan
+
+def _proposed_plan(monkeypatch, cli_target, two=False, with_record=False):
+    rep = _canned_plan()
+    if two:
+        second = dict(rep["contracts"][0]); second = {**second, "title": "Use health in router", "depends_on": [0],
+                                                    "allocation": {**second["allocation"], "complexity": "high", "tier": {"build": "careful", "test": "light", "investigate": "none"}}}
+        rep["contracts"].append(second)
+    if with_record:
+        rep["proposed_records"] = [{"kind": "convention", "statement": "Health endpoints return plain strings", "rationale": "simple", "origin": "inferred",
+                                    "basis": "observation", "evidence": [{"type": "code", "ref": "src/api/x.py:1"}], "paths": ["src/api/**"], "serves": [], "confidence": "medium"}]
+    _patch_investigation(monkeypatch, rep)
+    assert run("records", "approve", "R-0001", "--target", str(cli_target)).exit_code == 0   # so src/api/** has a binding record
+    assert run("plan", "add a health function", "--target", str(cli_target)).exit_code == 0
+    return TargetPaths.from_root(cli_target)
+
+
+def test_approve_freezes_contracts_in_dependency_order_and_transitions(monkeypatch, cli_target):
+    p = _proposed_plan(monkeypatch, cli_target, two=True)
+    r = run("approve", "P-0001", "--skip-records", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    cs = load_contracts(p.contracts)
+    assert cs["C-0002"].status == "ready" and cs["C-0002"].records and cs["C-0003"].status == "draft"   # C-0003 depends on C-0002
+    assert r.output.index("C-0002") < r.output.index("C-0003")
+    from ateam.plans.store import load_plans
+    assert load_plans(p.plans)["P-0001"].status == "plan_approved"
+    db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
+    assert db.feature_status("P-0001") == "plan_approved" and db.contract_status("C-0002") == "ready" and db.contract_hash("C-0003")
+    g = GitRepo(p.intent)
+    assert g.is_clean() and "approve plan P-0001" in g.run("log", "-1", "--format=%s")
+
+
+def test_approve_applies_tier_override_and_raises_test_tier(monkeypatch, cli_target):
+    p = _proposed_plan(monkeypatch, cli_target, two=True)
+    r = run("approve", "P-0001", "--skip-records", "--tier", "C-0002=careful", "--tier", "C-0003:test=light", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    cs = load_contracts(p.contracts)
+    assert cs["C-0002"].allocation.tier == {"build": "careful", "test": "careful", "investigate": "none"}
+    assert cs["C-0003"].allocation.tier["test"] == "careful" and "raised" in r.output   # build is careful; test cannot go below it
+    from ateam.plans.store import load_plans
+    assert load_plans(p.plans)["P-0001"].tier_overrides == {"C-0002": {"build": "careful", "test": "careful"}, "C-0003": {"test": "light"}}
+
+
+def test_approve_requires_plan_proposed(monkeypatch, cli_target):
+    _proposed_plan(monkeypatch, cli_target)
+    assert run("approve", "P-0001", "--skip-records", "--target", str(cli_target)).exit_code == 0
+    r = run("approve", "P-0001", "--skip-records", "--target", str(cli_target))
+    assert r.exit_code == 1 and "plan_approved" in r.output
+
+
+def test_approve_runs_records_review_unless_skipped(monkeypatch, cli_target):
+    p = _proposed_plan(monkeypatch, cli_target, with_record=True)
+    rid = load_plans_ids(p)[0]
+    r = run("approve", "P-0001", "--target", str(cli_target), input="o\n")
+    assert r.exit_code == 0, r.output
+    assert load_records(p.records)[rid].status == "approved" and load_records(p.records)[rid].basis == "observation"
+
+
+def load_plans_ids(p):
+    from ateam.plans.store import load_plans
+    return load_plans(p.plans)["P-0001"].proposed_records
+
+
+def test_reject_plan_records_reason_and_leaves_contracts_draft(monkeypatch, cli_target):
+    p = _proposed_plan(monkeypatch, cli_target)
+    r = run("reject", "P-0001", "too broad", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    from ateam.plans.store import load_plans
+    plan = load_plans(p.plans)["P-0001"]
+    assert plan.status == "plan_rejected" and plan.history[-1].why == "too broad"
+    assert load_contracts(p.contracts)["C-0002"].status == "draft"
+    db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
+    assert db.feature_status("P-0001") == "plan_rejected" and db.contract_hash("C-0002") is None
+    assert "reject plan P-0001" in GitRepo(p.intent).run("log", "-1", "--format=%s")
+
+
+def test_status_lists_plans(monkeypatch, cli_target):
+    _proposed_plan(monkeypatch, cli_target)
+    out = run("status", "--target", str(cli_target)).output
+    assert "P-0001" in out and "plan_proposed" in out and "1 contract" in out
+
+
+
+# ---- review round: plan retry after failure, approve commit failure, records review --all
+
+def test_plan_can_be_rerun_after_an_invalid_report(monkeypatch, cli_target):
+    from ateam.plans.store import load_plans
+    bad = _canned_plan(); bad["contracts"][0]["depends_on"] = [0]
+    _patch_investigation(monkeypatch, bad)
+    assert run("plan", "add a health function", "--target", str(cli_target)).exit_code == 1
+    p = TargetPaths.from_root(cli_target)
+    plans = load_plans(p.plans)
+    assert plans["P-0001"].status == "plan_rejected"          # the failure is visible as a plan file
+    assert "P-0001" in run("plans", "list", "--target", str(cli_target)).output
+    _patch_investigation(monkeypatch, _canned_plan())
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert load_plans(p.plans)["P-0002"].status == "plan_proposed"
+
+
+def test_plan_crash_in_investigation_leaves_terminal_state_and_rerun_works(monkeypatch, cli_target):
+    from ateam.plans.store import load_plans
+    from ateam.runner import investigate as inv_mod
+
+    async def boom(**kw):
+        raise RuntimeError("sdk exploded")
+
+    monkeypatch.setattr("ateam.cli.run_investigation", boom)
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 1 and "sdk exploded" in r.output and "Traceback" not in r.output
+    p = TargetPaths.from_root(cli_target)
+    assert load_plans(p.plans)["P-0001"].status == "plan_rejected"
+    _patch_investigation(monkeypatch, _canned_plan())
+    assert run("plan", "add a health function", "--target", str(cli_target)).exit_code == 0
+
+
+def test_approve_commit_failure_prints_recovery_and_leaves_store_untouched(monkeypatch, cli_target):
+    p = _proposed_plan(monkeypatch, cli_target)
+    from ateam.intent import IntentError
+
+    def fail_commit(paths, message, subpaths):
+        raise IntentError("simulated commit failure")
+
+    # `commit_intent` must stay a module-level name in ateam.cli for this patch to bite; approve calls it through the module global.
+    monkeypatch.setattr("ateam.cli.commit_intent", fail_commit)
+    r = run("approve", "P-0001", "--skip-records", "--target", str(cli_target))
+    assert r.exit_code == 1 and "git -C" in r.output and "checkout" in r.output
+    db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
+    assert db.feature_status("P-0001") == "plan_proposed" and db.contract_hash("C-0002") is None
+    # the printed recovery really restores a clean intent repo
+    import re, subprocess
+    cmd = re.search(r"^\s*(git -C .*)$", r.output, re.M).group(1)
+    subprocess.run(cmd, shell=True, check=True)
+    assert GitRepo(p.intent).is_clean()
+
+
+def test_records_review_all_shows_non_proposed_without_prompting(cli_target):
+    run("records", "approve", "R-0001", "--target", str(cli_target))
+    r = run("records", "review", "--all", "--target", str(cli_target), input="")
+    assert r.exit_code == 0 and "R-0001" in r.output and "approved" in r.output and "nothing to decide" in r.output.lower()
+    r2 = run("records", "review", "--target", str(cli_target), input="")
+    assert "nothing proposed" in r2.output.lower()
+
+
+
+def test_plan_id_allocation_uses_state_store_when_plan_file_is_missing(monkeypatch, cli_target):
+    from ateam.plans.store import load_plans
+    bad = _canned_plan(); bad["contracts"][0]["depends_on"] = [0]
+    _patch_investigation(monkeypatch, bad)
+    assert run("plan", "x", "--target", str(cli_target)).exit_code == 1
+    p = TargetPaths.from_root(cli_target)
+    for f in p.plans.glob("P-0001-*.yaml"):
+        f.unlink()
+    commit_intent(p, "owner deleted the rejected plan file", ["plans"])
+    _patch_investigation(monkeypatch, _canned_plan())
+    assert run("plan", "x", "--target", str(cli_target)).exit_code == 0
+    assert "P-0002" in load_plans(p.plans) and "P-0001" not in load_plans(p.plans)
+
+
+def test_approve_notes_overrides_below_rubric_floor(monkeypatch, cli_target):
+    _proposed_plan(monkeypatch, cli_target, two=True)   # C-0003 has complexity high -> floor careful
+    r = run("approve", "P-0001", "--skip-records", "--tier", "C-0003=light", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert "below the rubric" in r.output and "C-0003" in r.output

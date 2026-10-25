@@ -161,3 +161,153 @@ ROLE_SPECS: dict[Role, RoleSpec] = {
         report_schema=TEST_SCHEMA,
     ),
 }
+
+
+# ---------------------------------------------------------------- investigation specs (pass two)
+
+_CANDIDATE = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "kind": {"type": "string", "enum": ["decision", "invariant", "convention"]},
+        "statement": {"type": "string"},
+        "rationale": {"type": "string"},
+        "origin": {"type": "string", "enum": ["documented", "inferred"]},
+        "basis": {"type": "string", "enum": ["requirement", "observation"]},
+        "evidence": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "type": {"type": "string", "enum": ["doc", "claude-md", "agents-md", "commit-message", "code", "test", "commit"]},
+                    "ref": {"type": "string"},
+                    "note": {"type": "string"},
+                },
+                "required": ["type", "ref"],
+            },
+        },
+        "paths": {"type": "array", "items": {"type": "string"}},
+        "serves": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+    },
+    "required": ["kind", "statement", "rationale", "origin", "basis", "evidence", "paths", "serves", "confidence"],
+}
+
+DISCOVERY_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "candidates": {"type": "array", "items": _CANDIDATE},
+        "unknowns": {"type": "array", "items": {"type": "string"}},
+        "notes": {"type": "string"},
+    },
+    "required": ["candidates", "unknowns", "notes"],
+}
+
+_LEVEL = {"type": "string", "enum": ["low", "medium", "high"]}
+
+PLANNER_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "title": {"type": "string"},
+        "contracts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "title": {"type": "string"},
+                    "paths": {"type": "array", "items": {"type": "string"}},
+                    "incidental": {"type": "array", "items": {"type": "string"}},
+                    "depends_on": {"type": "array", "items": {"type": "integer"}},
+                    "acceptance": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "id": {"type": "string"},
+                                "statement": {"type": "string"},
+                                "check": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "properties": {"type": {"type": "string", "enum": ["test", "command", "judgment"]}, "ref": {"type": "string"}},
+                                    "required": ["type"],
+                                },
+                            },
+                            "required": ["id", "statement", "check"],
+                        },
+                    },
+                    "checks": {"type": "array", "items": {"type": "string"}},
+                    "allocation": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "complexity": _LEVEL, "risk": _LEVEL, "uncertainty": _LEVEL,
+                            "reasoning": {"type": "string"},
+                            "tier": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {"build": {"type": "string"}, "test": {"type": "string"}, "investigate": {"type": "string"}},
+                                "required": ["build", "test", "investigate"],
+                            },
+                        },
+                        "required": ["complexity", "risk", "uncertainty", "reasoning", "tier"],
+                    },
+                    "budget": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {"attempts": {"type": "integer"}, "usd_per_attempt": {"type": "number"}, "max_turns": {"type": "integer"}},
+                        "required": ["attempts", "usd_per_attempt", "max_turns"],
+                    },
+                },
+                "required": ["title", "paths", "incidental", "depends_on", "acceptance", "checks", "allocation"],
+            },
+        },
+        "proposed_records": {"type": "array", "items": _CANDIDATE},
+        "unknowns": {"type": "array", "items": {"type": "string"}},
+        "notes": {"type": "string"},
+    },
+    "required": ["title", "contracts", "proposed_records", "unknowns", "notes"],
+}
+
+_INVESTIGATE_TOOLS = ["Read", "Glob", "Grep", "Bash"]
+
+DISCOVERY_SPEC = RoleSpec(
+    role=Role.investigate,
+    tools=_INVESTIGATE_TOOLS,
+    system_prompt=(
+        "ROLE: INVESTIGATE, task: discovery. You are reading a repository to find the engineering intent it already "
+        "holds, so the owner can approve a small, accurate baseline of records. Read CLAUDE.md, AGENTS.md, README files, "
+        "docs/**, configuration, the tests, and the last 200 commits (git log). Propose at most the number of candidates "
+        "the brief allows; prefer five accurate records to fifty speculative ones. For each candidate: kind is decision, "
+        "invariant or convention; origin is documented only when you quote a document, CLAUDE.md, AGENTS.md or a commit "
+        "message as evidence, otherwise inferred; basis is observation when your only evidence is code (what the code "
+        "does today), requirement only when a document states the intent. Cite evidence as path[:line], path::test, or "
+        "commit <sha>. Bind the narrowest glob the evidence supports; never bind the whole repository unless the rule is "
+        "truly global. Separate what the code does from what it is meant to do, and never promote a bug or a workaround "
+        "into a rule. List what you could not determine as unknowns instead of guessing. You never modify files or state; "
+        "shell commands are limited to read-only inspection. " + COMMON
+    ),
+    report_schema=DISCOVERY_SCHEMA,
+)
+
+PLANNER_SPEC = RoleSpec(
+    role=Role.investigate,
+    tools=_INVESTIGATE_TOOLS,
+    system_prompt=(
+        "ROLE: INVESTIGATE, task: planning. Given the feature request, the index of approved records, the configured "
+        "checks and the allocation rubric in your brief, produce a plan: a list of contracts, each independently "
+        "verifiable. For every contract: declared paths must include every file a BUILD worker will change, including the "
+        "test files it must write; acceptance criteria use a test check naming path::test inside the contract's paths, or a "
+        "judgment check that cites the record it protects; depends_on lists indices into this same list, no cycles; checks "
+        "name only the configured checks; the allocation gives complexity, risk and uncertainty as low, medium or high, a "
+        "reasoning that cites the repository signals you used (component boundaries, bound records, test coverage, "
+        "migrations, concurrency, security surface, ambiguity), and tiers that follow the rubric. Propose records only for "
+        "decisions this plan itself introduces. List open questions as unknowns rather than guessing. You never modify "
+        "files or state; shell commands are limited to read-only inspection. " + COMMON
+    ),
+    report_schema=PLANNER_SCHEMA,
+)

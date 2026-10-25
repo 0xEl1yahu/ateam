@@ -1,0 +1,13 @@
+# A plan: one feature request, written by `ateam plan "<request>"` into the intent repo's plans/.
+# ATeam writes and updates this file; the owner acts on it with `ateam approve P-0001` or `ateam reject P-0001 "reason"`.
+id: P-0001
+title: Expose reading state through the books API
+request: "Let the API return and update each book's reading state"
+status: plan_proposed            # requested | investigating | plan_proposed | plan_approved | plan_rejected | executing | paused | integrating | merge_proposed | merged | abandoned
+contracts: ["C-0001", "C-0002"]  # draft until the plan is approved, then frozen in dependency order
+proposed_records: ["R-0004"]     # records the planner proposed; reviewed at approval, never approved by code
+unknowns:
+  - "Should PATCH accept re-reading when the book was never read?"
+tier_overrides: {}               # filled by `ateam approve --tier C-0002=careful` or `--tier C-0002:test=careful`
+history:
+  - {at: 2026-10-25T12:00:00Z, by: ateam-plan, to: plan_proposed}

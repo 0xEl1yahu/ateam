@@ -86,7 +86,8 @@ Three failure classes, each with its own mechanism:
 - **Tree verification.** The worktree's real state is checked, not the worker's reported commit.
 - **Protected files.** Contracts and approved records are protected from worker modification.
 - **Spike first.** SDK, bare mode, hooks and path-scoped rules are validated by a small executable spike before the integration is committed to.
-- **Feature work happens in git worktrees**, for ATeam's own development as much as for its workers. Never on a branch in the main checkout. (Owner, 2026-10-25.)
+- **Feature work happens in git worktrees**, for ATeam's own development as much as for its workers. Never on a branch in the main checkout. (Owner, 2026-10-25.) Carve-out, owner 2026-10-25: **read-only investigations run in the owner's checkout**, under enforced read-only permissions, with a before-and-after snapshot of the checkout (`git status --porcelain`, HEAD, stash list) that marks the attempt `tamper` if anything changed. A worktree for a role that cannot write costs a checkout, a branch and the loss of uncommitted context for no isolation gain. BUILD and TEST, which write, keep their worktrees.
+- **Enforcement is pre-guard first, instructions last.** (Owner, 2026-10-25.) What a worker may do is decided before a tool runs: the tool list the session is launched with, then the permission callback and PreToolUse hook in Python. The role's system prompt is explanation, never the control. A post-run check backs each pre-guard: tree and scope for the worktree, the intent-repo snapshot for intent, the checkout snapshot for in-place investigations. Workers hand information back; the coordinator decides what intelligence and resources each step gets and what counts as validated.
 - **Git-native mechanisms only.** Nothing ATeam depends on may live in clone-local state such as `.git/info/exclude` or local config; a fresh clone on another machine must behave identically. Ignore rules go in the target's tracked `.gitignore`. (Owner, 2026-10-25.)
 - **Durable intent lives in a private intent repo, not in the target.** (Owner, 2026-10-25.) Target repos are often public; records and contracts are private engineering notes. The target carries nothing of ATeam's: no `.ateam/` directory, no ignore lines, no scratch files. Records, contracts, plans, reports and `config.yaml` live in their own git repository under ATeam's home, `~/.ateam/<repo-id>/intent/`, created by `ateam intent init`, optionally pushed to a private remote so another machine gets the same intent by pulling it. Approval commits land in the intent repo. The target branch is still where integration happens; the target itself carries no ATeam files. See "Intent repo" below. This supersedes the earlier "Two homes for truth" wording that placed `.ateam/` inside the target, and the "Target repo layout" section.
 - **Workers never run `rm`.** Deletion is an integration-time action. A tracked file a worker must remove goes through `git rm`, so the deletion is in the reviewed diff. (Owner, 2026-10-25.)
@@ -302,16 +303,16 @@ Every transition is a row in SQLite with timestamp, actor and reason. `ateam sta
 
 | Role | May | May not | Ends with |
 |---|---|---|---|
-| INVESTIGATE | read, search, run read-only commands | edit, write, run tests that mutate state | findings report with evidence and proposed records |
+| INVESTIGATE | read, search, run read-only commands from a strict allow-list (git log/show/diff/blame/status/ls-files/grep/branch --list, ls, cat, head, tail, wc, grep, rg, find, tree, du, stat, file, pwd, sort, uniq, cut; no interpreters, no sed, no awk) | edit, write, run anything that can write, run tests | findings report with evidence and proposed records |
 | BUILD | read, edit, write, run checks, commit in its worktree | edit `.ateam/**` or `.claude/**`, touch files outside `paths` plus `incidental`, push, merge, run `rm` in any form (tracked files go through `git rm`; cleanup is an integration step) | build report: commits, files, checks run, risks, record proposals |
 | TEST | read, run checks and tests, write only under a scratch directory | edit source, edit tests that the contract names, see the builder's transcript | verdict per acceptance criterion with evidence |
 
-Enforcement, in layers:
+Enforcement, in layers. Layers 1 to 3 run before a tool executes (pre-guards); layer 4 verifies afterwards. The system prompt is not a layer.
 
-1. Agent definition: `tools` and `disallowedTools` per role.
+1. Session tool list: `tools` per role. INVESTIGATE sessions are launched without any editing tool.
 2. SDK permission callback: deny any file write outside the contract's paths, any edit under `.ateam/` or `.claude/`, and any Bash matching a configurable destructive list (`git push`, `git merge`, `rm -rf`, deploy commands).
 3. Path deny rules for `Edit` on `.ateam/**` and `.claude/**` in the session settings.
-4. Post-run tree check: the worktree must be clean except for committed changes (staged, unstaged and untracked files are reported and fail the attempt); the diff against the base must touch only `paths` plus `incidental`.
+4. Post-run checks: for BUILD and TEST, the worktree must be clean except for committed changes (staged, unstaged and untracked files are reported and fail the attempt) and the diff against the base must touch only `paths` plus `incidental`; for every role, the intent repo's head and cleanliness must be unchanged; for in-place investigations, the owner's checkout status, HEAD and stash list must be unchanged. Any change is recorded as `tamper`.
 
 Layers 1 to 3 stop built-in tools and recognised shell commands. They do not stop a script the worker writes and runs. Layer 4 catches the result. This is integrity verification, not a security boundary.
 

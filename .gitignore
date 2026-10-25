@@ -4,3 +4,4 @@ __pycache__/
 spikes/*/out/
 .superpowers/
 *.egg-info/
+*.sw?
