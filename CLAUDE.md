@@ -24,6 +24,19 @@ Decide and record only mechanics: data structures, test fixtures, message wordin
 
 If a delegated mechanism fails, the fallback is a question, not a different mechanism with wider consequences. Say each ruling in chat at the moment you make it, not only in a list at the end.
 
+## Working style
+
+Adapted from the Claude Code team's own published practices (Boris Cherny's "how I use Claude Code" threads, January and February 2026). Kept to what fits this repo.
+
+- **Plan first, then execute.** Any task bigger than a one-file change starts in plan mode. Iterate on the plan until it is right, have a second fresh Claude review it as a staff engineer, then implement. If a task goes sideways, stop pushing and re-plan. Plan the verification steps too, not only the build.
+- **Give Claude a way to verify its own work.** Every change has a check it can run: the unit suite, the table-driven policy tests, the opt-in live run, or `ateam worker run` against a scratch repo. "Done" means the check ran and you read its output, never "should pass".
+- **This file is the memory of mistakes.** Whenever the owner corrects something, or a reviewer finds a class of bug, add a line here in the same change, under the heading it belongs to. Keep it short enough to read in a minute; cut a line when it stops earning its place.
+- **Subagents for repeated and context-heavy work.** Explore with subagents to keep the main context clean; use a fresh reviewer for whole-branch review; simplify after a feature is done. Anything done more than once a day becomes a skill or a slash command under `.claude/`, committed to git.
+- **Pre-allow permissions, never skip them.** Known-safe commands go in `.claude/settings.json` so they are shared; no `--dangerously-skip-permissions`.
+- **Make the model justify changes.** Ask why a fix is right, and ask for a rewrite when a fix is mediocre rather than patching it further. Detailed specs beat clever prompts.
+- **Parallel work is one worktree per session.** Never two sessions in one checkout.
+- **Model choice is the owner's.** Default to the strongest model with thinking for design, review and policy work; a smaller model is fine for mechanical, well-specified tasks and for live tests.
+
 ## Conventions
 
 - Python 3.14, `.venv/` in the repo. Run everything with `.venv/bin/...`. Tests: `.venv/bin/pytest` (unit, no API calls). Live: `ATEAM_LIVE_TESTS=1 .venv/bin/pytest tests/live -s` (one real haiku session, opt in only).
