@@ -98,3 +98,25 @@ def record_service(target_repo, sample_record):
     git = GitRepo(target_repo)
     git.commit_paths([".ateam"], "seed record")
     return RecordService(TargetPaths.from_root(target_repo), git, TargetConfig())
+
+
+@pytest.fixture
+def sample_contract():
+    from ateam.contracts.model import Acceptance, Allocation, Check, Contract, Level
+
+    return Contract(
+        id="C-0001",
+        plan="P-0001",
+        title="Expose reading state through the books API",
+        paths=["src/api/**", "tests/api/test_books.py"],
+        incidental=["requirements.txt"],
+        acceptance=[
+            Acceptance(id="A1", statement="GET /books/{id} returns reading_state", check=Check(type="test", ref="tests/api/test_books.py::test_reading_state_present")),
+            Acceptance(id="A3", statement="No code path infers reading state", check=Check(type="judgment")),
+        ],
+        allocation=Allocation(
+            complexity=Level.medium, risk=Level.high, uncertainty=Level.low,
+            reasoning="API boundary bound by R-0001; API untested; requirements explicit.",
+            tier={"build": "standard", "test": "careful", "investigate": "none"},
+        ),
+    )
