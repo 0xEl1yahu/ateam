@@ -11,6 +11,7 @@ import os
 import re
 import signal
 import subprocess
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,20 +27,27 @@ TAIL_CHARS = 4000
 ENVIRONMENT_EXITS = (126, 127)   # the shell could not find or execute the command
 
 _SCRUB_PREFIXES = ("CLAUDE", "ANTHROPIC")
-_SCRUB_WORDS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
-_SCRUB_NAMES = {"VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME"}
+_SCRUB_WORDS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "CREDS")
+_SCRUB_SUFFIXES = ("_PWD",)
+_SCRUB_NAMES = {"VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME", "SSH_AUTH_SOCK", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"}
 
 
 def check_env(base: Mapping[str, str], extra: Mapping[str, str]) -> dict[str, str]:
     """The environment checks run with: `base` minus credentials and Python path overrides, then `extra` on top.
 
     Checks execute code a worker wrote, outside the worker's clean room, so they never see the owner's secrets,
-    and the worktree's own interpreter is used rather than whichever virtualenv launched ateam."""
+    cannot be pointed at another repository, and use the worktree's own interpreter rather than whichever
+    virtualenv launched ateam (its bin directory is dropped from PATH)."""
     def scrubbed(name: str) -> bool:
         upper = name.upper()
-        return upper.startswith(_SCRUB_PREFIXES) or any(w in upper for w in _SCRUB_WORDS) or upper in _SCRUB_NAMES
+        return (upper.startswith(_SCRUB_PREFIXES) or any(w in upper for w in _SCRUB_WORDS)
+                or upper.endswith(_SCRUB_SUFFIXES) or upper in _SCRUB_NAMES)
 
     env = {k: v for k, v in base.items() if not scrubbed(k)}
+    venv = base.get("VIRTUAL_ENV")
+    if venv and "PATH" in env:
+        venv_bin = venv.rstrip("/") + "/bin"
+        env["PATH"] = os.pathsep.join(p for p in env["PATH"].split(os.pathsep) if p.rstrip("/") != venv_bin)
     env.update(extra)
     return env
 
@@ -63,27 +71,41 @@ class CheckResult:
         return {"name": self.name, "passed": self.passed, "class": self.failure_class, "tail": self.tail}
 
 
+def _kill_group(pgid: int) -> None:
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        pass   # the group is already gone
+
+
 def _run_one(check: NamedCheck, cwd: Path, env: dict[str, str], timeout: float) -> CheckResult:
-    try:
-        proc = subprocess.Popen(
-            ["/bin/sh", "-c", check.cmd], cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
-        )
-    except OSError as e:
-        return CheckResult(check.name, check.cmd, False, True, None, f"could not start: {e}")
-    try:
-        out, _ = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
+    """Run one check in its own process group with output to a file, so a background child holding the output
+    open can neither hang verify nor fake a timeout. The group is killed when the shell ends (or times out), so
+    nothing the check left running can change the tree after it is judged. A child that leaves the group with
+    setsid escapes this; that residual is not closed here."""
+    with tempfile.TemporaryFile() as out:
         try:
-            os.killpg(proc.pid, signal.SIGKILL)   # the whole group: the shell and everything it started
-        except ProcessLookupError:
-            pass
-        out, _ = proc.communicate()
-        tail = (out.decode(errors="replace") + f"\ntimed out after {timeout:g}s")[-TAIL_CHARS:]
-        return CheckResult(check.name, check.cmd, False, True, None, tail)
-    tail = out.decode(errors="replace")[-TAIL_CHARS:]
+            proc = subprocess.Popen(
+                ["/bin/sh", "-c", check.cmd], cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
+            )
+        except OSError as e:
+            return CheckResult(check.name, check.cmd, False, True, None, f"could not start: {e}")
+        timed_out = False
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+        _kill_group(proc.pid)
+        if timed_out:
+            proc.wait()
+        size = out.seek(0, os.SEEK_END)
+        out.seek(max(0, size - 4 * TAIL_CHARS))
+        text = out.read().decode(errors="replace")
+    if timed_out:
+        return CheckResult(check.name, check.cmd, False, True, None, (text + f"\ntimed out after {timeout:g}s")[-TAIL_CHARS:])
     code = proc.returncode
-    return CheckResult(check.name, check.cmd, code == 0, code in ENVIRONMENT_EXITS, code, tail)
+    return CheckResult(check.name, check.cmd, code == 0, code in ENVIRONMENT_EXITS, code, text[-TAIL_CHARS:])
 
 
 def run_checks(checks: list[NamedCheck], cwd: Path, env: dict[str, str], timeout: float = CHECK_TIMEOUT) -> list[CheckResult]:
@@ -110,8 +132,19 @@ def _inside(root: Path, rel: str) -> Path | None:
     return path
 
 
+def _defines(text: str, name: str) -> bool:
+    """`name` is defined at the start of a line (def, class, fn, func, function; async allowed) or named by a
+    test(...)/it(...)/describe(...) call. Mentions in comments and other strings do not count."""
+    n = re.escape(name)
+    return bool(
+        re.search(rf"^[ \t]*(?:async[ \t]+)?(?:def|class|fn|func|function)[ \t]+{n}(?![\w])", text, re.M)
+        or re.search(rf"^[ \t]*(?:test|it|describe)\(\s*[\"']{n}[\"']", text, re.M)
+    )
+
+
 def acceptance_presence(contract: Contract, root: Path) -> list[AcceptanceResult]:
-    """For each `test` criterion `path::name`: the file exists inside the worktree and defines `name` as a word."""
+    """For each `test` criterion `path::name` (or `path::Class::name`): the file exists inside the worktree and
+    defines every named part."""
     out: list[AcceptanceResult] = []
     for a in contract.acceptance:
         kind = a.check.type
@@ -119,46 +152,66 @@ def acceptance_presence(contract: Contract, root: Path) -> list[AcceptanceResult
             out.append(AcceptanceResult(a.id, kind, None, "not checked by minimal verify"))
             continue
         ref = a.check.ref or ""
-        file_part, _, name = ref.partition("::")
-        path = _inside(root, file_part)
-        if not ref or not name:
+        file_part, *names = ref.split("::")
+        if not file_part or not names or not all(names):
             out.append(AcceptanceResult(a.id, kind, False, f"test reference {ref!r} does not name path::test"))
-        elif path is None:
+            continue
+        path = _inside(root, file_part)
+        if path is None:
             out.append(AcceptanceResult(a.id, kind, False, f"{file_part} is outside the worktree"))
         elif not path.is_file():
             out.append(AcceptanceResult(a.id, kind, False, f"acceptance test not found: {file_part} does not exist"))
-        elif not re.search(rf"(?<![\w]){re.escape(name)}(?![\w])", path.read_text(errors="replace")):
-            out.append(AcceptanceResult(a.id, kind, False, f"acceptance test not found: {name} is not in {file_part}"))
         else:
-            out.append(AcceptanceResult(a.id, kind, True, f"{ref} is present"))
+            text = path.read_text(errors="replace")
+            missing = [n for n in names if not _defines(text, n)]
+            if missing:
+                out.append(AcceptanceResult(a.id, kind, False, f"acceptance test not found: {', '.join(missing)} not defined in {file_part}"))
+            else:
+                out.append(AcceptanceResult(a.id, kind, True, f"{ref} is present"))
     return out
 
 
 @dataclass(frozen=True)
 class Snapshot:
     worktree_head: str
-    worktree_dirty: tuple
+    worktree_tracked: tuple     # porcelain entries for tracked files
+    worktree_untracked: tuple   # porcelain entries for untracked files
     intent_head: str
-    intent_clean: bool
+    intent_dirty: tuple
     owner_head: str
     owner_dirty: tuple
+    db: str                     # StateDB.fingerprint()
 
 
-def snapshot(worktree: GitRepo, intent: GitRepo, owner: GitRepo) -> Snapshot:
+def snapshot(worktree: GitRepo, intent: GitRepo, owner: GitRepo, db_fingerprint: str) -> Snapshot:
+    entries = worktree.status_porcelain()
     return Snapshot(
-        worktree.head(), tuple(worktree.status_porcelain()), intent.head(), intent.is_clean(),
-        owner.head(), tuple(owner.status_porcelain()),
+        worktree.head(), tuple(e for e in entries if e[0] != "??"), tuple(e for e in entries if e[0] == "??"),
+        intent.head(), tuple(intent.status_porcelain()), owner.head(), tuple(owner.status_porcelain()), db_fingerprint,
     )
 
 
-def tampered(before: Snapshot, after: Snapshot) -> list[str]:
-    """Everything the checks changed that they must not: the worktree, the intent repo or the owner's checkout."""
-    labels = {
-        "worktree_head": "worktree HEAD moved", "worktree_dirty": "worktree files changed",
-        "intent_head": "intent repo HEAD moved", "intent_clean": "intent repo changed",
-        "owner_head": "owner checkout HEAD moved", "owner_dirty": "owner checkout files changed",
-    }
-    return [label for field, label in labels.items() if getattr(before, field) != getattr(after, field)]
+_TAMPER = {
+    "worktree_head": "worktree HEAD moved", "worktree_tracked": "worktree tracked files changed",
+    "intent_head": "intent repo HEAD moved", "intent_dirty": "intent repo files changed",
+    "owner_head": "owner checkout HEAD moved", "db": "state store changed",
+}
+
+
+def compare(before: Snapshot, after: Snapshot) -> tuple[list[str], list[str]]:
+    """(tamper, warnings) for what changed while the checks ran (owner ruling, 2026-10-25).
+
+    Tamper: the worktree's HEAD or tracked files, the intent repo, the state store, or the owner checkout's HEAD.
+    Warnings only: new untracked files in the worktree (build output) and edits in the owner's checkout (the
+    owner keeps working while a verify runs)."""
+    tamper = [label for field, label in _TAMPER.items() if getattr(before, field) != getattr(after, field)]
+    warnings: list[str] = []
+    new = sorted(p for _, p in set(after.worktree_untracked) - set(before.worktree_untracked))
+    if new:
+        warnings.append("new untracked files in the worktree: " + ", ".join(new))
+    if before.owner_dirty != after.owner_dirty:
+        warnings.append("files changed in your checkout during the checks")
+    return tamper, warnings
 
 
 @dataclass

@@ -32,22 +32,55 @@ def test_contract_transition_rules(tmp_path):
     assert rows[-1]["from_status"] == "draft" and rows[-1]["to_status"] == "ready" and rows[-1]["by"] == "ateam"
 
 
-def test_transition_path_writes_every_step_in_one_go(tmp_path):
+def test_finish_verification_writes_walk_checkpoint_and_clears_the_marker_together(tmp_path):
     db = fresh(tmp_path)
     db.upsert_contract("C-0001", "P-0001", "ready", "h")
-    db.transition_path("contract", "C-0001", ["building", "verifying", "verified"], by="verify", reason="r")
+    db.set_meta("verify-pending:C-0001", "{}")
+    db.finish_verification("C-0001", "ready", ["building", "verifying", "verified"], by="verify", reason="r",
+                           checkpoint={"k": 1}, pending_key="verify-pending:C-0001")
     assert db.contract_status("C-0001") == "verified"
     rows = db.transitions("contract", "C-0001")
     assert [(r["from_status"], r["to_status"]) for r in rows] == [("ready", "building"), ("building", "verifying"), ("verifying", "verified")]
     assert {r["by"] for r in rows} == {"verify"} and {r["reason"] for r in rows} == {"r"}
+    assert db.latest_checkpoint("C-0001") == {"k": 1} and db.get_meta("verify-pending:C-0001") is None
 
 
-def test_transition_path_with_an_invalid_step_writes_nothing(tmp_path):
+def test_finish_verification_with_an_invalid_step_writes_nothing(tmp_path):
     db = fresh(tmp_path)
     db.upsert_contract("C-0001", "P-0001", "ready", "h")
+    db.set_meta("verify-pending:C-0001", "{}")
     with pytest.raises(InvalidTransition):
-        db.transition_path("contract", "C-0001", ["building", "verified"], by="verify")
+        db.finish_verification("C-0001", "ready", ["building", "verified"], by="verify", reason="r",
+                               checkpoint={"k": 1}, pending_key="verify-pending:C-0001")
     assert db.contract_status("C-0001") == "ready" and db.transitions("contract", "C-0001") == []
+    assert db.latest_checkpoint("C-0001") is None and db.get_meta("verify-pending:C-0001") == "{}"
+
+
+def test_finish_verification_walks_from_the_status_seen_before_the_checks(tmp_path):
+    db = fresh(tmp_path)
+    db.upsert_contract("C-0001", "P-0001", "verified", "h")   # rewritten behind the verifier's back
+    db.finish_verification("C-0001", "ready", ["building", "verifying", "failed"], by="verify", reason="tamper",
+                           checkpoint={}, pending_key=None)
+    assert db.contract_status("C-0001") == "failed"
+    assert db.transitions("contract", "C-0001")[0]["from_status"] == "ready"
+
+
+def test_fingerprint_sees_writes_from_another_connection(tmp_path):
+    import sqlite3
+    db = fresh(tmp_path)
+    db.upsert_contract("C-0001", "P-0001", "ready", "h")
+    first = db.fingerprint()
+    assert db.fingerprint() == first
+    other = sqlite3.connect(tmp_path / "s.db")
+    with other:
+        other.execute("UPDATE contracts SET status='verified'")
+    assert db.fingerprint() != first
+
+
+def test_delete_meta(tmp_path):
+    db = fresh(tmp_path)
+    db.set_meta("k", "v"); db.delete_meta("k"); db.delete_meta("absent")
+    assert db.get_meta("k") is None
 
 
 def test_record_hashes(tmp_path):

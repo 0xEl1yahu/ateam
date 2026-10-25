@@ -107,6 +107,10 @@ class StateDB:
         row = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return row["value"] if row else None
 
+    def delete_meta(self, key: str) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM meta WHERE key=?", (key,))
+
     # -- records ------------------------------------------------------------
 
     def set_record_hash(self, record_id: str, hash: str) -> None:
@@ -169,31 +173,39 @@ class StateDB:
             else:
                 self.conn.execute("UPDATE contracts SET status=?, updated_at=? WHERE contract_id=?", (to, _now(), id))
 
-    def transition_path(self, kind: Kind, id: str, steps: list[str], by: str, reason: str | None = None) -> None:
-        """Several transitions in one transaction: every step is checked first, then all are written or none."""
-        table = FEATURE_TRANSITIONS if kind == "feature" else CONTRACT_TRANSITIONS
-        start = self.feature_status(id) if kind == "feature" else self.contract_status(id)
+    def finish_verification(
+        self, contract_id: str, start: str, steps: list[str], by: str, reason: str, checkpoint: dict[str, Any],
+        pending_key: str | None,
+    ) -> None:
+        """Record a verification in one transaction: the transitions, the final status, the checkpoint, and the
+        removal of the pending marker. Steps are checked from `start`, the status seen before the checks ran, so a
+        store row rewritten behind the verifier's back cannot change the walk; nothing is written if a step is invalid."""
         current = start
         for to in steps:
-            if to not in table.get(current, set()):
-                raise InvalidTransition(f"{kind} {id}: {current} -> {to} is not allowed")
+            if to not in CONTRACT_TRANSITIONS.get(current, set()):
+                raise InvalidTransition(f"contract {contract_id}: {current} -> {to} is not allowed")
             current = to
         with self.conn:
             current = start
             for to in steps:
                 self.conn.execute(
                     "INSERT INTO transitions (kind, id, from_status, to_status, by, reason, at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (kind, id, current, to, by, reason, _now()),
+                    ("contract", contract_id, current, to, by, reason, _now()),
                 )
                 current = to
-            if kind == "feature":
-                self.conn.execute(
-                    "INSERT INTO features (feature_id, status, updated_at) VALUES (?, ?, ?) "
-                    "ON CONFLICT(feature_id) DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at",
-                    (id, current, _now()),
-                )
-            else:
-                self.conn.execute("UPDATE contracts SET status=?, updated_at=? WHERE contract_id=?", (current, _now(), id))
+            self.conn.execute("UPDATE contracts SET status=?, updated_at=? WHERE contract_id=?", (current, _now(), contract_id))
+            self.conn.execute(
+                "INSERT INTO checkpoints (contract_id, attempt_id, facts, at) VALUES (?, ?, ?, ?)",
+                (contract_id, None, json.dumps(checkpoint, default=str), _now()),
+            )
+            if pending_key:
+                self.conn.execute("DELETE FROM meta WHERE key=?", (pending_key,))
+
+    def fingerprint(self) -> str:
+        """A hash of the whole store's content as committed, including writes made by other connections."""
+        import hashlib
+
+        return hashlib.sha256("\n".join(self.conn.iterdump()).encode()).hexdigest()
 
     def transitions(self, kind: Kind, id: str) -> list[dict[str, Any]]:
         rows = self.conn.execute("SELECT * FROM transitions WHERE kind=? AND id=? ORDER BY seq", (kind, id))

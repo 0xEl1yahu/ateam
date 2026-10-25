@@ -847,14 +847,92 @@ def test_verify_interrupted_store_walk_is_recovered_without_rerunning_checks(cli
         raise RuntimeError("crash between the intent commit and the store")
 
     with monkeypatch.context() as m:   # never monkeypatch.undo(): it would also drop the fixture's ATEAM_HOME
-        m.setattr(StateDB, "transition_path", boom)
+        m.setattr(StateDB, "finish_verification", boom)
         r = _verify(cli_target, wt)
     assert r.exit_code != 0
     assert _statuses(cli_target)[:2] == ("verified", "ready")
     r = _verify(cli_target, wt)
     assert r.exit_code == 0 and "recovered" in r.output
-    assert _statuses(cli_target)[:2] == ("verified", "verified")
+    file_status, store_status, db = _statuses(cli_target)
+    assert (file_status, store_status) == ("verified", "verified")
+    assert db.latest_checkpoint("C-0001")["warnings"][0] == "verifier: minimal"
+    assert db.get_meta("verify-pending:C-0001") is None
     assert count.read_text().count("x") == 1
+
+
+def test_verify_forged_verify_commit_from_a_check_is_recorded_as_tamper(cli_target, tmp_path):
+    paths = TargetPaths.from_root(cli_target)
+    wt = _verify_setup(cli_target, tmp_path, [("unit", "true")])
+    [cfile] = paths.contracts.glob("C-0001-*.yaml")
+    forged = tmp_path / "forged.yaml"
+    forged.write_text(cfile.read_text().replace("status: ready", "status: verified"))
+    from ateam.config import NamedCheck
+    from ateam.contracts.store import save_contract
+    # re-freeze with a check that forges the verifier's own commit and then fails
+    c = load_contracts(paths.contracts)["C-0001"]
+    cmd = f'cp {forged} {cfile} && git -C {paths.intent} commit -qam "ateam: verify C-0001 -> verified"; exit 1'
+    save_contract(paths.contracts, c.model_copy(update={"checks": [NamedCheck(name="unit", cmd=cmd)]}))
+    commit_intent(paths, "forging check", ["contracts"])
+    assert run("contracts", "freeze", "C-0001", "--force", "--target", str(cli_target)).exit_code == 0
+    forged.write_text(cfile.read_text().replace("status: ready", "status: verified"))
+    _do_work(wt)
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 1 and "C-0001 -> failed (tamper)" in r.output, r.output
+    assert _statuses(cli_target)[:2] == ("failed", "failed")
+    assert GitRepo(paths.intent).run("log", "-1", "--format=%s").strip() == "ateam: verify C-0001 -> failed"
+    r = _verify(cli_target, wt)
+    assert "recovered" not in r.output and _statuses(cli_target)[:2] == ("failed", "failed")
+
+
+def test_verify_check_writing_the_state_store_is_tamper(cli_target, tmp_path):
+    db_path = home_dir(cli_target) / "state.db"
+    wt = _verify_setup(cli_target, tmp_path, [("unit", f"sqlite3 {db_path} \"UPDATE contracts SET status='verified'\"")])
+    _do_work(wt)
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 1 and "C-0001 -> failed (tamper)" in r.output and "state store changed" in r.output
+    assert _statuses(cli_target)[:2] == ("failed", "failed")
+
+
+def test_verify_owner_edits_in_their_checkout_are_a_warning(cli_target, tmp_path):
+    wt = _verify_setup(cli_target, tmp_path, [("unit", f"echo note > {cli_target}/notes.md")])
+    _do_work(wt)
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 0 and "warning:" in r.output and "your checkout" in r.output
+
+
+def test_verify_owner_head_moving_is_tamper(cli_target, tmp_path):
+    wt = _verify_setup(cli_target, tmp_path, [("unit", f"git -C {cli_target} commit -q --allow-empty -m moved")])
+    _do_work(wt)
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 1 and "C-0001 -> failed (tamper)" in r.output and "owner checkout HEAD moved" in r.output
+
+
+def test_verify_untracked_build_output_is_a_warning_not_tamper(cli_target, tmp_path):
+    wt = _verify_setup(cli_target, tmp_path, [("unit", "mkdir -p build && echo o > build/out.o")])
+    _do_work(wt)
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 0 and "C-0001 -> verified" in r.output and "build/out.o" in r.output
+    cp = _statuses(cli_target)[2].latest_checkpoint("C-0001")
+    assert any("build/out.o" in w for w in cp["warnings"])
+
+
+def test_verify_crash_before_the_intent_commit_leaves_a_marker_that_is_cleared_safely(cli_target, tmp_path, monkeypatch):
+    wt = _verify_setup(cli_target, tmp_path, [("unit", "true")])
+    _do_work(wt)
+
+    def crash(*a, **k):
+        raise RuntimeError("killed before the intent commit")
+
+    with monkeypatch.context() as m:
+        m.setattr("ateam.cli.commit_intent", crash)
+        assert _verify(cli_target, wt).exit_code != 0
+    paths = TargetPaths.from_root(cli_target)
+    r = _verify(cli_target, wt)   # the saved but uncommitted file is still there: refuse, say how to restore
+    assert r.exit_code == 4 and "checkout --" in r.output
+    GitRepo(paths.intent).run("checkout", "--", "contracts")
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 0 and "C-0001 -> verified" in r.output
+    assert _statuses(cli_target)[2].get_meta("verify-pending:C-0001") is None
 
 
 def test_verify_failed_intent_commit_stops_before_the_store(cli_target, tmp_path, monkeypatch):
@@ -869,7 +947,7 @@ def test_verify_failed_intent_commit_stops_before_the_store(cli_target, tmp_path
     monkeypatch.setattr("ateam.cli.commit_intent", refuse)
     r = _verify(cli_target, wt)
     assert r.exit_code == 1 and "disk full" in r.output and "checkout --" in r.output and "C-0001-" in r.output
-    assert _statuses(cli_target)[1] == "ready"
+    assert _statuses(cli_target)[1] == "ready" and _statuses(cli_target)[2].get_meta("verify-pending:C-0001") is None
     dirty = GitRepo(TargetPaths.from_root(cli_target).intent).status_porcelain()
     assert len(dirty) == 1 and dirty[0][1].startswith("contracts/C-0001-")
 
