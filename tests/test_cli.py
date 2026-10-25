@@ -187,3 +187,60 @@ def test_malformed_record_file_is_reported_by_every_command(cli_target):
     for args in (["records", "list"], ["records", "show", "R-0001"], ["records", "approve", "R-0001"], ["contracts", "freeze", "C-0001"], ["brief", "C-0001", "--role", "build"]):
         r = run(*args, "--target", str(cli_target))
         assert r.exit_code == 1 and "notes.yaml" in r.output and "Traceback" not in r.output, args
+
+
+# ---- Task 6: intent commands, doctor derivation, nothing written into the target
+
+def _fresh_target(tmp_path, ateam_home):
+    import subprocess
+    t = tmp_path / "fresh"; t.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=t, check=True)
+    subprocess.run(["git", "config", "user.email", "t@e"], cwd=t, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=t, check=True)
+    (t / "f").write_text("x"); subprocess.run(["git", "add", "f"], cwd=t, check=True); subprocess.run(["git", "commit", "-q", "-m", "i"], cwd=t, check=True)
+    return t
+
+
+def test_intent_init_then_status_ok(tmp_path, ateam_home):
+    t = _fresh_target(tmp_path, ateam_home)
+    assert run("status", "--target", str(t)).exit_code == 2
+    r = run("intent", "init", "--target", str(t))
+    assert r.exit_code == 0 and str(TargetPaths.from_root(t).intent) in r.output, r.output
+    assert run("status", "--target", str(t)).exit_code == 0
+    assert run("intent", "init", "--target", str(t)).exit_code == 0  # idempotent
+    assert GitRepo(t).is_clean() and not (t / ".ateam").exists() and not (t / ".gitignore").exists()
+    assert run("intent", "path", "--target", str(t)).output.strip() == str(TargetPaths.from_root(t).intent)
+
+
+def test_intent_remote_push_pull(tmp_path, ateam_home):
+    import subprocess
+    t = _fresh_target(tmp_path, ateam_home)
+    bare = tmp_path / "private.git"; subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    assert run("intent", "init", "--remote", str(bare), "--target", str(t)).exit_code == 0
+    assert run("intent", "push", "--target", str(t)).exit_code == 0
+    assert subprocess.run(["git", "log", "-1", "--format=%s", "main"], cwd=bare, text=True, capture_output=True).stdout.strip() == "ateam: initialise intent repo"
+    assert run("intent", "pull", "--target", str(t)).exit_code == 0
+    assert run("intent", "remote", str(bare), "--target", str(t)).exit_code == 0
+
+
+def test_doctor_shows_id_source_and_intent_path(cli_target):
+    r = run("doctor", "--target", str(cli_target))
+    p = TargetPaths.from_root(cli_target)
+    assert r.exit_code == 0 and "from path" in r.output and str(p.intent) in r.output and "WARN" not in r.output
+
+
+def test_doctor_warns_when_id_source_changed(cli_target):
+    run("doctor", "--target", str(cli_target))  # records the current derivation
+    GitRepo(cli_target).run("remote", "add", "origin", "git@github.com:a/b.git")
+    r = run("doctor", "--target", str(cli_target))
+    assert "WARN" in r.output and "from origin" in r.output and "was path" in r.output
+
+
+def test_worker_run_leaves_target_and_worktree_free_of_ateam_files(cli_target, tmp_path):
+    _frozen_target(cli_target)
+    wt = tmp_path / "wt"; GitRepo(cli_target).worktree_add(wt, "wt-free", "main")
+    r = run("worker", "run", "C-0001", "--role", "investigate", "--cwd", str(wt), "--target", str(cli_target))
+    assert r.exit_code == 1 and "no investigate tier" in r.output
+    for root in (cli_target, wt):
+        assert not (root / ".ateam").exists() and not (root / ".ateam-scratch").exists()
+    assert GitRepo(cli_target).is_clean() and GitRepo(wt).is_clean()

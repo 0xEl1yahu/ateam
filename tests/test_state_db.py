@@ -88,3 +88,10 @@ def test_run_lock_is_exclusive_across_connections(tmp_path):
     b.conn.rollback()
     a.release_run_lock("P-0001")
     assert b.acquire_run_lock("P-0002") and a.run_lock_holder() == "P-0002"
+
+
+def test_meta_key_value(tmp_path):
+    db = fresh(tmp_path)
+    assert db.get_meta("repo_id_source") is None
+    db.set_meta("repo_id_source", "path"); db.set_meta("repo_id_source", "origin")
+    assert db.get_meta("repo_id_source") == "origin"

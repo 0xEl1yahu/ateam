@@ -88,3 +88,32 @@ class TargetPaths:
     def exists(self) -> bool:
         """True when the intent repo has been initialised."""
         return (self.intent / ".git").exists()
+
+
+def _registry_file() -> Path:
+    base = Path(os.environ.get("ATEAM_HOME") or (Path.home() / ".ateam"))
+    base.mkdir(parents=True, exist_ok=True)
+    return base / "targets.json"
+
+
+def lookup_target(root: Path) -> dict | None:
+    """What ATeam last recorded for this target path: {"id", "source", "key"}. Independent of the id itself."""
+    import json
+
+    f = _registry_file()
+    if not f.is_file():
+        return None
+    return json.loads(f.read_text()).get(str(root.resolve()))
+
+
+def record_target(root: Path) -> dict:
+    """Remember how this target's id was derived, keyed by its resolved path, so a changed derivation is noticed."""
+    import json
+
+    f = _registry_file()
+    data = json.loads(f.read_text()) if f.is_file() else {}
+    url = origin_url(root)
+    entry = {"id": repo_id(root), "source": repo_id_source(root), "key": normalise_remote(url) if url else str(root.resolve())}
+    data[str(root.resolve())] = entry
+    f.write_text(json.dumps(data, indent=2, sort_keys=True))
+    return entry

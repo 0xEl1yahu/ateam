@@ -10,7 +10,7 @@ import click
 from ateam import SPIKED_CLI_VERSION, __version__
 from ateam.config import TargetConfig, load_config
 from ateam.gitops import GitRepo
-from ateam.paths import TargetPaths, home_dir
+from ateam.paths import TargetPaths, home_dir, lookup_target, normalise_remote, origin_url, record_target, repo_id, repo_id_source
 from ateam.state.db import StateDB
 
 TARGET_OPTION = click.option(
@@ -58,6 +58,84 @@ class _Group(click.Group):
 @click.version_option(__version__, prog_name="ateam")
 def main() -> None:
     """ATeam: durable intent, role-separated workers, human approval gates."""
+
+
+# ---------------------------------------------------------------- intent
+
+
+@main.group()
+def intent() -> None:
+    """The private intent repo for a target (records, contracts, config)."""
+
+
+@intent.command("init")
+@click.option("--remote", default=None, help="Private git remote to pull from and push to.")
+@TARGET_OPTION
+def intent_init(remote: str | None, target: Path) -> None:
+    """Create the intent repo for this target under ATeam's home. Idempotent."""
+    from ateam.intent import IntentError, init_intent
+
+    paths = TargetPaths.from_root(target)
+    try:
+        git = init_intent(paths, remote=remote)
+    except IntentError as e:
+        _fail(str(e))
+    record_target(target)
+    click.echo(f"intent repo {paths.intent} ({git.current_branch()}, {'remote ' + remote if remote else 'no remote'})")
+    click.echo(f"repo id {repo_id(target)} derived from {_derivation(target)}")
+    click.echo("nothing was written into the target repository")
+
+
+@intent.command("path")
+@TARGET_OPTION
+def intent_path(target: Path) -> None:
+    """Print the intent repo location."""
+    click.echo(str(TargetPaths.from_root(target).intent))
+
+
+@intent.command("remote")
+@click.argument("url")
+@TARGET_OPTION
+def intent_remote(url: str, target: Path) -> None:
+    """Set the private remote."""
+    from ateam.intent import IntentError, set_remote
+
+    try:
+        set_remote(TargetPaths.from_root(target), url)
+    except IntentError as e:
+        _fail(str(e))
+    click.echo(f"origin -> {url}")
+
+
+@intent.command("push")
+@TARGET_OPTION
+def intent_push(target: Path) -> None:
+    """Push the intent repo to its private remote."""
+    from ateam.gitops import GitError
+    from ateam.intent import IntentError, push
+
+    try:
+        click.echo(push(TargetPaths.from_root(target)).strip() or "pushed")
+    except (IntentError, GitError) as e:
+        _fail(str(e))
+
+
+@intent.command("pull")
+@TARGET_OPTION
+def intent_pull(target: Path) -> None:
+    """Fast-forward the intent repo from its private remote."""
+    from ateam.gitops import GitError
+    from ateam.intent import IntentError, pull
+
+    try:
+        click.echo(pull(TargetPaths.from_root(target)).strip() or "pulled")
+    except (IntentError, GitError) as e:
+        _fail(str(e))
+
+
+def _derivation(target: Path) -> str:
+    url = origin_url(target)
+    return f"origin {normalise_remote(url)}" if url else "path"
 
 
 # ---------------------------------------------------------------- records
@@ -343,11 +421,21 @@ def doctor(target: Path) -> None:
     if __cli_version__ != SPIKED_CLI_VERSION:
         click.echo("WARN bundled Claude Code differs from the spiked version; re-run the spike before trusting the clean room")
     paths = TargetPaths.from_root(target)
-    click.echo(f"target {target}: .ateam/ {'present' if paths.exists() else 'missing'}")
+    click.echo(f"repo id {repo_id(target)} (from {_derivation(target)})")
+    previous = lookup_target(target)
+    if previous and previous["id"] != repo_id(target):
+        click.echo(f"WARN repo id derivation changed: now from {_derivation(target)}, was {previous['source']} ({previous['id']}). "
+                   f"The intent repo for the old id is still at {paths.intent.parent.parent / previous['id'] / 'intent'}; "
+                   f"move it to {paths.intent} if it is the same target")
+    record_target(target)
+    click.echo(f"intent repo {paths.intent}: {'present' if paths.exists() else 'missing (run: ateam intent init)'}")
+    if paths.exists():
+        remotes = GitRepo(paths.intent).run("remote", "-v").strip().splitlines()
+        click.echo("intent remote " + (remotes[0].split()[1] if remotes else "none"))
     try:
         git = GitRepo.discover(target)
         cfg = load_config(paths)
-        click.echo(f"branch {git.current_branch()} (target branch {cfg.target_branch})")
+        click.echo(f"target branch {git.current_branch()} (configured target branch {cfg.target_branch})")
     except Exception as e:  # noqa: BLE001
         click.echo(f"git: {e}")
 
