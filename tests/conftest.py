@@ -15,7 +15,7 @@ def _git(cwd: Path, *args: str) -> str:
 @pytest.fixture
 def target_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """A git repo on `main` with one commit and `src/`, `tests/`; its intent repo is initialised under ATEAM_HOME."""
-    monkeypatch.setenv("ATEAM_HOME", str(tmp_path / "ateam-home"))
+    monkeypatch.setenv("ATEAM_HOME", str(tmp_path / ".ateam"))  # a real-looking home: the path itself contains ".ateam"
     root = tmp_path / "target"
     root.mkdir()
     _git(root, "init", "-q", "-b", "main")
@@ -46,7 +46,7 @@ def target_paths(target_repo: Path):
 @pytest.fixture
 def ateam_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Isolated ATeam home. `target_repo` sets the same path, so the two fixtures compose."""
-    home = tmp_path / "ateam-home"
+    home = tmp_path / ".ateam"
     monkeypatch.setenv("ATEAM_HOME", str(home))
     return home
 

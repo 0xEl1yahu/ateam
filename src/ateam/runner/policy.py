@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -134,6 +135,7 @@ class Policy:
     protected: list[str]
     bound: dict[str, list[Record]] = field(default_factory=dict)
     scratch_dir: Path | None = None   # the worker's own scratch dir under ATeam home; the only writable place outside the worktree
+    ateam_home: Path | None = None    # the ATeam home base ($ATEAM_HOME or ~/.ateam); everything in it except scratch_dir is off limits
     denials: list[str] = field(default_factory=list)
     injected: set[str] = field(default_factory=set)
 
@@ -155,11 +157,25 @@ class Policy:
     def _in_scratch(self, file_path: str) -> bool:
         if self.scratch_dir is None:
             return False
+        candidate = Path(file_path)
+        if not candidate.is_absolute():
+            candidate = self.worktree / candidate
         try:
-            Path(file_path).resolve().relative_to(self.scratch_dir.resolve())
+            candidate.resolve().relative_to(self.scratch_dir.resolve())
             return True
         except ValueError:
             return False
+
+    def _spellings(self, path: Path | None) -> list[str]:
+        if path is None:
+            return []
+        out = {str(path), str(path.resolve())}
+        return sorted(out, key=len, reverse=True)
+
+    def _home_spellings(self) -> list[str]:
+        home = self.ateam_home or Path(os.environ.get("ATEAM_HOME") or (Path.home() / ".ateam"))
+        out = set(self._spellings(home)) | {"$ATEAM_HOME", "${ATEAM_HOME}", "~/.ateam", "$HOME/.ateam", "${HOME}/.ateam"}
+        return sorted(out, key=len, reverse=True)
 
     def path_writable_abs(self, file_path: str) -> tuple[bool, str]:
         """Writability for any path: inside the worktree by the role rules, inside the worker's scratch dir, nothing else."""
@@ -188,13 +204,21 @@ class Policy:
             if re.search(pattern, cmd):
                 return False, f"destructive command matched {pattern!r}"
         segments = _split_segments(_strip_heredocs(cmd))
-        home = str(self.scratch_dir.resolve().parent.parent) if self.scratch_dir is not None else None
+        scratch_spellings = self._spellings(self.scratch_dir)
+        home_spellings = self._home_spellings() if self.scratch_dir is not None or self.ateam_home is not None else []
         for seg in segments:
-            if home and home in seg and str(self.scratch_dir.resolve()) not in seg and str(self.scratch_dir) not in seg:
-                return False, "ATeam's home (intent repo, state store, logs) is off limits to workers"
+            mentions_scratch = any(sp in seg for sp in scratch_spellings)
+            if mentions_scratch and ".." in seg:
+                return False, "paths that leave your scratch directory are not allowed"
+            if any(sp in seg for sp in home_spellings) and not mentions_scratch:
+                return False, "ATeam's home (intent repo, state store, logs) is off limits to workers; only your scratch directory is writable"
+            rest = seg
+            for sp in [*scratch_spellings, *home_spellings]:
+                rest = rest.replace(sp, " ")
             if _is_rm(seg):
                 return False, "rm is not allowed for workers; use `git rm` for tracked files, cleanup happens at integration"
-            if _PROTECTED_MENTION.search(seg):
+            if _PROTECTED_MENTION.search(rest):
+                seg = rest
                 if _CD.match(seg):
                     return False, "changing directory into .ateam/ or .claude/ is not allowed"
                 if _MUTATORS.search(seg):

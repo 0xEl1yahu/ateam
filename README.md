@@ -1,6 +1,6 @@
 # ATeam
 
-ATeam is an engineering harness around headless Claude Code. It keeps engineering intent in version-controlled records and task contracts inside a target repository, runs role-separated workers (BUILD, INVESTIGATE, TEST) in isolated git worktrees through the Claude Agent SDK, and verifies the worktree itself rather than trusting a worker's report. The owner approves what gets built and what gets merged; ATeam decides how to build and verify in between.
+ATeam is an engineering harness around headless Claude Code. It keeps engineering intent in version-controlled records and task contracts in a private intent repo per target, runs role-separated workers (BUILD, INVESTIGATE, TEST) in isolated git worktrees through the Claude Agent SDK, and verifies the worktree itself rather than trusting a worker's report. The owner approves what gets built and what gets merged; ATeam decides how to build and verify in between.
 
 Design: `docs/superpowers/specs/2026-10-24-ateam-harness-design.md`. Plans: `docs/superpowers/plans/`.
 
@@ -20,7 +20,7 @@ Workers run in a clean room built from SDK options (no setting sources, strict M
 
 ## Setting up a fresh target repo
 
-Install once per machine (above). Then, per target repository, five steps, all ending up committed in that repo:
+Install once per machine (above). Then, per target repository, five steps; everything ATeam writes ends up committed in the target's private intent repo, never in the target:
 
 1. **Bootstrap.** `ateam intent init [--remote git@github.com:you/private-intent.git]` creates the intent repo and prints its path; `ateam intent path` prints it again. Optionally copy `examples/CLAUDE.target.md` to the target's `CLAUDE.md` so a Claude session a person opens there knows the rules (this is the only file you may choose to add to the target, and it is yours to keep private or not). Edit `$(ateam intent path)/config.yaml` to name the target branch and the deterministic checks.
 2. **First records.** Copy `examples/record.example.yaml` into `$(ateam intent path)/records/`, once per decision or invariant you already hold, bound to the paths it governs. A handful, not fifty. Commit them in the intent repo (`git -C "$(ateam intent path)" add -A && git -C "$(ateam intent path)" commit -m "ateam: first records"`), then `ateam records validate` and `ateam records approve R-0001` for each; approvals commit in the intent repo.

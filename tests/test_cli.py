@@ -244,3 +244,51 @@ def test_worker_run_leaves_target_and_worktree_free_of_ateam_files(cli_target, t
     for root in (cli_target, wt):
         assert not (root / ".ateam").exists() and not (root / ".ateam-scratch").exists()
     assert GitRepo(cli_target).is_clean() and GitRepo(wt).is_clean()
+
+
+# ---- review: freeze guard, origin-change adoption, doctor detail
+
+def test_contracts_freeze_refuses_dirty_intent_and_commits_only_its_file(cli_target, sample_contract):
+    from ateam.contracts.store import save_contract
+    p = TargetPaths.from_root(cli_target)
+    run("records", "approve", "R-0001", "--target", str(cli_target))
+    (p.contracts / "stray.txt").write_text("x: 1\n")
+    r = run("contracts", "freeze", "C-0001", "--target", str(cli_target))
+    assert r.exit_code == 1 and "uncommitted" in r.output and str(p.intent) in r.output
+    (p.contracts / "stray.txt").unlink()
+    save_contract(p.contracts, sample_contract.model_copy(update={"id": "C-0002", "title": "Second"}))
+    commit_intent(p, "seed C-0002", ["contracts"])
+    assert run("contracts", "freeze", "C-0001", "--target", str(cli_target)).exit_code == 0
+    g = GitRepo(p.intent)
+    assert g.is_clean() and g.run("log", "-1", "--format=%s").strip() == "ateam: freeze C-0001"
+    assert g.run("show", "--stat", "--format=", "HEAD").count(".yaml") == 1
+
+
+def test_intent_init_refuses_orphaning_after_origin_change_unless_adopt(cli_target):
+    old = TargetPaths.from_root(cli_target)
+    assert old.exists()
+    GitRepo(cli_target).run("remote", "add", "origin", "git@github.com:a/b.git")
+    new = TargetPaths.from_root(cli_target)
+    assert new.intent != old.intent
+    r = run("status", "--target", str(cli_target))
+    assert r.exit_code == 2 and "--adopt" in r.output and old.intent.parent.name in r.output
+    r2 = run("intent", "init", "--target", str(cli_target))
+    assert r2.exit_code == 1 and "--adopt" in r2.output and old.intent.parent.name in r2.output and new.intent.parent.name in r2.output
+    assert old.exists() and not new.exists()
+    r3 = run("intent", "init", "--adopt", "--target", str(cli_target))
+    assert r3.exit_code == 0, r3.output
+    assert new.exists() and not old.intent.exists()
+    assert (new.records / "R-0001-reading-state-is-only-ever-set.yaml").is_file()
+    assert run("status", "--target", str(cli_target)).exit_code == 0
+
+
+def test_doctor_names_both_ids_and_leaves_old_repo(cli_target):
+    old = TargetPaths.from_root(cli_target)
+    run("doctor", "--target", str(cli_target))
+    GitRepo(cli_target).run("remote", "add", "origin", "git@github.com:a/b.git")
+    new = TargetPaths.from_root(cli_target)
+    r = run("doctor", "--target", str(cli_target))
+    assert "WARN" in r.output and old.intent.parent.name in r.output and new.intent.parent.name in r.output and "--adopt" in r.output
+    assert old.exists()
+    r2 = run("doctor", "--target", str(cli_target))
+    assert "WARN" in r2.output  # the warning persists until the owner resolves it

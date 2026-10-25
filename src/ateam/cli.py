@@ -28,9 +28,25 @@ class Context:
         self.db.init_schema()
 
 
+def _previous_home(target: Path) -> tuple[dict, Path] | None:
+    """(registry entry, old home dir) when this target's id changed and the old home still has an intent repo."""
+    previous = lookup_target(target)
+    if not previous or previous["id"] == repo_id(target):
+        return None
+    old_home = home_dir(target).parent / previous["id"]
+    return (previous, old_home) if (old_home / "intent" / ".git").exists() else None
+
+
 def _context(target: Path, require_ateam: bool = True) -> Context:
     if require_ateam and not TargetPaths.from_root(target).exists():
-        click.echo(f"No intent repo for {target}. Run: ateam intent init")
+        moved = _previous_home(target)
+        if moved:
+            previous, old_home = moved
+            click.echo(f"The intent repo for {target} exists under a previous id {previous['id']} (derived from {previous['source']}); "
+                       f"the id is now {repo_id(target)} (from {_derivation(target)}). Run: ateam intent init --adopt  to move it, "
+                       f"or ateam intent init --fresh to start a new one and keep {old_home} as is")
+        else:
+            click.echo(f"No intent repo for {target}. Run: ateam intent init")
         sys.exit(2)
     return Context(target)
 
@@ -70,12 +86,26 @@ def intent() -> None:
 
 @intent.command("init")
 @click.option("--remote", default=None, help="Private git remote to pull from and push to.")
+@click.option("--adopt", is_flag=True, help="After the target's id changed (for example a new origin), move the existing home to the new id.")
+@click.option("--fresh", is_flag=True, help="After the target's id changed, start a new intent repo and leave the old home alone.")
 @TARGET_OPTION
-def intent_init(remote: str | None, target: Path) -> None:
+def intent_init(remote: str | None, adopt: bool, fresh: bool, target: Path) -> None:
     """Create the intent repo for this target under ATeam's home. Idempotent."""
-    from ateam.intent import IntentError, init_intent
+    from ateam.intent import IntentError, adopt_home, init_intent
 
     paths = TargetPaths.from_root(target)
+    moved = _previous_home(target) if not paths.exists() else None
+    if moved:
+        previous, old_home = moved
+        if adopt:
+            try:
+                adopt_home(old_home, paths.intent.parent)
+            except IntentError as e:
+                _fail(str(e))
+            click.echo(f"adopted {old_home} as {paths.intent.parent}")
+        elif not fresh:
+            _fail(f"this target's id changed from {previous['id']} ({previous['source']}) to {repo_id(target)} ({_derivation(target)}) "
+                  f"and {old_home / 'intent'} still exists. Pass --adopt to move it to the new id, or --fresh to start a new intent repo")
     try:
         git = init_intent(paths, remote=remote)
     except IntentError as e:
@@ -323,17 +353,22 @@ def contracts_freeze(contract_id: str, force: bool, target: Path) -> None:
         _fail(f"unknown contract {contract_id}")
     if cs[contract_id].status != ContractStatus.draft and not force:
         _fail(f"{contract_id} is already frozen ({cs[contract_id].status}); pass --force to re-freeze and reset it")
-    graph = RecordGraph(load_records(ctx.paths.records))
+    from ateam.intent import IntentError, commit_intent, require_clean
+
+    recs = load_records(ctx.paths.records)
+    try:
+        require_clean(ctx.paths)
+    except IntentError as e:
+        _fail(str(e))
+    graph = RecordGraph(recs)
     selected = select_records(cs[contract_id].paths, graph, ctx.paths.root)
     frozen = freeze(cs[contract_id], selected)
-    save_contract(ctx.paths.contracts, frozen)
-    from ateam.intent import IntentError, commit_intent
-
+    saved = save_contract(ctx.paths.contracts, frozen)
     try:
-        commit_intent(ctx.paths, f"ateam: freeze {frozen.id}", ["contracts"])
+        commit_intent(ctx.paths, f"ateam: freeze {frozen.id}", [f"contracts/{saved.name}"])
     except IntentError as e:
         if "nothing to commit" not in str(e):
-            _fail(str(e))
+            _fail(f"{e}. The frozen file is saved but not committed; commit it in {ctx.paths.intent} or re-run with --force")
     ctx.db.upsert_contract(frozen.id, frozen.plan, frozen.status, frozen.content_hash())
     for r in selected:
         ctx.db.set_record_hash(r.id, r.content_hash())
@@ -422,12 +457,14 @@ def doctor(target: Path) -> None:
         click.echo("WARN bundled Claude Code differs from the spiked version; re-run the spike before trusting the clean room")
     paths = TargetPaths.from_root(target)
     click.echo(f"repo id {repo_id(target)} (from {_derivation(target)})")
-    previous = lookup_target(target)
-    if previous and previous["id"] != repo_id(target):
-        click.echo(f"WARN repo id derivation changed: now from {_derivation(target)}, was {previous['source']} ({previous['id']}). "
-                   f"The intent repo for the old id is still at {paths.intent.parent.parent / previous['id'] / 'intent'}; "
-                   f"move it to {paths.intent} if it is the same target")
-    record_target(target)
+    moved = _previous_home(target)
+    if moved:
+        previous, old_home = moved
+        click.echo(f"WARN repo id derivation changed: now from {_derivation(target)} ({repo_id(target)}), was {previous['source']} "
+                   f"({previous['id']}). The intent repo for the old id is still at {old_home / 'intent'}; nothing was moved. "
+                   f"Run: ateam intent init --adopt  to move it, or --fresh to start over")
+    else:
+        record_target(target)
     click.echo(f"intent repo {paths.intent}: {'present' if paths.exists() else 'missing (run: ateam intent init)'}")
     if paths.exists():
         remotes = GitRepo(paths.intent).run("remote", "-v").strip().splitlines()

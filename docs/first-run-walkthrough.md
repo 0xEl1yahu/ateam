@@ -20,7 +20,7 @@ claude auth status | grep loggedIn                       # "loggedIn": true
 
 ## 1. A scratch target
 
-A throwaway repo keeps the first run away from anything you care about. Approval commands commit onto the target branch of whatever repo you point at.
+A throwaway repo keeps the first run away from anything you care about. ATeam writes nothing into the target, but worker branches and your own merges do land there.
 
 ```bash
 mkdir -p ~/tmp/ateam-playground && cd ~/tmp/ateam-playground
@@ -153,14 +153,14 @@ Then look at the evidence yourself, which is the whole point:
 ```bash
 git -C ../ateam-playground-C-0001 log --oneline main..          # the worker's commit(s)
 git -C ../ateam-playground-C-0001 diff main                     # exactly what changed
-cat ~/.ateam/*/scratch/C-0001/handoff.yaml                      # the worker's notes for a replacement (under ATeam home, not the worktree)
+cat "$(dirname "$I")/scratch/C-0001/handoff.yaml"               # the worker's notes for a replacement (under ATeam home, not the worktree)
 ateam status                                                    # C-0001 ready, last attempt: build completed
 ateam brief C-0001 --role build                                 # now has prior work and the notes section
 ```
 
 Nothing of ATeam's is in the worktree or the target: `git status` in both is clean after the worker's commit.
 
-Running the same contract again in the same worktree is a second attempt: the brief now carries the verified prior work and the previous worker's notes, and the worker typically confirms the work rather than redoing it. Pass `--base main` on reruns so the scope line and `changed=` cover the whole branch rather than only the latest commit; without it `--base` defaults to the worktree's current HEAD.
+Running the same contract again in the same worktree is a second attempt: the brief now carries the verified prior work and the previous worker's notes, and the worker typically confirms the work rather than redoing it. `--base` defaults to the merge-base with the target branch, so reruns compare against the whole branch; pass `--base <ref>` to narrow it.
 
 ## 5. Try to break it
 
@@ -182,7 +182,7 @@ Each of these should be refused or caught. Note any that is not.
 
 The same steps apply. Three cautions:
 
-1. Approvals and freezes commit in the intent repo, never in your checkout. Push it to a private remote (`ateam intent init --remote URL` or `ateam intent remote URL`, then `ateam intent push`) if you work from more than one machine; the other machine runs `ateam intent init --remote URL` once and `ateam intent pull` after that.
+1. Approvals and freezes commit in the intent repo, never in your checkout. Push it to a private remote (`ateam intent init --remote URL` or `ateam intent remote URL`, then `ateam intent push`) if you work from more than one machine; the other machine runs `ateam intent init --remote URL` once (before any plain `init`) and `ateam intent pull` after that. If the two machines diverge, `pull` refuses with git's non-fast-forward message; resolve it with git inside `$(ateam intent path)` and retry. If you add or change the target's `origin`, its id changes: `ateam doctor` warns and `ateam intent init --adopt` moves the existing intent repo to the new id.
 2. Contract `paths` are the only files a worker may change; list test files too, or the worker cannot write the test the contract asks for.
 3. Deterministic checks run in the worktree, which starts without any virtualenv. Either reference a check that needs only `python3` (`python3 -m unittest discover -s tests -t .`), or describe the setup in the contract's prompt for now; `config.setup` is honoured by the pass-two scheduler, not by `worker run`.
 

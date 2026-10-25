@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from ateam.config import TargetConfig, save_config
 from ateam.gitops import GitError, GitRepo
-from ateam.paths import TargetPaths
+from ateam.paths import TargetPaths, record_target
 
 FIRST_COMMIT = "ateam: initialise intent repo"
 
@@ -33,6 +33,7 @@ def init_intent(paths: TargetPaths, remote: str | None = None) -> GitRepo:
         git = GitRepo(intent)
         if remote:
             set_remote(paths, remote)
+        record_target(paths.root)
         return git
     intent.mkdir(parents=True)
     git = GitRepo(intent)
@@ -53,7 +54,29 @@ def init_intent(paths: TargetPaths, remote: str | None = None) -> GitRepo:
         save_config(paths, TargetConfig())
         git.run("add", "-A")
         git.run("commit", "-q", "-m", FIRST_COMMIT)
+    record_target(paths.root)
     return git
+
+
+def require_clean(paths: TargetPaths) -> GitRepo:
+    """The intent repo, or IntentError naming it when it has uncommitted changes."""
+    git = intent_git(paths)
+    if not git.is_clean():
+        raise IntentError(f"intent repo {paths.intent} has uncommitted changes; commit or discard them first")
+    return git
+
+
+def adopt_home(old_home: Path, new_home: Path) -> None:
+    """Move a target's ATeam home (intent repo, state, scratch) from a previous id to the current one."""
+    import shutil
+
+    new_home.mkdir(parents=True, exist_ok=True)
+    for child in old_home.iterdir():
+        dest = new_home / child.name
+        if dest.exists():
+            raise IntentError(f"cannot adopt: {dest} already exists; resolve by hand")
+        shutil.move(str(child), str(dest))
+    old_home.rmdir()
 
 
 def set_remote(paths: TargetPaths, url: str) -> None:

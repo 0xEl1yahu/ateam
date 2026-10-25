@@ -14,6 +14,7 @@ from ateam.checkpoint import Checkpoint, collect
 from ateam.config import TargetConfig
 from ateam.contracts.model import Contract
 from ateam.gitops import GitRepo
+from ateam.intent import intent_git
 from ateam.paths import TargetPaths
 from ateam.records.model import Record
 from ateam.roles import ROLE_SPECS, Role
@@ -83,7 +84,7 @@ def build_policy(
             bound.setdefault(g, []).append(r)
     return Policy(
         worktree=worktree, role=role, allowed_paths=list(contract.paths), protected=list(config.protected_paths),
-        bound=bound, scratch_dir=scratch_dir,
+        bound=bound, scratch_dir=scratch_dir, ateam_home=scratch_dir.parent.parent.parent if scratch_dir else None,
     )
 
 
@@ -128,8 +129,12 @@ async def run_contract_attempt(
     predicted = {k: contract.allocation.model_dump()[k] for k in ("complexity", "risk", "uncertainty")}
     attempt_id = db.start_attempt(contract.id, role.value, tier_name, tier.model, predicted)
 
+    intent = intent_git(paths)
+    intent_before = (intent.head(), intent.is_clean())
     options = worker_options(cwd=worktree, spec=ROLE_SPECS[role], brief_text=brief_text, policy=policy, tier=tier, resume=resume)
     res = await run_worker(prompt or default_prompt(contract, role), options, policy)
+    intent_after = (intent.head(), intent.is_clean())
+    tampered = intent_after != intent_before or not intent_after[1]
 
     usage = res.usage
     tokens_in = int(usage.get("input_tokens", 0) or 0) + int(usage.get("cache_read_input_tokens", 0) or 0)
@@ -143,6 +148,10 @@ async def run_contract_attempt(
         # The session was already paid for: close the attempt before propagating.
         db.finish_attempt(attempt_id, "failed", "environment", tokens_in, tokens_out, res.cost_usd, res.num_turns, res.wall_s, res.session_id)
         raise
-    outcome = "completed" if res.report and scope.ok else ("scope_breach" if res.report else "failed")
-    db.finish_attempt(attempt_id, outcome, None, tokens_in, tokens_out, res.cost_usd, res.num_turns, res.wall_s, res.session_id)
+    if tampered:
+        outcome, failure_class = "tamper", "tamper"   # the intent repo changed during the session; nothing a worker may do
+    else:
+        outcome = "completed" if res.report and scope.ok else ("scope_breach" if res.report else "failed")
+        failure_class = None
+    db.finish_attempt(attempt_id, outcome, failure_class, tokens_in, tokens_out, res.cost_usd, res.num_turns, res.wall_s, res.session_id)
     return res, tree, scope, cp

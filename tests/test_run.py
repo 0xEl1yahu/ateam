@@ -145,3 +145,30 @@ async def test_worktree_has_no_ateam_files_after_run(monkeypatch, target_repo, t
     assert not (target_repo / ".ateam-scratch").exists() and not (target_repo / ".ateam").exists()
     assert git.is_clean() and scope.ok
     assert (target_paths.scratch_root / "C-0001").is_dir()
+
+@pytest.mark.asyncio
+async def test_attempt_fails_as_tamper_when_intent_repo_changes_during_run(monkeypatch, target_repo, target_paths, sample_contract, records_three):
+    from ateam.config import TargetConfig
+    from ateam.contracts.select import freeze
+    from ateam.gitops import GitRepo
+    from ateam.paths import home_dir
+    from ateam.roles import Role
+    from ateam.runner import run as run_mod
+    from ateam.state.db import StateDB
+    from ateam.tiers import load_tiers
+
+    async def fake_query(prompt, options):
+        (target_paths.records / "R-0099-planted.yaml").write_text("id: R-0099\n")  # a worker reaching the intent repo
+        yield _result()
+
+    monkeypatch.setattr("ateam.runner.run.query", fake_query)
+    db = StateDB(home_dir(target_repo) / "state.db"); db.init_schema()
+    contract = freeze(sample_contract, [records_three["R-0001"]])
+    db.upsert_contract(contract.id, contract.plan, contract.status, contract.content_hash())
+    git = GitRepo(target_repo)
+    res, tree, scope, cp = await run_mod.run_contract_attempt(
+        paths=target_paths, config=TargetConfig(), git_worktree=git, worktree=target_repo, base=git.head(),
+        contract=contract, records=records_three, role=Role.build, tiers=load_tiers(), db=db,
+    )
+    row = db.telemetry_rows()[-1]
+    assert row["outcome"] == "tamper" and row["failure_class"] == "tamper"
