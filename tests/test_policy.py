@@ -244,6 +244,7 @@ INVESTIGATE_CD_DENY = [
     r'ls "a\\"; cd ..',
     r"ls $'\''; cd ..",
     r"ls $$'\'; cd ..; ls #'",
+    "ls $\\\n$'\\'; cd ..; ls #'",
 ]
 
 
@@ -724,6 +725,16 @@ BUILD_RM_DENY_ROUND2 = [
     "cat \\<<EOF\nrm x\nEOF",
     "cat '<<EOF'\nrm x\nEOF",
     "cat x # <<EOF\nrm x\nEOF",
+    "ls $\\\n$'\\'; rm x #'",
+    "cat <<EOF \\\n&& rm x\nd\nEOF",
+    "ls;#<<EOF\nrm x\nEOF",
+    "ls&&#<<EOF\nrm x\nEOF",
+    "ls|#<<EOF\nrm x\nEOF",
+    "cat <<EOF '\n'; rm x\nEOF",
+    "cat $\\\n'\\' <<EOF'\nrm x\nEOF",
+    "cat <<-EOF\n\tx\n\tEOF\nrm x\nEOF",
+    "cat <<EOF-x\nd\nEOF-x\nrm x\nEOF",
+    'cat <<E"O"F\nd\nEOF\nrm x\nE',
 ]
 
 
@@ -744,3 +755,16 @@ def test_double_quoted_fake_heredoc_body_is_checked(policy_build, policy_investi
 def test_build_real_heredoc_body_is_data(policy_build):
     assert policy_build.command_allowed("cat <<EOF\nrm x\nEOF")[0]
     assert policy_build.command_allowed("cat <<-EOF\n\trm x\nEOF")[0]
+
+
+@pytest.mark.parametrize("cmd", [
+    "cat <<EOF\nrm x\nEOF",
+    "cat <<'EOF'\nrm x\nEOF",
+    "cat <<-EOF\n\trm x\n\tEOF",
+    "cat <<A <<B\nrm a\nA\nrm b\nB",
+    "cat <<EOF > out.txt\nrm x\nEOF",
+    'echo "a # <<EOF"; ls',
+])
+def test_build_heredoc_bodies_are_data(policy_build, cmd):
+    ok, reason = policy_build.command_allowed(cmd)
+    assert ok, (cmd, reason)

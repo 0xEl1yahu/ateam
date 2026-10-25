@@ -64,7 +64,6 @@ _REDIRECT_TARGET = re.compile(r">>?\s*(\S+)")
 _READ_PREFIX = re.compile(
     r"^\s*(?:cat|head|tail|less|more|wc|grep|rg|ls|stat|file|diff|sort|uniq|cut|awk|find|tree|du|sed\s+-n|git\s+(?:diff|show|log|blame|status|ls-files|grep|branch|stash\s+(?:list|show)))\b"
 )
-_HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n(.*?)(?:^|\n)\2(?:\n|$)", re.S)
 _GIT_GLOBAL_OPTS = re.compile(r"^(\s*git)(?:\s+(?:-[cC]\s*\S+|--?\S+))+(\s+)")
 _WRAPPERS = {"command", "env", "exec", "nice", "nohup", "time", "builtin"}
 _READ_TOOL_HINT_WORDS = {"sed", "awk", "python", "python3", "perl", "ruby", "node"}
@@ -73,106 +72,189 @@ _CD_WORKTREE_REASON = "INVESTIGATE may cd only to a directory inside the worktre
 _GIT_BRANCH = re.compile(r"^\s*git\s+branch\b(?P<rest>.*)$")
 
 
-def _split_segments(cmd: str) -> list[str]:
-    """Split on &&, ||, ;, |, a single & (a background job) and newlines, but never inside single or double quotes.
+_COMMENT_AFTER = set(";&|()")
 
-    A & that belongs to >&, <& or &> is a redirect, not a separator."""
+
+def _comment_starts(prev: str) -> bool:
+    """A # begins a comment at the start of a word: first character, or after whitespace, ; & | ( or )."""
+    return prev == "" or prev.isspace() or prev in _COMMENT_AFTER
+
+
+def _join_continuations(cmd: str) -> str:
+    """Delete every backslash-newline that bash deletes: everywhere except inside single quotes and $'...'.
+
+    This is the one place that handles line continuations; later passes never see them."""
+    out: list[str] = []
+    quote: str | None = None   # "'", '"' or "$'"
+    dollars = 0                # consecutive $ just emitted; an odd count leaves one unpaired before a quote
+    i = 0
+    while i < len(cmd):
+        ch = cmd[i]
+        if ch == "\\" and quote not in ("'",):
+            nxt = cmd[i + 1 : i + 2]
+            if nxt == "\n" and quote != "$'":
+                i += 2
+                continue
+            out.append(cmd[i : i + 2]); i += 2; dollars = 0
+            continue
+        if quote:
+            if ch == quote[-1]:
+                quote = None
+            out.append(ch); i += 1; dollars = 0
+            continue
+        if ch == "$":
+            dollars += 1
+            out.append(ch); i += 1
+            continue
+        if ch == "'":
+            quote = "$'" if dollars % 2 else "'"
+        elif ch == '"':
+            quote = '"'
+        dollars = 0
+        out.append(ch); i += 1
+    return "".join(out)
+
+
+def _split_segments(cmd: str) -> list[str]:
+    """Split on &&, ||, ;, |, a single & (a background job) and newlines, but never inside quotes or comments.
+
+    A & that belongs to >&, <& or &> is a redirect, not a separator. Line continuations are removed before
+    this runs (see _join_continuations)."""
     segments: list[str] = []
     buf: list[str] = []
     quote: str | None = None   # "'", '"' or "$'" (ANSI-C quoting)
     redir_at = -2              # index of the last unescaped < or >
+    prev = ""                  # last character consumed outside quotes, "x" for anything word-like
     i = 0
     while i < len(cmd):
         ch = cmd[i]
         if quote:
-            if quote == '"' and ch == "\\" and cmd[i + 1 : i + 2] == "\n":
-                i += 2   # backslash-newline is deleted inside double quotes
-                continue
             buf.append(ch)
-            if quote == "'":
-                closes = ch == "'"
-            else:
-                closes = ch == quote[-1]
-                if closes:
-                    n = 0
-                    while cmd[i - 1 - n : i - n] == "\\" and i - 1 - n >= 0:
-                        n += 1
-                    closes = n % 2 == 0
-            if closes:
+            if ch == "\\" and quote != "'":
+                buf.append(cmd[i + 1 : i + 2]); i += 2; continue
+            if ch == quote[-1]:
                 quote = None
             i += 1
             continue
         if ch == "\\":   # outside quotes a backslash makes the next character literal
-            if cmd[i + 1 : i + 2] != "\n":   # backslash-newline is a line continuation and vanishes
-                buf.append(cmd[i : i + 2])
-            i += 2
+            buf.append(cmd[i : i + 2]); i += 2; prev = "x"
             continue
         if cmd[i : i + 2] == "$$":   # the PID parameter; a following ' is an ordinary quote
-            buf.append("$$")
-            i += 2
+            buf.append("$$"); i += 2; prev = "x"
             continue
         if cmd[i : i + 2] == "$'":
-            quote = "$'"
-            buf.append("$'")
-            i += 2
+            quote = "$'"; buf.append("$'"); i += 2; prev = "x"
             continue
         if ch in ("'", '"'):
-            quote = ch
-            buf.append(ch)
-            i += 1
+            quote = ch; buf.append(ch); i += 1; prev = "x"
+            continue
+        if ch == "#" and _comment_starts(prev):   # a comment holds no separators and no commands
+            j = cmd.find("\n", i)
+            i = len(cmd) if j < 0 else j
             continue
         two = cmd[i : i + 2]
-        if two in ("&&", "||"):
-            segments.append("".join(buf)); buf = []; i += 2; continue
-        if two == "|&":
-            segments.append("".join(buf)); buf = []; i += 2; continue
+        if two in ("&&", "||", "|&"):
+            segments.append("".join(buf)); buf = []; i += 2; prev = ";"; continue
         if ch in (";", "|", "\n"):
-            segments.append("".join(buf)); buf = []; i += 1; continue
+            segments.append("".join(buf)); buf = []; i += 1; prev = ";"; continue
         if ch == "&" and redir_at != i - 1 and cmd[i + 1 : i + 2] != ">":
-            segments.append("".join(buf)); buf = []; i += 1; continue
+            segments.append("".join(buf)); buf = []; i += 1; prev = ";"; continue
         if ch in ("<", ">"):
             redir_at = i
         buf.append(ch)
+        prev = ch
         i += 1
     segments.append("".join(buf))
     return [seg for seg in segments if seg.strip()]
 
 
+def _heredoc_word(cmd: str, j: int) -> int:
+    """End index of the delimiter word starting at j: runs to whitespace or one of ;&|<>(), quotes kept whole."""
+    k = j
+    while k < len(cmd):
+        c = cmd[k]
+        if c.isspace() or c in ";&|<>()":
+            break
+        if c == "\\":
+            k += 2
+        elif c in ("'", '"'):
+            close = cmd.find(c, k + 1)
+            k = len(cmd) if close < 0 else close + 1
+        else:
+            k += 1
+    return min(k, len(cmd))
+
+
 def _strip_heredocs(cmd: str) -> str:
     """Drop heredoc bodies so file contents are not mistaken for commands.
 
-    Only a << that bash would treat as an operator counts: not quoted, not escaped, not in a # comment."""
+    Only a << that bash would treat as an operator counts: not quoted, not escaped, not in a # comment, not <<<.
+    The rest of the operator line stays command text; the body starts after the first unquoted newline and ends
+    at a line equal to the delimiter (leading tabs ignored for <<-). An unterminated heredoc is left as is."""
     out: list[str] = []
     quote: str | None = None
+    prev = ""
+    pending: list[tuple[str, bool]] = []
+    n = len(cmd)
     i = 0
-    while i < len(cmd):
+    while i < n:
         ch = cmd[i]
         if quote:
             if ch == "\\" and quote != "'":
                 out.append(cmd[i : i + 2]); i += 2; continue
             if ch == quote[-1]:
                 quote = None
-            out.append(ch); i += 1; continue
+            out.append(ch); i += 1
+            continue
         two = cmd[i : i + 2]
         if ch == "\\":
-            out.append(cmd[i : i + 2]); i += 2; continue
+            out.append(cmd[i : i + 2]); i += 2; prev = "x"
+            continue
         if two in ("$$", "$'"):
             if two == "$'":
                 quote = "$'"
-            out.append(two); i += 2; continue
+            out.append(two); i += 2; prev = "x"
+            continue
         if ch in ("'", '"'):
-            quote = ch; out.append(ch); i += 1; continue
-        if ch == "#" and (i == 0 or cmd[i - 1].isspace()):
+            quote = ch; out.append(ch); i += 1; prev = "x"
+            continue
+        if ch == "#" and _comment_starts(prev):
             j = cmd.find("\n", i)
-            j = len(cmd) if j < 0 else j
-            out.append(cmd[i:j]); i = j; continue
-        if two == "<<" and cmd[i + 2 : i + 3] != "<":
-            m = _HEREDOC.match(cmd, i)
-            if m:
-                out.append(m.group(0)[: m.start(3) - m.start(0)]); i = m.end(); continue
-        if cmd[i : i + 3] == "<<<":
-            out.append("<<<"); i += 3; continue
-        out.append(ch); i += 1
+            j = n if j < 0 else j
+            out.append(cmd[i:j]); i = j
+            continue
+        if ch == "\n":
+            out.append("\n"); i += 1; prev = "\n"
+            pos = i
+            for term, dash in pending:
+                while True:
+                    if pos >= n:
+                        out.append(cmd[i:])   # unterminated: fail closed, keep every line as command text
+                        return "".join(out)
+                    eol = cmd.find("\n", pos)
+                    line = cmd[pos : n if eol < 0 else eol]
+                    pos = n if eol < 0 else eol + 1
+                    if (line.lstrip("\t") if dash else line) == term:
+                        break
+            if pending:
+                i = pos
+                pending = []
+            continue
+        if cmd.startswith("<<<", i):
+            out.append("<<<"); i += 3; prev = "<"
+            continue
+        if two == "<<":
+            j = i + 2
+            dash = cmd[j : j + 1] == "-"
+            j += dash
+            while j < n and cmd[j] in " \t":
+                j += 1
+            k = _heredoc_word(cmd, j)
+            term = re.sub(r"['\"\\]", "", cmd[j:k])
+            if term:
+                out.append(cmd[i:k]); pending.append((term, dash)); i = k; prev = "x"
+                continue
+        out.append(ch); i += 1; prev = ch
     return "".join(out)
 
 
@@ -396,6 +478,7 @@ class Policy:
         return path.is_dir() and any(r == path or r in path.parents for r in {self.worktree, self.worktree.resolve()})
 
     def command_allowed(self, cmd: str) -> tuple[bool, str]:
+        cmd = _join_continuations(cmd)
         self._pending_cwds = []
         if self.role == Role.investigate:
             for seg in _split_segments(_strip_heredocs(cmd)):
