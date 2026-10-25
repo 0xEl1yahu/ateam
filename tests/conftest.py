@@ -120,3 +120,16 @@ def sample_contract():
             tier={"build": "standard", "test": "careful", "investigate": "none"},
         ),
     )
+
+
+@pytest.fixture
+def cli_target(target_repo, ateam_home, sample_record, sample_contract):
+    """target_repo with sample_record (proposed) and sample_contract committed; ATEAM_HOME isolated."""
+    from ateam.contracts.store import save_contract
+    from ateam.gitops import GitRepo
+    from ateam.records.store import save_record
+
+    save_record(target_repo / ".ateam/records", sample_record)
+    save_contract(target_repo / ".ateam/contracts", sample_contract)
+    GitRepo(target_repo).commit_paths([".ateam"], "seed")
+    return target_repo
