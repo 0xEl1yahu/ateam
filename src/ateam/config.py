@@ -37,6 +37,6 @@ def load_config(paths: TargetPaths) -> TargetConfig:
 
 
 def save_config(paths: TargetPaths, cfg: TargetConfig) -> Path:
-    paths.ateam.mkdir(parents=True, exist_ok=True)
+    paths.intent.mkdir(parents=True, exist_ok=True)
     paths.config_file.write_text(yaml.safe_dump(cfg.model_dump(mode="json"), sort_keys=False))
     return paths.config_file
