@@ -133,3 +133,33 @@ def cli_target(target_repo, ateam_home, sample_record, sample_contract):
     save_contract(target_repo / ".ateam/contracts", sample_contract)
     GitRepo(target_repo).commit_paths([".ateam"], "seed")
     return target_repo
+
+
+def _policy(target_repo, records_three, role):
+    from ateam.runner.policy import Policy
+
+    return Policy(
+        worktree=target_repo, role=role, allowed_paths=["src/api/**"],
+        protected=[".ateam/**", ".claude/**"], bound={"src/api/**": [records_three["R-0001"]]},
+    )
+
+
+@pytest.fixture
+def policy_build(target_repo, records_three):
+    from ateam.roles import Role
+
+    return _policy(target_repo, records_three, Role.build)
+
+
+@pytest.fixture
+def policy_test(target_repo, records_three):
+    from ateam.roles import Role
+
+    return _policy(target_repo, records_three, Role.test)
+
+
+@pytest.fixture
+def policy_investigate(target_repo, records_three):
+    from ateam.roles import Role
+
+    return _policy(target_repo, records_three, Role.investigate)
