@@ -400,3 +400,85 @@ def test_plan_command_invalid_report_rejects_and_writes_nothing(monkeypatch, cli
     assert "P-0001" not in load_plans(p.plans) and "C-0002" not in load_contracts(p.contracts) and GitRepo(p.intent).head() == before
     db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
     assert db.feature_status("P-0001") == "plan_rejected"
+
+
+# ---- stage 2: approve and reject a plan
+
+def _proposed_plan(monkeypatch, cli_target, two=False, with_record=False):
+    rep = _canned_plan()
+    if two:
+        second = dict(rep["contracts"][0]); second = {**second, "title": "Use health in router", "depends_on": [0],
+                                                    "allocation": {**second["allocation"], "complexity": "high", "tier": {"build": "careful", "test": "light", "investigate": "none"}}}
+        rep["contracts"].append(second)
+    if with_record:
+        rep["proposed_records"] = [{"kind": "convention", "statement": "Health endpoints return plain strings", "rationale": "simple", "origin": "inferred",
+                                    "basis": "observation", "evidence": [{"type": "code", "ref": "src/api/x.py:1"}], "paths": ["src/api/**"], "serves": [], "confidence": "medium"}]
+    _patch_investigation(monkeypatch, rep)
+    assert run("records", "approve", "R-0001", "--target", str(cli_target)).exit_code == 0   # so src/api/** has a binding record
+    assert run("plan", "add a health function", "--target", str(cli_target)).exit_code == 0
+    return TargetPaths.from_root(cli_target)
+
+
+def test_approve_freezes_contracts_in_dependency_order_and_transitions(monkeypatch, cli_target):
+    p = _proposed_plan(monkeypatch, cli_target, two=True)
+    r = run("approve", "P-0001", "--skip-records", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    cs = load_contracts(p.contracts)
+    assert cs["C-0002"].status == "ready" and cs["C-0002"].records and cs["C-0003"].status == "draft"   # C-0003 depends on C-0002
+    assert r.output.index("C-0002") < r.output.index("C-0003")
+    from ateam.plans.store import load_plans
+    assert load_plans(p.plans)["P-0001"].status == "plan_approved"
+    db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
+    assert db.feature_status("P-0001") == "plan_approved" and db.contract_status("C-0002") == "ready" and db.contract_hash("C-0003")
+    g = GitRepo(p.intent)
+    assert g.is_clean() and "approve plan P-0001" in g.run("log", "-1", "--format=%s")
+
+
+def test_approve_applies_tier_override_and_raises_test_tier(monkeypatch, cli_target):
+    p = _proposed_plan(monkeypatch, cli_target, two=True)
+    r = run("approve", "P-0001", "--skip-records", "--tier", "C-0002=careful", "--tier", "C-0003:test=light", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    cs = load_contracts(p.contracts)
+    assert cs["C-0002"].allocation.tier == {"build": "careful", "test": "careful", "investigate": "none"}
+    assert cs["C-0003"].allocation.tier["test"] == "careful" and "raised" in r.output   # build is careful; test cannot go below it
+    from ateam.plans.store import load_plans
+    assert load_plans(p.plans)["P-0001"].tier_overrides == {"C-0002": {"build": "careful", "test": "careful"}, "C-0003": {"test": "light"}}
+
+
+def test_approve_requires_plan_proposed(monkeypatch, cli_target):
+    _proposed_plan(monkeypatch, cli_target)
+    assert run("approve", "P-0001", "--skip-records", "--target", str(cli_target)).exit_code == 0
+    r = run("approve", "P-0001", "--skip-records", "--target", str(cli_target))
+    assert r.exit_code == 1 and "plan_approved" in r.output
+
+
+def test_approve_runs_records_review_unless_skipped(monkeypatch, cli_target):
+    p = _proposed_plan(monkeypatch, cli_target, with_record=True)
+    rid = load_plans_ids(p)[0]
+    r = run("approve", "P-0001", "--target", str(cli_target), input="o\n")
+    assert r.exit_code == 0, r.output
+    assert load_records(p.records)[rid].status == "approved" and load_records(p.records)[rid].basis == "observation"
+
+
+def load_plans_ids(p):
+    from ateam.plans.store import load_plans
+    return load_plans(p.plans)["P-0001"].proposed_records
+
+
+def test_reject_plan_records_reason_and_leaves_contracts_draft(monkeypatch, cli_target):
+    p = _proposed_plan(monkeypatch, cli_target)
+    r = run("reject", "P-0001", "too broad", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    from ateam.plans.store import load_plans
+    plan = load_plans(p.plans)["P-0001"]
+    assert plan.status == "plan_rejected" and plan.history[-1].why == "too broad"
+    assert load_contracts(p.contracts)["C-0002"].status == "draft"
+    db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
+    assert db.feature_status("P-0001") == "plan_rejected" and db.contract_hash("C-0002") is None
+    assert "reject plan P-0001" in GitRepo(p.intent).run("log", "-1", "--format=%s")
+
+
+def test_status_lists_plans(monkeypatch, cli_target):
+    _proposed_plan(monkeypatch, cli_target)
+    out = run("status", "--target", str(cli_target)).output
+    assert "P-0001" in out and "plan_proposed" in out and "1 contract" in out

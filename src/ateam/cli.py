@@ -302,6 +302,151 @@ def plan(request: str, tier: str, target: Path) -> None:
     click.echo(f"\nsession {result.res.session_id}: {result.res.num_turns} turns, ${result.res.cost_usd:.4f}")
 
 
+def _dependency_order(contracts: dict) -> list[str]:
+    """Contract ids with dependencies first; ties by id. Cycles were rejected at planning time."""
+    remaining = dict(contracts)
+    order: list[str] = []
+    while remaining:
+        ready = sorted(cid for cid, c in remaining.items() if all(d not in remaining for d in c.depends_on))
+        if not ready:
+            ready = sorted(remaining)[:1]
+        for cid in ready:
+            order.append(cid)
+            remaining.pop(cid)
+    return order
+
+
+def _parse_tier_overrides(specs: tuple[str, ...], plan_contracts: list[str], tier_names: list[str]) -> dict[str, dict[str, str]]:
+    overrides: dict[str, dict[str, str]] = {}
+    for spec in specs:
+        if "=" not in spec:
+            _fail(f"bad --tier {spec!r}; use C-0002=careful or C-0002:test=careful")
+        lhs, name = spec.split("=", 1)
+        cid, _, role = lhs.partition(":")
+        if cid not in plan_contracts:
+            _fail(f"--tier {spec!r}: {cid} is not in this plan ({', '.join(plan_contracts)})")
+        if name not in tier_names:
+            _fail(f"--tier {spec!r}: unknown tier {name!r}; known: {', '.join(tier_names)}")
+        roles = [role] if role else ["build", "test"]   # investigate changes only when named; "none" is a real setting
+        if any(r not in ("build", "test", "investigate") for r in roles):
+            _fail(f"--tier {spec!r}: role must be build, test or investigate")
+        overrides.setdefault(cid, {}).update({r: name for r in roles})
+    return overrides
+
+
+@main.command()
+@click.argument("plan_id")
+@click.option("--tier", "tier_specs", multiple=True, help="Override tiers: C-0002=careful (build and test) or C-0002:investigate=light (one role); repeatable.")
+@click.option("--skip-records", is_flag=True, help="Do not walk the plan's proposed records now.")
+@TARGET_OPTION
+def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, target: Path) -> None:
+    """Approve a plan: review its proposed records, apply tier overrides, freeze its contracts."""
+    from datetime import UTC, datetime
+
+    from ateam.allocation import investigate_tier_for
+    from ateam.contracts.model import Level
+    from ateam.contracts.select import freeze, select_records
+    from ateam.contracts.store import load_contracts, save_contract
+    from ateam.intent import IntentError, commit_intent, require_clean
+    from ateam.plans.model import PlanHistoryEntry, PlanStatus
+    from ateam.plans.store import load_plans, save_plan
+    from ateam.records.graph import RecordGraph
+    from ateam.records.store import load_records
+    from ateam.tiers import ORDER, at_least, load_tiers
+
+    ctx = _context(target)
+    plans_ = load_plans(ctx.paths.plans)
+    if plan_id not in plans_:
+        _fail(f"unknown plan {plan_id}")
+    plan_ = plans_[plan_id]
+    if plan_.status != PlanStatus.plan_proposed:
+        _fail(f"{plan_id} is {plan_.status}; only plan_proposed plans can be approved")
+    tiers = load_tiers(ctx.config.tiers)
+    overrides = _parse_tier_overrides(tier_specs, plan_.contracts, list(tiers))
+
+    counts = {"approved": 0, "rejected": 0, "skipped": 0}
+    if plan_.proposed_records and not skip_records:
+        click.echo(f"Records proposed by {plan_id}:")
+        _review_records(ctx, list(plan_.proposed_records), counts)
+        click.echo(f"records: approved {counts['approved']}, rejected {counts['rejected']}, skipped {counts['skipped']}")
+    try:
+        require_clean(ctx.paths)
+    except IntentError as e:
+        _fail(str(e))
+
+    cs = load_contracts(ctx.paths.contracts)
+    missing = [cid for cid in plan_.contracts if cid not in cs]
+    if missing:
+        _fail(f"{plan_id} names contracts that do not exist: {', '.join(missing)}")
+    records = load_records(ctx.paths.records)
+    graph = RecordGraph(records)
+    notes: list[str] = []
+    click.echo("Frozen contracts, in dependency order:")
+    for cid in _dependency_order({cid: cs[cid] for cid in plan_.contracts}):
+        c = cs[cid]
+        tier = dict(c.allocation.tier)
+        tier.update(overrides.get(cid, {}))
+        build = tier.get("build") if tier.get("build") in ORDER else "standard"
+        wanted = at_least(build, tier.get("test") if tier.get("test") in ORDER else "light")
+        if wanted != tier.get("test"):
+            notes.append(f"{cid}: test tier raised from {tier.get('test')!r} to {wanted!r} (TEST never runs below BUILD)")
+            tier["test"] = wanted
+        if tier.get("investigate", "none") == "none" and Level(c.allocation.uncertainty) in (Level.medium, Level.high):
+            tier["investigate"] = investigate_tier_for(c.allocation.uncertainty)
+            notes.append(f"{cid}: investigate tier set to {tier['investigate']!r} for {c.allocation.uncertainty} uncertainty")
+        c = c.model_copy(update={"allocation": c.allocation.model_copy(update={"tier": tier})})
+        selected = select_records(c.paths, graph, ctx.paths.root)
+        frozen = freeze(c, selected)
+        save_contract(ctx.paths.contracts, frozen)
+        ctx.db.upsert_contract(frozen.id, frozen.plan, frozen.status, frozen.content_hash())
+        for r in selected:
+            ctx.db.set_record_hash(r.id, r.content_hash())
+        click.echo(f"  {frozen.id}  {frozen.status:<6} build={tier['build']} test={tier['test']} investigate={tier.get('investigate', 'none')}  records: {', '.join(r.id for r in selected) or 'none'}")
+    for n in notes:
+        click.echo(f"  note: {n}")
+    plan_ = plan_.model_copy(update={
+        "status": PlanStatus.plan_approved, "tier_overrides": overrides,
+        "history": [*plan_.history, PlanHistoryEntry(at=datetime.now(UTC), by="owner", to=PlanStatus.plan_approved)],
+    })
+    save_plan(ctx.paths.plans, plan_)
+    commit_intent(ctx.paths, f"ateam: approve plan {plan_id}", ["plans", "contracts"])
+    ctx.db.transition("feature", plan_id, "plan_approved", by="owner")
+    click.echo(f"{plan_id} -> plan_approved")
+
+
+@main.command()
+@click.argument("plan_id")
+@click.argument("reason")
+@TARGET_OPTION
+def reject(plan_id: str, reason: str, target: Path) -> None:
+    """Reject a proposed plan. Its contracts stay draft and are never frozen."""
+    from datetime import UTC, datetime
+
+    from ateam.intent import IntentError, commit_intent, require_clean
+    from ateam.plans.model import PlanHistoryEntry, PlanStatus
+    from ateam.plans.store import load_plans, save_plan
+
+    ctx = _context(target)
+    plans_ = load_plans(ctx.paths.plans)
+    if plan_id not in plans_:
+        _fail(f"unknown plan {plan_id}")
+    plan_ = plans_[plan_id]
+    if plan_.status != PlanStatus.plan_proposed:
+        _fail(f"{plan_id} is {plan_.status}; only plan_proposed plans can be rejected")
+    try:
+        require_clean(ctx.paths)
+    except IntentError as e:
+        _fail(str(e))
+    plan_ = plan_.model_copy(update={
+        "status": PlanStatus.plan_rejected,
+        "history": [*plan_.history, PlanHistoryEntry(at=datetime.now(UTC), by="owner", to=PlanStatus.plan_rejected, why=reason)],
+    })
+    save_plan(ctx.paths.plans, plan_)
+    commit_intent(ctx.paths, f"ateam: reject plan {plan_id}", ["plans"])
+    ctx.db.transition("feature", plan_id, "plan_rejected", by="owner", reason=reason)
+    click.echo(f"{plan_id} -> plan_rejected")
+
+
 @main.group()
 def plans() -> None:
     """Plans (feature requests and their contracts)."""
@@ -640,11 +785,14 @@ def schema(kind: str) -> None:
 @TARGET_OPTION
 def status(target: Path) -> None:
     """Feature and contract state from the operational store."""
+    from ateam.plans.store import load_plans
+
     ctx = _context(target)
-    rows = ctx.db.conn.execute("SELECT feature_id, status FROM features ORDER BY feature_id").fetchall()
-    click.echo("Features:" if rows else "Features: none")
-    for r in rows:
-        click.echo(f"  {r['feature_id']}  {r['status']}")
+    plans_ = load_plans(ctx.paths.plans)
+    click.echo("Plans:" if plans_ else "Plans: none")
+    for pid, p in sorted(plans_.items()):
+        live = ctx.db.feature_status(pid) or p.status
+        click.echo(f"  {pid}  {live:<14} {len(p.contracts)} contract(s)  {p.title}")
     crow = ctx.db.conn.execute("SELECT contract_id, plan_id, status FROM contracts ORDER BY contract_id").fetchall()
     click.echo("Contracts:" if crow else "Contracts: none")
     for r in crow:
