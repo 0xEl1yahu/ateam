@@ -1,0 +1,32 @@
+# A task contract. One file per contract under .ateam/contracts/, named <id>-<slug>.yaml.
+# A worker cannot start until `ateam contracts freeze C-0001` has run: that selects the binding
+# records, snapshots their hashes into `records:` and stores the contract hash in the state store.
+# Any later change to this file, or to a frozen record, stops workers until you re-freeze.
+id: C-0001
+plan: P-0001
+title: Expose reading state through the books API
+status: draft                   # draft until frozen; then ready | building | verifying | verified | failed | paused | integrated
+depends_on: []                  # contract ids that must be verified first
+paths: ["src/api/books/**", "tests/api/test_books.py"]   # the only files a BUILD worker may change
+incidental: ["requirements.txt"]                          # also allowed, not counted as scope breach
+records: []                     # filled by freeze: [{id: R-0001, hash: ...}]
+acceptance:
+  - id: A1
+    statement: GET /books/{id} returns reading_state for every book
+    check: {type: test, ref: tests/api/test_books.py::test_reading_state_present}
+  - id: A2
+    statement: PATCH with an invalid state returns 422 and changes nothing
+    check: {type: test, ref: tests/api/test_books.py::test_invalid_state}
+  - id: A3
+    statement: No code path infers reading state (R-0001)
+    check: {type: judgment}     # decided by the TEST worker with evidence
+checks:                         # deterministic checks run in the worktree
+  - {name: unit, cmd: "python -m pytest -q"}
+allocation:
+  complexity: medium            # low | medium | high  -> reasoning capacity (BUILD tier)
+  risk: high                    # low | medium | high  -> verification depth
+  uncertainty: low              # low | medium | high  -> investigation before building
+  reasoning: >
+    Touches an API boundary bound by R-0001; the API layer has no tests yet; requirements are explicit.
+  tier: {build: standard, test: careful, investigate: none}   # light | standard | careful | none
+budget: {attempts: 3, usd_per_attempt: 2.0, max_turns: 60}

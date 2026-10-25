@@ -1,0 +1,22 @@
+# A record: one decision, invariant or convention. One file per record under .ateam/records/.
+# File name must be <id>-<slug>.yaml. ATeam writes these; approve/reject through the CLI.
+id: R-0001                      # ^R-\d{4}$, never reused
+kind: invariant                 # decision | invariant | convention
+status: proposed                # proposed | approved | rejected | superseded | retired  (only approved reaches a worker)
+origin: documented              # documented (found written down) | inferred (read from code or history)
+basis: requirement              # requirement (intended behaviour) | observation (what the code does today)
+statement: >
+  Reading state is only ever set by the owner; nothing infers it.
+rationale: >
+  Inferred progress produced false confidence in an earlier version.
+evidence:                       # at least one doc/claude-md/agents-md/commit-message entry when origin is documented
+  - {type: doc, ref: docs/design.md#anti-goals}
+  - {type: test, ref: tests/test_reading_state.py::test_no_inference}
+binds:
+  paths: ["src/data/books.py", "src/api/books/**"]   # relative globs; empty list means global
+  incidental: []
+supersedes: []                  # ids this record replaces (set by `ateam records supersede`)
+serves: ["owner controls their own data"]            # short reusable phrases; duplicates are reported
+fingerprint: 1d5b17203a70fe69307bd41ade64b33f46e4003776c1923c0f3d9cac76dd1ca5
+history:
+  - {at: 2026-10-24T10:12:00Z, by: ateam-init, to: proposed, why: "found in design anti-goals"}
