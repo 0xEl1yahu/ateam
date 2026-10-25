@@ -24,3 +24,17 @@ def test_contract_example_loads():
 def test_config_example_loads():
     cfg = TargetConfig.model_validate(yaml.safe_load((EXAMPLES / "config.example.yaml").read_text()))
     assert cfg.checks and cfg.target_branch
+
+
+def test_target_claude_md_mentions_every_command_it_lists_exists():
+    import re
+    from click.testing import CliRunner
+
+    from ateam.cli import main
+
+    text = (EXAMPLES / "CLAUDE.target.md").read_text()
+    commands = sorted({m.group(1) for m in re.finditer(r"^ateam ([a-z]+(?: [a-z]+)?)", text, re.M)})
+    assert commands, "no commands found in the snippet"
+    for cmd in commands:
+        r = CliRunner().invoke(main, [*cmd.split(), "--help"])
+        assert r.exit_code == 0, f"`ateam {cmd}` is not a real command"

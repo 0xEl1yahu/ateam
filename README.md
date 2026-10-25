@@ -42,12 +42,13 @@ Approval commands commit only `.ateam/` paths on the configured target branch in
 
 ## Your first record and contract
 
-There is no `ateam init` or `ateam plan` yet (pass two), so the first record and contract are written by hand. Annotated templates live in [`examples/`](examples/): [`record.example.yaml`](examples/record.example.yaml), [`contract.example.yaml`](examples/contract.example.yaml) and [`config.example.yaml`](examples/config.example.yaml). A test loads them through the real models, so they cannot drift from the schema. `ateam schema records|contracts|config` prints the JSON Schema for editor validation.
+There is no `ateam init` or `ateam plan` yet (pass two), so the first record and contract are written by hand. Annotated templates live in [`examples/`](examples/): [`record.example.yaml`](examples/record.example.yaml), [`contract.example.yaml`](examples/contract.example.yaml), [`config.example.yaml`](examples/config.example.yaml), and [`CLAUDE.target.md`](examples/CLAUDE.target.md), a `CLAUDE.md` for the target repo so a Claude session a person opens there knows `.ateam/` is managed through the CLI. A test loads them through the real models, so they cannot drift from the schema. `ateam schema records|contracts|config` prints the JSON Schema for editor validation.
 
 ```bash
 cd ~/code/myrepo                                   # a throwaway clone is the safest first target
 mkdir -p .ateam/records .ateam/contracts
 echo '.ateam-scratch/' >> .gitignore                # the worker's handoff dir; tracked, so every clone agrees
+cp ~/code/ateam/examples/CLAUDE.target.md CLAUDE.md # rules for human-driven Claude sessions in this repo (workers never read it)
 cp ~/code/ateam/examples/record.example.yaml   .ateam/records/R-0001-reading-state.yaml
 cp ~/code/ateam/examples/contract.example.yaml .ateam/contracts/C-0001-reading-state-api.yaml
 # edit both: statement, evidence, binds.paths, contract paths and acceptance criteria for your repo

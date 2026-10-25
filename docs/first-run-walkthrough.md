@@ -39,6 +39,7 @@ class RoutesTest(unittest.TestCase):
         self.assertEqual(ROUTES, [])
 PY
 printf '__pycache__/\n.ateam-scratch/\n' > .gitignore   # .ateam-scratch/ is the worker's handoff dir; must be ignored via the tracked .gitignore
+cp ~/Documents/GitHub/ateam/examples/CLAUDE.target.md CLAUDE.md   # tells any Claude session opened here how .ateam/ is managed
 python3 -m unittest discover -s tests -t . -q      # 1 test, OK
 git add -A && git commit -q -m "playground"
 ```
