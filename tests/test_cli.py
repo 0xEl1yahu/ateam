@@ -19,8 +19,8 @@ from ateam.records.store import load_records, save_record
 from ateam.state.db import StateDB
 
 
-def run(*args):
-    return CliRunner().invoke(main, list(args))
+def run(*args, input=None):
+    return CliRunner().invoke(main, list(args), input=input)
 
 
 def test_records_validate_reports_errors(cli_target, sample_record):
@@ -292,3 +292,70 @@ def test_doctor_names_both_ids_and_leaves_old_repo(cli_target):
     assert old.exists()
     r2 = run("doctor", "--target", str(cli_target))
     assert "WARN" in r2.output  # the warning persists until the owner resolves it
+
+
+# ---- stage 1: ateam init and records review
+
+def _canned_discovery(**over):
+    report = {"candidates": [{
+        "kind": "invariant", "statement": "Routes never read environment variables directly", "rationale": "testability",
+        "origin": "documented", "basis": "requirement", "evidence": [{"type": "doc", "ref": "README.md#rules"}],
+        "paths": ["src/api/**"], "serves": ["testable handlers"], "confidence": "high"}], "unknowns": ["which port"], "notes": "n"}
+    report.update(over)
+    return report
+
+
+def _patch_investigation(monkeypatch, report):
+    from ateam.runner import investigate as inv_mod
+    from ateam.runner.run import WorkerResult
+
+    async def fake(**kw):
+        db = kw["db"]
+        a = db.start_attempt(kw["name"], "investigate", "light", "haiku", {})
+        db.finish_attempt(a, "completed", None, 1, 1, 0.001, 1, 0.1, "s")
+        res = WorkerResult("success", False, "completed", "s", 1, 0.001, {}, {}, report, [], [], None, 0.1)
+        return inv_mod.InvestigationResult(res=res, attempt_id=a, tampered=[])
+
+    monkeypatch.setattr("ateam.cli.run_investigation", fake, raising=False)
+    monkeypatch.setattr("ateam.discovery.run_investigation", fake, raising=False)
+    monkeypatch.setattr(inv_mod, "run_investigation", fake)
+
+
+def test_init_writes_proposed_records_and_commits(monkeypatch, target_repo, target_paths):
+    (target_repo / "README.md").write_text("# rules\nRoutes never read env.\n")
+    GitRepo(target_repo).run("add", "README.md"); GitRepo(target_repo).run("commit", "-q", "-m", "readme")
+    _patch_investigation(monkeypatch, _canned_discovery())
+    r = run("init", "--target", str(target_repo))
+    assert r.exit_code == 0, r.output
+    assert "R-0001" in r.output and "ateam records review" in r.output and "which port" in r.output
+    recs = load_records(target_paths.records)
+    assert recs["R-0001"].status == "proposed"
+    g = GitRepo(target_paths.intent)
+    assert g.is_clean() and "propose 1 record" in g.run("log", "-1", "--format=%s")
+    assert GitRepo(target_repo).is_clean()
+
+
+def test_init_with_zero_candidates_exits_zero(monkeypatch, target_repo, target_paths):
+    _patch_investigation(monkeypatch, _canned_discovery(candidates=[]))
+    r = run("init", "--target", str(target_repo))
+    assert r.exit_code == 0 and "0 records" in r.output and load_records(target_paths.records) == {}
+
+
+def test_init_creates_intent_repo_when_missing(monkeypatch, tmp_path, ateam_home):
+    t = _fresh_target(tmp_path, ateam_home)
+    _patch_investigation(monkeypatch, _canned_discovery(candidates=[]))
+    assert run("init", "--target", str(t)).exit_code == 0 and TargetPaths.from_root(t).exists()
+
+
+def test_records_review_approve_reject_skip_via_input(cli_target, sample_record):
+    p = TargetPaths.from_root(cli_target)
+    for rid in ("R-0002", "R-0003"):
+        save_record(p.records, sample_record.model_copy(update={"id": rid, "statement": f"Rule {rid}"}))
+    commit_intent(p, "seed", ["records"])
+    r = run("records", "review", "--target", str(cli_target), input="r\nj\nnot needed\ns\n")
+    assert r.exit_code == 0, r.output
+    recs = load_records(p.records)
+    assert recs["R-0001"].status == "approved" and recs["R-0001"].basis == "requirement"
+    assert recs["R-0002"].status == "rejected" and recs["R-0002"].history[-1].why == "not needed"
+    assert recs["R-0003"].status == "proposed"
+    assert "approved 1" in r.output and "rejected 1" in r.output and "skipped 1" in r.output

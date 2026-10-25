@@ -11,6 +11,7 @@ from ateam import SPIKED_CLI_VERSION, __version__
 from ateam.config import TargetConfig, load_config
 from ateam.gitops import GitRepo
 from ateam.paths import TargetPaths, home_dir, lookup_target, normalise_remote, origin_url, record_target, repo_id, repo_id_source
+from ateam.runner.investigate import run_investigation
 from ateam.state.db import StateDB
 
 TARGET_OPTION = click.option(
@@ -168,6 +169,69 @@ def _derivation(target: Path) -> str:
     return f"origin {normalise_remote(url)}" if url else "path"
 
 
+# ---------------------------------------------------------------- init (discovery)
+
+
+def _records_index(records) -> str:
+    approved = [r for r in records.values() if r.status == "approved"]
+    if not approved:
+        return "Approved records: none yet."
+    lines = ["Approved records (id, kind, binds, statement):"]
+    lines += [f"- {r.id} {r.kind} [{', '.join(r.binds.paths) or 'global'}] {r.statement.strip()}" for r in sorted(approved, key=lambda r: r.id)]
+    return "\n".join(lines)
+
+
+@main.command()
+@click.option("--remote", default=None, help="Private remote for the intent repo, when creating it.")
+@click.option("--max-candidates", default=12, show_default=True, type=int)
+@click.option("--tier", default="standard", show_default=True, type=click.Choice(["light", "standard", "careful"]))
+@TARGET_OPTION
+def init(remote: str | None, max_candidates: int, tier: str, target: Path) -> None:
+    """Discover a small baseline of records from the target and propose them for review."""
+    import asyncio
+
+    from ateam.discovery import candidates_to_records, render_discovery_report
+    from ateam.intent import IntentError, commit_intent, init_intent
+    from ateam.records.store import load_records, save_record
+    from ateam.roles import DISCOVERY_SPEC, Role
+    from ateam.tiers import load_tiers
+
+    paths = TargetPaths.from_root(target)
+    if not paths.exists():
+        try:
+            init_intent(paths, remote=remote)
+        except IntentError as e:
+            _fail(str(e))
+        record_target(target)
+    ctx = Context(target)
+    records = load_records(ctx.paths.records)
+    brief = "\n\n".join([
+        f"Propose at most {max_candidates} candidate records; at most {ctx.config.global_record_cap} may be global (no paths).",
+        _records_index(records),
+        "Do not re-propose anything already covered above.",
+    ])
+    tiers = load_tiers(ctx.config.tiers)
+    result = asyncio.run(run_investigation(
+        paths=ctx.paths, config=ctx.config, target_git=ctx.git, name="init", spec=DISCOVERY_SPEC,
+        prompt="Discover this repository's existing engineering intent and report candidates.", brief_text=brief,
+        tier=tiers[tier][Role.investigate], db=ctx.db, tier_name=tier,
+    ))
+    if result.tampered:
+        _fail("discovery changed the checkout or the intent repo; report discarded: " + "; ".join(result.tampered))
+    if result.res.report is None:
+        _fail(f"discovery produced no report (subtype {result.res.subtype}{', ' + result.res.error if result.res.error else ''})")
+    report = result.res.report
+    disc = candidates_to_records(report.get("candidates", []), report.get("unknowns", []), records, ctx.paths.root,
+                                 ctx.paths.records, cap_global=ctx.config.global_record_cap)
+    for rec in disc.proposed:
+        save_record(ctx.paths.records, rec)
+    if disc.proposed:
+        n = len(disc.proposed)
+        commit_intent(ctx.paths, f"ateam: propose {n} record{'s' if n != 1 else ''} from discovery", ["records"])
+    click.echo(render_discovery_report(disc))
+    click.echo(f"\nsession {result.res.session_id}: {result.res.num_turns} turns, ${result.res.cost_usd:.4f}")
+
+
 # ---------------------------------------------------------------- records
 
 
@@ -272,6 +336,54 @@ def _lifecycle(ctx: Context, action, *records_out: str) -> None:
     for r in changed:
         ctx.db.set_record_hash(r.id, r.content_hash())
         click.echo(f"{r.id} -> {r.status}")
+
+
+@records.command("review")
+@click.option("--all", "review_all", is_flag=True, help="Review every record, not only proposed ones.")
+@TARGET_OPTION
+def records_review(review_all: bool, target: Path) -> None:
+    """Walk through proposed records: approve as requirement or observation, reject with a reason, or skip."""
+    from ateam.records.lifecycle import LifecycleError
+    from ateam.records.model import Basis
+    from ateam.records.store import load_records
+
+    ctx = _context(target)
+    counts = {"approved": 0, "rejected": 0, "skipped": 0}
+    _review_records(ctx, [rid for rid, r in sorted(load_records(ctx.paths.records).items()) if review_all or r.status == "proposed"], counts)
+    click.echo(f"approved {counts['approved']}, rejected {counts['rejected']}, skipped {counts['skipped']}")
+
+
+def _review_records(ctx: Context, record_ids: list[str], counts: dict[str, int]) -> None:
+    import yaml
+
+    from ateam.records.lifecycle import LifecycleError
+    from ateam.records.model import Basis
+    from ateam.records.store import load_records
+
+    svc = _service(ctx)
+    for rid in record_ids:
+        recs = load_records(ctx.paths.records)
+        if rid not in recs or recs[rid].status != "proposed":
+            continue
+        click.echo("\n" + yaml.safe_dump(recs[rid].model_dump(mode="json", exclude={"history", "fingerprint"}), sort_keys=False))
+        _print_overlaps(ctx, rid)
+        choice = click.prompt(f"{rid}: approve as [r]equirement, approve as [o]bservation, re[j]ect, [s]kip, [q]uit",
+                              type=click.Choice(["r", "o", "j", "s", "q"]), show_choices=False)
+        try:
+            if choice in ("r", "o"):
+                rec = svc.approve(rid, Basis.requirement if choice == "r" else Basis.observation)
+                ctx.db.set_record_hash(rec.id, rec.content_hash()); counts["approved"] += 1
+            elif choice == "j":
+                reason = click.prompt("reason")
+                rec = svc.reject(rid, reason)
+                ctx.db.set_record_hash(rec.id, rec.content_hash()); counts["rejected"] += 1
+            elif choice == "s":
+                counts["skipped"] += 1
+            else:
+                counts["skipped"] += len(record_ids) - record_ids.index(rid)
+                break
+        except LifecycleError as e:
+            click.echo(f"error: {e}")
 
 
 @records.command("approve")

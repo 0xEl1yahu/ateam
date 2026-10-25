@@ -1,0 +1,60 @@
+from ateam.discovery import DiscoveryResult, candidates_to_records, render_discovery_report
+from ateam.records.lifecycle import reject
+from ateam.records.model import Basis, Evidence, Origin, Status, compute_fingerprint
+
+
+def cand(**over):
+    base = dict(kind="invariant", statement="Routes never read environment variables directly", rationale="testability",
+                origin="documented", basis="requirement",
+                evidence=[{"type": "doc", "ref": "README.md#rules"}], paths=["src/api/**"], serves=["testable handlers"], confidence="high")
+    base.update(over)
+    return base
+
+
+def test_candidates_dead_glob_dropped_and_reported(target_repo, target_paths):
+    r = candidates_to_records([cand(paths=["src/nothing/**"])], [], {}, target_repo, target_paths.records, cap_global=5)
+    assert r.proposed == [] and len(r.dropped) == 1 and "dead glob" in r.dropped[0][1]
+    assert "dead glob" in render_discovery_report(r)
+
+
+def test_rejected_fingerprint_not_reproposed(target_repo, target_paths, sample_record):
+    ev = [Evidence(type="doc", ref="README.md#rules")]
+    rejected = reject(sample_record.model_copy(update={"id": "R-0003", "evidence": ev, "fingerprint": compute_fingerprint(ev)}), "no")
+    r = candidates_to_records([cand()], [], {"R-0003": rejected}, target_repo, target_paths.records, cap_global=5)
+    assert r.proposed == [] and r.skipped_rejected == ["R-0003"]
+    assert "previously rejected" in render_discovery_report(r)
+
+
+def test_existing_fingerprint_skipped_silently(target_repo, target_paths, sample_record):
+    ev = [Evidence(type="doc", ref="README.md#rules")]
+    existing = sample_record.model_copy(update={"evidence": ev, "fingerprint": compute_fingerprint(ev), "status": Status.approved})
+    r = candidates_to_records([cand()], [], {"R-0001": existing}, target_repo, target_paths.records, cap_global=5)
+    assert r.proposed == [] and r.skipped_rejected == [] and r.dropped == []
+
+
+def test_documented_without_doc_evidence_downgraded(target_repo, target_paths):
+    r = candidates_to_records([cand(origin="documented", evidence=[{"type": "code", "ref": "src/api/x.py:1"}])], [], {}, target_repo, target_paths.records, cap_global=5)
+    rec = r.proposed[0]
+    assert rec.origin == Origin.inferred and "downgraded" in (rec.rationale or "")
+
+
+def test_code_only_evidence_is_observation(target_repo, target_paths):
+    r = candidates_to_records([cand(origin="inferred", basis="requirement", evidence=[{"type": "code", "ref": "src/api/x.py:1"}, {"type": "test", "ref": "tests/test_app.py::test_greet"}])], [], {}, target_repo, target_paths.records, cap_global=5)
+    assert r.proposed[0].basis == Basis.observation
+
+
+def test_global_cap_and_ids_continue(target_repo, target_paths, sample_record):
+    existing = {"R-0004": sample_record.model_copy(update={"id": "R-0004"})}
+    from ateam.records.store import save_record
+    save_record(target_paths.records, existing["R-0004"])
+    cands = [cand(statement=f"Global rule {i}", paths=[], evidence=[{"type": "doc", "ref": f"docs/d{i}.md"}]) for i in range(4)]
+    r = candidates_to_records(cands, ["what about ports"], existing, target_repo, target_paths.records, cap_global=2)
+    assert [p.id for p in r.proposed] == ["R-0005", "R-0006"] and r.capped == 2
+    assert all(p.status == Status.proposed and p.history[-1].by == "ateam-init" for p in r.proposed)
+    assert r.unknowns == ["what about ports"] and "global cap" in [d[1] for d in r.dropped][0]
+
+
+def test_render_report_lists_next_command(target_repo, target_paths):
+    r = candidates_to_records([cand()], ["which port"], {}, target_repo, target_paths.records, cap_global=5)
+    text = render_discovery_report(r)
+    assert "R-0001" in text and "ateam records review" in text and "which port" in text and "README.md#rules" in text
