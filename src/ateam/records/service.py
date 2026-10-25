@@ -9,6 +9,7 @@ from ateam.records import lifecycle
 from ateam.records.lifecycle import LifecycleError
 from ateam.records.model import Basis, Record
 from ateam.records.store import load_records, save_record
+from ateam.records.validate import validate_records
 
 
 class RecordService:
@@ -31,7 +32,16 @@ class RecordService:
             raise LifecycleError(f"unknown record id(s): {', '.join(missing)}")
         return [records[i] for i in ids]
 
+    def _check(self, *changed: Record) -> None:
+        """Refuse a transition that would commit a record set with validation errors on the changed ids."""
+        future = {**load_records(self.paths.records), **{r.id: r for r in changed}}
+        ids = {r.id for r in changed}
+        errors = [p for p in validate_records(future, self.paths.root) if p.level == "error" and (p.record_id in ids or p.record_id is None)]
+        if errors:
+            raise LifecycleError("; ".join(f"{p.record_id or '-'}: {p.message}" for p in errors))
+
     def _commit(self, message: str, *records: Record) -> None:
+        self._check(*records)
         for r in records:
             save_record(self.paths.records, r)
         self.git.commit_paths([".ateam/records"], message)

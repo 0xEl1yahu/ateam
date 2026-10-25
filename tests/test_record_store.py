@@ -38,3 +38,10 @@ def test_duplicate_id_raises(target_repo, sample_record):
     (d / f"{sample_record.id}-copy.yaml").write_text(p.read_text())
     with pytest.raises(RecordStoreError, match="duplicate"):
         load_records(d)
+
+
+def test_malformed_record_file_raises_store_error_naming_file(target_repo):
+    d = target_repo / ".ateam/records"
+    (d / "R-0003-bad.yaml").write_text("id: R-0003\nkind: nonsense\n")
+    with pytest.raises(RecordStoreError, match="R-0003-bad.yaml"):
+        load_records(d)

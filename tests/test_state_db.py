@@ -73,3 +73,18 @@ def test_checkpoint_and_lock(tmp_path):
     assert db.acquire_run_lock("P-0001")  # re-entrant for the holder
     db.release_run_lock("P-0001")
     assert db.acquire_run_lock("P-0002")
+
+
+def test_run_lock_is_exclusive_across_connections(tmp_path):
+    a = fresh(tmp_path)
+    b = StateDB(tmp_path / "s.db")
+    assert a.acquire_run_lock("P-0001")
+    assert not b.acquire_run_lock("P-0002")
+    assert b.acquire_run_lock("P-0001")  # same holder, re-entrant from any connection
+    assert a.run_lock_holder() == "P-0001"
+    import sqlite3
+    with pytest.raises(sqlite3.IntegrityError):  # the schema itself forbids a second holder, so a race cannot create one
+        b.conn.execute("INSERT INTO run_lock (singleton, plan_id, acquired_at) VALUES (1, 'P-0002', 'now')")
+    b.conn.rollback()
+    a.release_run_lock("P-0001")
+    assert b.acquire_run_lock("P-0002") and a.run_lock_holder() == "P-0002"

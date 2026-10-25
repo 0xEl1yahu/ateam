@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 
 import yaml
+from pydantic import ValidationError
 
 from ateam.records.model import Record
 
@@ -22,8 +23,10 @@ def load_records(records_dir: Path) -> dict[str, Record]:
     sources: dict[str, Path] = {}
     for path in sorted(records_dir.glob("*.y*ml")):
         m = _FILE_RE.match(path.name)
-        data = yaml.safe_load(path.read_text()) or {}
-        record = Record.model_validate(data)
+        try:
+            record = Record.model_validate(yaml.safe_load(path.read_text()) or {})
+        except (yaml.YAMLError, ValidationError) as e:
+            raise RecordStoreError(f"{path.name}: {_summarise(e)}") from e
         if not m or m.group("id") != record.id:
             raise RecordStoreError(f"{path.name}: filename does not match record id {record.id!r}")
         if record.id in records:
@@ -55,3 +58,10 @@ def next_id(records_dir: Path, prefix: str = "R") -> str:
 
 def file_hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _summarise(e: Exception) -> str:
+    if hasattr(e, "errors"):
+        parts = [f"{'.'.join(str(x) for x in err['loc']) or '<root>'}: {err['msg']}" for err in e.errors()]  # type: ignore[attr-defined]
+        return "; ".join(parts)
+    return str(e).splitlines()[0]

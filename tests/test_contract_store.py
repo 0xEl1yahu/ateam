@@ -18,3 +18,10 @@ def test_mismatch_raises(target_repo, sample_contract):
     (d / "C-0009-copy.yaml").write_text(p.read_text())
     with pytest.raises(ContractStoreError, match="C-0009-copy.yaml"):
         load_contracts(d)
+
+
+def test_malformed_contract_file_raises_store_error_naming_file(target_repo):
+    d = target_repo / ".ateam/contracts"
+    (d / "C-0002-bad.yaml").write_text("id: C-0002\ntitle: x\n")
+    with pytest.raises(ContractStoreError, match="C-0002-bad.yaml"):
+        load_contracts(d)

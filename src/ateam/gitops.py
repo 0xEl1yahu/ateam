@@ -48,8 +48,10 @@ class GitRepo:
     def is_clean(self, paths: list[str] | None = None) -> bool:
         if not paths:
             return not self.status_porcelain()
-        prefixes = tuple(p.rstrip("/") + "/" for p in paths) + tuple(p.rstrip("/") for p in paths)
-        return not any(path.startswith(prefixes) or path in paths for _, path in self.status_porcelain())
+        roots = [p.rstrip("/") for p in paths]
+        return not any(
+            path == r or path.startswith(r + "/") for _, path in self.status_porcelain() for r in roots
+        )
 
     def diff_names(self, base: str) -> list[str]:
         out = self.run("diff", "--name-only", base)
@@ -62,6 +64,12 @@ class GitRepo:
             raise GitError(f"nothing to commit under {paths}")
         self.run("commit", "-q", "-m", message, "--only", "--", *paths)
         return self.head()
+
+    def is_linked_worktree(self) -> bool:
+        """True when this checkout is a linked worktree (its git dir differs from the common dir)."""
+        git_dir = Path(self.run("rev-parse", "--git-dir").strip())
+        common = Path(self.run("rev-parse", "--git-common-dir").strip())
+        return (self.root / git_dir).resolve() != (self.root / common).resolve()
 
     def worktree_add(self, path: Path, branch: str, base: str) -> None:
         self.run("worktree", "add", "-q", "-b", branch, str(path), base)

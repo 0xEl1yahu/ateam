@@ -45,3 +45,77 @@ async def test_run_worker_without_result(monkeypatch, policy_build):
     monkeypatch.setattr("ateam.runner.run.query", fake_query)
     r = await run_worker("p", ClaudeAgentOptions(), policy_build)
     assert r.subtype == "no_result" and r.is_error and r.session_id is None and "connection lost" in r.error
+
+
+@pytest.mark.asyncio
+async def test_attempt_is_finished_even_if_post_run_fails(monkeypatch, target_repo, sample_contract, records_three, ateam_home):
+    from ateam.config import TargetConfig
+    from ateam.contracts.select import freeze
+    from ateam.gitops import GitRepo
+    from ateam.paths import TargetPaths, home_dir
+    from ateam.roles import Role
+    from ateam.runner import run as run_mod
+    from ateam.state.db import StateDB
+    from ateam.tiers import load_tiers
+
+    async def fake_query(prompt, options):
+        yield _result()
+
+    monkeypatch.setattr("ateam.runner.run.query", fake_query)
+    monkeypatch.setattr(run_mod, "collect", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("git exploded")))
+    db = StateDB(home_dir(target_repo) / "state.db"); db.init_schema()
+    contract = freeze(sample_contract.model_copy(update={"allocation": sample_contract.allocation.model_copy(update={"tier": {"build": "light", "test": "light", "investigate": "none"}})}), [records_three["R-0001"]])
+    db.upsert_contract(contract.id, contract.plan, contract.status, contract.content_hash())
+    git = GitRepo(target_repo)
+    with pytest.raises(RuntimeError, match="git exploded"):
+        await run_mod.run_contract_attempt(
+            paths=TargetPaths.from_root(target_repo), config=TargetConfig(), git_worktree=git, worktree=target_repo, base=git.head(),
+            contract=contract, records=records_three, role=Role.build, tiers=load_tiers(), db=db,
+        )
+    row = db.telemetry_rows()[-1]
+    assert row["outcome"] == "failed" and row["failure_class"] == "environment" and row["finished_at"]
+
+
+@pytest.mark.asyncio
+async def test_tier_override_is_recorded_without_touching_contract(monkeypatch, target_repo, sample_contract, records_three, ateam_home):
+    from ateam.config import TargetConfig
+    from ateam.contracts.select import freeze
+    from ateam.gitops import GitRepo
+    from ateam.paths import TargetPaths, home_dir
+    from ateam.roles import Role
+    from ateam.runner import run as run_mod
+    from ateam.state.db import StateDB
+    from ateam.tiers import load_tiers
+
+    seen = {}
+
+    async def fake_query(prompt, options):
+        seen["model"] = options.model
+        yield _result()
+
+    monkeypatch.setattr("ateam.runner.run.query", fake_query)
+    db = StateDB(home_dir(target_repo) / "state.db"); db.init_schema()
+    contract = freeze(sample_contract, [records_three["R-0001"]])   # build tier is "standard" (sonnet)
+    db.upsert_contract(contract.id, contract.plan, contract.status, contract.content_hash())
+    git = GitRepo(target_repo)
+    res, tree, scope, cp = await run_mod.run_contract_attempt(
+        paths=TargetPaths.from_root(target_repo), config=TargetConfig(), git_worktree=git, worktree=target_repo, base=git.head(),
+        contract=contract, records=records_three, role=Role.build, tiers=load_tiers(), db=db, tier_override="light",
+    )
+    row = db.telemetry_rows()[-1]
+    assert seen["model"] == "haiku" and row["tier"] == "light" and row["model"] == "haiku"
+    assert cp.contract_hash == contract.content_hash() == db.contract_hash("C-0001")
+
+
+def test_prepare_worktree_creates_scratch_and_exclude(target_repo, tmp_path):
+    from ateam.gitops import GitRepo
+    from ateam.runner.run import prepare_worktree
+
+    wt = tmp_path / "wt"
+    GitRepo(target_repo).worktree_add(wt, "wt-prep", "main")
+    prepare_worktree(wt)
+    prepare_worktree(wt)  # idempotent
+    (wt / ".ateam-scratch/handoff.yaml").write_text("progress: x\n")
+    assert (wt / ".ateam-scratch").is_dir() and GitRepo(wt).is_clean()
+    common = GitRepo(wt).run("rev-parse", "--git-common-dir").strip()
+    assert (wt / common / "info/exclude").read_text().count(".ateam-scratch/") == 1

@@ -30,13 +30,41 @@ ateam records reject R-0001 "reason"
 ateam records supersede R-0001 --with R-0002   # one transaction, one commit
 ateam records retire R-0001 "reason"
 ateam contracts show C-0001
-ateam contracts freeze C-0001                  # selects bound records, snapshots their hashes
+ateam contracts freeze C-0001 [--force]        # selects bound records, snapshots their hashes; binding from here on
+ateam contracts validate                       # hand edits and record drift against the freeze
+ateam schema records|contracts|config          # JSON Schema for editors
 ateam brief C-0001 --role build                # print the brief a worker would receive
 ateam worker run C-0001 --role build --cwd /path/to/worktree [--base REF] [--tier light] [--resume ID]
 ateam status
 ```
 
 Approval commands commit only `.ateam/` paths on the configured target branch in your checkout, and refuse to act when the checkout is on another branch or `.ateam/` already has uncommitted changes.
+
+## Your first record and contract
+
+There is no `ateam init` or `ateam plan` yet (pass two), so the first record and contract are written by hand. Annotated templates live in [`examples/`](examples/): [`record.example.yaml`](examples/record.example.yaml), [`contract.example.yaml`](examples/contract.example.yaml) and [`config.example.yaml`](examples/config.example.yaml). A test loads them through the real models, so they cannot drift from the schema. `ateam schema records|contracts|config` prints the JSON Schema for editor validation.
+
+```bash
+cd ~/code/myrepo                                   # a throwaway clone is the safest first target
+mkdir -p .ateam/records .ateam/contracts
+cp ~/code/ateam/examples/record.example.yaml   .ateam/records/R-0001-reading-state.yaml
+cp ~/code/ateam/examples/contract.example.yaml .ateam/contracts/C-0001-reading-state-api.yaml
+# edit both: statement, evidence, binds.paths, contract paths and acceptance criteria for your repo
+git add .ateam && git commit -m "ateam: first record and contract"
+
+ateam records validate                              # must print 0 error(s)
+ateam records approve R-0001                        # commits only .ateam/ on the target branch
+ateam contracts freeze C-0001                       # selects bound records, snapshots hashes; the contract is now binding
+ateam brief C-0001 --role build                     # exactly what the worker will be told
+
+git worktree add ../myrepo-C-0001 -b ateam/C-0001 main
+ateam worker run C-0001 --role build --cwd ../myrepo-C-0001 --tier light
+ateam status
+```
+
+A worker refuses to start (exit code 4) unless the contract is frozen, unchanged since the freeze, in a runnable state, and none of its frozen records have changed. `ateam contracts validate` reports hand edits and record drift; `ateam contracts freeze --force` re-freezes deliberately. Workers also refuse to run in the target checkout itself: `--cwd` must be a linked worktree.
+
+`ateam worker run` creates `.ateam-scratch/` in the worktree and adds one line, `.ateam-scratch/`, to the target's `.git/info/exclude` (git shares that file across worktrees), so the worker's handoff file never shows up as untracked.
 
 ## Target repo layout
 

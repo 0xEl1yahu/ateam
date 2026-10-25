@@ -36,3 +36,13 @@ def test_supersede_commits_both(record_service, target_repo, sample_record):
     recs = load_records(target_repo / ".ateam/records")
     assert recs["R-0001"].status == Status.superseded and recs["R-0002"].status == Status.approved
     assert GitRepo(target_repo).run("log", "-1", "--format=%s").strip() == "ateam: supersede R-0001 with R-0002"
+
+
+def test_approve_refuses_record_with_validation_errors(record_service, target_repo, sample_record):
+    bad = sample_record.model_copy(update={"id": "R-0002"})
+    bad.binds.paths = ["./src/**"]
+    save_record(target_repo / ".ateam/records", bad)
+    GitRepo(target_repo).commit_paths([".ateam"], "seed bad")
+    with pytest.raises(LifecycleError, match="invalid glob"):
+        record_service.approve("R-0002")
+    assert load_records(target_repo / ".ateam/records")["R-0002"].status == Status.proposed

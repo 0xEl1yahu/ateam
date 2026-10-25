@@ -17,6 +17,7 @@ from ateam.gitops import GitRepo
 from ateam.paths import TargetPaths
 from ateam.records.model import Record
 from ateam.roles import ROLE_SPECS, Role
+from ateam.runner.binding import require_binding
 from ateam.runner.options import worker_options
 from ateam.runner.policy import Policy
 from ateam.state.db import StateDB
@@ -81,6 +82,13 @@ def build_policy(worktree: Path, role: Role, contract: Contract, config: TargetC
     return Policy(worktree=worktree, role=role, allowed_paths=list(contract.paths), protected=list(config.protected_paths), bound=bound)
 
 
+def prepare_worktree(worktree: Path) -> None:
+    """Create the worker's scratch directory and keep it out of git status (idempotent)."""
+    git = GitRepo(worktree)
+    (worktree / ".ateam-scratch").mkdir(exist_ok=True)
+    git.exclude_in_worktree(worktree, [".ateam-scratch/"])
+
+
 def default_prompt(contract: Contract, role: Role) -> str:
     verb = {Role.build: "Implement", Role.investigate: "Investigate", Role.test: "Judge"}[role]
     return f"{verb} contract {contract.id}: {contract.title}. Follow the brief in your system prompt and end with the structured report."
@@ -89,10 +97,15 @@ def default_prompt(contract: Contract, role: Role) -> str:
 async def run_contract_attempt(
     *, paths: TargetPaths, config: TargetConfig, git_worktree: GitRepo, worktree: Path, base: str,
     contract: Contract, records: dict[str, Record], role: Role, tiers: dict[str, dict[Role, TierSpec]],
-    db: StateDB, resume: str | None = None, prompt: str | None = None,
+    db: StateDB, resume: str | None = None, prompt: str | None = None, tier_override: str | None = None,
 ) -> tuple[WorkerResult, TreeState, ScopeResult, Checkpoint]:
-    tier = resolve(contract, role, tiers)
-    tier_name = contract.allocation.tier[role.value]
+    require_binding(contract, records, db)
+    if tier_override:
+        if tier_override not in tiers:
+            raise ValueError(f"unknown tier {tier_override!r}")
+        tier, tier_name = tiers[tier_override][role], tier_override
+    else:
+        tier, tier_name = resolve(contract, role, tiers), contract.allocation.tier[role.value]
     policy = build_policy(worktree, role, contract, config, records)
     selected = [records[ref.id] for ref in contract.records if ref.id in records]
     prev_raw = db.latest_checkpoint(contract.id)
@@ -104,13 +117,18 @@ async def run_contract_attempt(
     options = worker_options(cwd=worktree, spec=ROLE_SPECS[role], brief_text=brief_text, policy=policy, tier=tier, resume=resume)
     res = await run_worker(prompt or default_prompt(contract, role), options, policy)
 
-    tree = tree_state(git_worktree, base)
-    scope = scope_check(tree, contract.paths, contract.incidental)
-    cp = collect(git_worktree, worktree, base, contract, records, res.session_id, checks=[])
-    db.set_checkpoint(contract.id, attempt_id, cp.to_dict())
-    outcome = "completed" if res.report and scope.ok else ("scope_breach" if res.report else "failed")
     usage = res.usage
     tokens_in = int(usage.get("input_tokens", 0) or 0) + int(usage.get("cache_read_input_tokens", 0) or 0)
     tokens_out = int(usage.get("output_tokens", 0) or 0)
+    try:
+        tree = tree_state(git_worktree, base)
+        scope = scope_check(tree, contract.paths, contract.incidental)
+        cp = collect(git_worktree, worktree, base, contract, records, res.session_id, checks=[])
+        db.set_checkpoint(contract.id, attempt_id, cp.to_dict())
+    except Exception:
+        # The session was already paid for: close the attempt before propagating.
+        db.finish_attempt(attempt_id, "failed", "environment", tokens_in, tokens_out, res.cost_usd, res.num_turns, res.wall_s, res.session_id)
+        raise
+    outcome = "completed" if res.report and scope.ok else ("scope_breach" if res.report else "failed")
     db.finish_attempt(attempt_id, outcome, None, tokens_in, tokens_out, res.cost_usd, res.num_turns, res.wall_s, res.session_id)
     return res, tree, scope, cp

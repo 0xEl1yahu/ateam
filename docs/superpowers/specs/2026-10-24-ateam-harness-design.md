@@ -264,7 +264,9 @@ allocation:
 budget: {attempts: 3, usd_per_attempt: 2.00, max_turns: 60}
 ```
 
-Workers receive contracts read-only. The contract's `records` list is what the brief contains. Acceptance criteria with a `check` of type `test` must be satisfied by that named test passing; criteria of type `judgment` are decided by the TEST worker with cited evidence.
+Workers receive contracts read-only. The contract's `records` list is what the brief contains.
+
+**A contract is binding or work does not start.** No worker runs unless the contract was frozen through `ateam contracts freeze`, its content hash still matches the one stored at freeze, its status is runnable (`ready`, `building`, `failed` or `paused`), and none of its frozen records has changed, been superseded or gone missing. The runner enforces this before an attempt is recorded (`ateam.runner.binding.require_binding`), and the pass-two scheduler inherits the same check. Re-freezing after a deliberate change is explicit (`--force`). Acceptance criteria with a `check` of type `test` must be satisfied by that named test passing; criteria of type `judgment` are decided by the TEST worker with cited evidence.
 
 ## State machines
 

@@ -45,9 +45,9 @@ def load_handoff(worktree: Path) -> tuple[dict | None, list[str]]:
     if not path.is_file():
         return None, [f"no handoff file at {HANDOFF_FILE}"]
     try:
-        data = yaml.safe_load(path.read_text())
-    except yaml.YAMLError as e:
-        return None, [f"handoff file is not valid YAML: {e}"]
+        data = yaml.safe_load(path.read_bytes().decode("utf-8", errors="replace"))
+    except (OSError, yaml.YAMLError) as e:
+        return None, [f"handoff file could not be read as YAML: {str(e).splitlines()[0]}"]
     if data is None:
         return None, ["handoff file is empty"]
     if not isinstance(data, dict):

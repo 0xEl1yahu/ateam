@@ -51,3 +51,12 @@ def test_worktree_add_remove_and_exclude(target_repo, tmp_path):
     assert GitRepo(wt).is_clean()
     g.worktree_remove(wt, force=True)
     assert not wt.exists()
+
+
+def test_is_clean_prefix_does_not_match_sibling_names(target_repo):
+    g = GitRepo(target_repo)
+    (target_repo / ".ateam-scratch").mkdir(); (target_repo / ".ateam-scratch/h.yaml").write_text("x\n")
+    (target_repo / ".ateamrc").write_text("x\n")
+    assert g.is_clean([".ateam"]) and g.is_clean([".ateam/"])
+    (target_repo / ".ateam/records/new.yaml").write_text("x\n")
+    assert not g.is_clean([".ateam"])

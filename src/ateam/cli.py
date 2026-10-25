@@ -30,7 +30,7 @@ class Context:
 
 def _context(target: Path, require_ateam: bool = True) -> Context:
     if require_ateam and not TargetPaths.from_root(target).exists():
-        click.echo(f"No .ateam/ directory in {target}. Run: ateam init")
+        click.echo(f"No .ateam/ directory in {target}. Create .ateam/records/ and .ateam/contracts/ (see README, Your first record and contract); ateam init arrives in pass two.")
         sys.exit(2)
     return Context(target)
 
@@ -57,11 +57,16 @@ def records() -> None:
 @records.command("validate")
 @TARGET_OPTION
 def records_validate(target: Path) -> None:
-    from ateam.records.store import load_records
+    from ateam.records.store import RecordStoreError, load_records
     from ateam.records.validate import validate_records
 
     ctx = _context(target)
-    problems = validate_records(load_records(ctx.paths.records), ctx.paths.root, ctx.db.record_hashes())
+    try:
+        recs = load_records(ctx.paths.records)
+    except RecordStoreError as e:
+        click.echo(f"ERROR -: {e}")
+        sys.exit(1)
+    problems = validate_records(recs, ctx.paths.root, ctx.db.record_hashes())
     for p in problems:
         tag = "ERROR" if p.level == "error" else "WARN"
         click.echo(f"{tag} {p.record_id or '-'}: {p.message}")
@@ -211,8 +216,10 @@ def contracts_show(contract_id: str, target: Path) -> None:
 
 @contracts.command("freeze")
 @click.argument("contract_id")
+@click.option("--force", is_flag=True, help="Re-freeze a contract that is no longer a draft.")
 @TARGET_OPTION
-def contracts_freeze(contract_id: str, target: Path) -> None:
+def contracts_freeze(contract_id: str, force: bool, target: Path) -> None:
+    from ateam.contracts.model import ContractStatus
     from ateam.contracts.select import freeze, select_records
     from ateam.contracts.store import load_contracts, save_contract
     from ateam.records.graph import RecordGraph
@@ -222,6 +229,8 @@ def contracts_freeze(contract_id: str, target: Path) -> None:
     cs = load_contracts(ctx.paths.contracts)
     if contract_id not in cs:
         _fail(f"unknown contract {contract_id}")
+    if cs[contract_id].status != ContractStatus.draft and not force:
+        _fail(f"{contract_id} is already frozen ({cs[contract_id].status}); pass --force to re-freeze and reset it")
     graph = RecordGraph(load_records(ctx.paths.records))
     selected = select_records(cs[contract_id].paths, graph, ctx.paths.root)
     frozen = freeze(cs[contract_id], selected)
@@ -230,6 +239,52 @@ def contracts_freeze(contract_id: str, target: Path) -> None:
     for r in selected:
         ctx.db.set_record_hash(r.id, r.content_hash())
     click.echo(f"{frozen.id} frozen as {frozen.status} with records: {', '.join(r.id for r in selected) or '(none)'}")
+
+
+@contracts.command("validate")
+@TARGET_OPTION
+def contracts_validate(target: Path) -> None:
+    """Check frozen contracts against the state store: hand edits and record drift."""
+    from ateam.contracts.select import drift
+    from ateam.contracts.store import ContractStoreError, load_contracts
+    from ateam.records.store import RecordStoreError, load_records
+
+    ctx = _context(target)
+    try:
+        cs = load_contracts(ctx.paths.contracts)
+        recs = load_records(ctx.paths.records)
+    except (ContractStoreError, RecordStoreError) as e:
+        click.echo(f"ERROR -: {e}")
+        sys.exit(1)
+    errors = 0
+    for cid, c in sorted(cs.items()):
+        frozen = ctx.db.contract_hash(cid)
+        if frozen is None:
+            click.echo(f"INFO {cid}: not frozen ({c.status})")
+            continue
+        if c.content_hash() != frozen:
+            click.echo(f"ERROR {cid}: hand edit; content differs from the hash stored at freeze")
+            errors += 1
+        drifted = drift(c, recs)
+        if drifted:
+            click.echo(f"ERROR {cid}: record drift; {', '.join(drifted)} changed, superseded or missing since freeze")
+            errors += 1
+    click.echo(f"{errors} error(s)")
+    sys.exit(1 if errors else 0)
+
+
+@main.command()
+@click.argument("kind", type=click.Choice(["records", "contracts", "config"]))
+def schema(kind: str) -> None:
+    """Print the JSON Schema for records, contracts or config (for editors and validation)."""
+    import json
+
+    from ateam.config import TargetConfig
+    from ateam.contracts.model import Contract
+    from ateam.records.model import Record
+
+    model = {"records": Record, "contracts": Contract, "config": TargetConfig}[kind]
+    click.echo(json.dumps(model.model_json_schema(), indent=2))
 
 
 # ---------------------------------------------------------------- status, doctor
@@ -323,22 +378,36 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
     from ateam.contracts.store import load_contracts
     from ateam.records.store import load_records
     from ateam.roles import Role
-    from ateam.runner.run import run_contract_attempt
+    from ateam.runner.run import prepare_worktree, run_contract_attempt
     from ateam.tiers import load_tiers
+
+    from ateam.gitops import GitError
+    from ateam.runner.binding import ContractNotBinding
 
     ctx = _context(target)
     cs = load_contracts(ctx.paths.contracts)
     if contract_id not in cs:
         _fail(f"unknown contract {contract_id}")
     contract = cs[contract_id]
-    if tier:
-        contract = contract.model_copy(update={"allocation": contract.allocation.model_copy(update={"tier": {**contract.allocation.tier, role: tier}})})
-    wt_git = GitRepo(worktree)
-    res, tree, scope, cp = asyncio.run(run_contract_attempt(
-        paths=ctx.paths, config=ctx.config, git_worktree=wt_git, worktree=worktree, base=base or wt_git.head(),
-        contract=contract, records=load_records(ctx.paths.records), role=Role(role), tiers=load_tiers(ctx.config.tiers),
-        db=ctx.db, resume=resume, prompt=prompt,
-    ))
+    try:
+        wt_git = GitRepo.discover(worktree)
+        linked = wt_git.is_linked_worktree()
+    except GitError:
+        linked = False
+    if not linked or wt_git.root.resolve() == ctx.paths.root.resolve():
+        _fail(f"{worktree} is not an isolated worktree of the target; workers never run in the owner's checkout", code=4)
+    prepare_worktree(worktree)
+    tiers = load_tiers(ctx.config.tiers)
+    if tier and tier not in tiers:
+        _fail(f"unknown tier {tier!r}; known: {', '.join(tiers)}")
+    try:
+        res, tree, scope, cp = asyncio.run(run_contract_attempt(
+            paths=ctx.paths, config=ctx.config, git_worktree=wt_git, worktree=worktree, base=base or wt_git.head(),
+            contract=contract, records=load_records(ctx.paths.records), role=Role(role), tiers=tiers,
+            db=ctx.db, resume=resume, prompt=prompt, tier_override=tier,
+        ))
+    except ContractNotBinding as e:
+        _fail(str(e), code=4)
     click.echo(f"session {res.session_id} subtype={res.subtype} turns={res.num_turns} cost=${res.cost_usd:.4f} wall={res.wall_s:.0f}s")
     if res.denials:
         click.echo("denials: " + "; ".join(res.denials))

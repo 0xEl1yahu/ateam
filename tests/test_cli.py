@@ -79,7 +79,7 @@ def test_contracts_show_and_freeze_selects_records(cli_target):
 
 def test_status_without_ateam_dir(tmp_path, ateam_home):
     r = run("status", "--target", str(tmp_path))
-    assert r.exit_code == 2 and "Run: ateam init" in r.output
+    assert r.exit_code == 2 and "No .ateam/ directory" in r.output and "see README" in r.output
 
 
 def test_status_lists_contracts(cli_target):
@@ -91,3 +91,55 @@ def test_status_lists_contracts(cli_target):
 def test_doctor_mentions_versions(cli_target):
     r = run("doctor", "--target", str(cli_target))
     assert r.exit_code == 0 and "SDK 0.2." in r.output and "2.1.310" in r.output and "main" in r.output
+
+
+def test_records_validate_reports_malformed_file_without_traceback(cli_target):
+    (cli_target / ".ateam/records/notes.yaml").write_text("just: notes\n")
+    r = run("records", "validate", "--target", str(cli_target))
+    assert r.exit_code == 1 and "ERROR" in r.output and "notes.yaml" in r.output and "Traceback" not in r.output
+
+
+def test_worker_run_refuses_target_checkout_and_non_worktree(cli_target, tmp_path):
+    run("records", "approve", "R-0001", "--target", str(cli_target))
+    run("contracts", "freeze", "C-0001", "--target", str(cli_target))
+    r = run("worker", "run", "C-0001", "--role", "build", "--cwd", str(cli_target), "--target", str(cli_target))
+    assert r.exit_code == 4 and "isolated worktree" in r.output
+    other = tmp_path / "other"; other.mkdir(); GitRepo(other).run("init", "-q")
+    r2 = run("worker", "run", "C-0001", "--role", "build", "--cwd", str(other), "--target", str(cli_target))
+    assert r2.exit_code == 4 and "isolated worktree" in r2.output
+
+
+def test_worker_run_refuses_unfrozen_contract(cli_target, tmp_path):
+    wt = tmp_path / "wt"; GitRepo(cli_target).worktree_add(wt, "wt-x", "main")
+    r = run("worker", "run", "C-0001", "--role", "build", "--cwd", str(wt), "--target", str(cli_target))
+    assert r.exit_code == 4 and "not frozen" in r.output
+
+
+def test_contracts_freeze_refuses_non_draft_without_force(cli_target):
+    run("records", "approve", "R-0001", "--target", str(cli_target))
+    assert run("contracts", "freeze", "C-0001", "--target", str(cli_target)).exit_code == 0
+    r = run("contracts", "freeze", "C-0001", "--target", str(cli_target))
+    assert r.exit_code == 1 and "already frozen" in r.output
+    assert run("contracts", "freeze", "C-0001", "--force", "--target", str(cli_target)).exit_code == 0
+
+
+def test_contracts_validate_reports_hand_edit_and_drift(cli_target, sample_record):
+    run("records", "approve", "R-0001", "--target", str(cli_target))
+    run("contracts", "freeze", "C-0001", "--target", str(cli_target))
+    assert run("contracts", "validate", "--target", str(cli_target)).exit_code == 0
+    c = load_contracts(cli_target / ".ateam/contracts")["C-0001"]
+    from ateam.contracts.store import save_contract
+    save_contract(cli_target / ".ateam/contracts", c.model_copy(update={"title": "edited by hand"}))
+    r = run("contracts", "validate", "--target", str(cli_target))
+    assert r.exit_code == 1 and "C-0001" in r.output and "hand edit" in r.output
+    save_contract(cli_target / ".ateam/contracts", c)
+    save_record(cli_target / ".ateam/records", load_records(cli_target / ".ateam/records")["R-0001"].model_copy(update={"statement": "changed"}))
+    r2 = run("contracts", "validate", "--target", str(cli_target))
+    assert r2.exit_code == 1 and "drift" in r2.output and "R-0001" in r2.output
+
+
+def test_schema_command_prints_json_schema():
+    import json
+    for kind in ("records", "contracts", "config"):
+        r = run("schema", kind)
+        assert r.exit_code == 0 and json.loads(r.output)["type"] == "object"

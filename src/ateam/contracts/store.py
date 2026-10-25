@@ -5,9 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import yaml
+from pydantic import ValidationError
 
 from ateam.contracts.model import Contract
-from ateam.records.store import _FILE_RE
+from ateam.records.store import _FILE_RE, _summarise
 
 
 class ContractStoreError(Exception):
@@ -19,7 +20,10 @@ def load_contracts(contracts_dir: Path) -> dict[str, Contract]:
     sources: dict[str, Path] = {}
     for path in sorted(contracts_dir.glob("*.y*ml")):
         m = _FILE_RE.match(path.name)
-        contract = Contract.model_validate(yaml.safe_load(path.read_text()) or {})
+        try:
+            contract = Contract.model_validate(yaml.safe_load(path.read_text()) or {})
+        except (yaml.YAMLError, ValidationError) as e:
+            raise ContractStoreError(f"{path.name}: {_summarise(e)}") from e
         if not m or m.group("id") != contract.id:
             raise ContractStoreError(f"{path.name}: filename does not match contract id {contract.id!r}")
         if contract.id in contracts:

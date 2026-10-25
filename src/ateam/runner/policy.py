@@ -18,32 +18,67 @@ READ_OR_WRITE_TOOLS = WRITE_TOOLS | {"Read"}
 SCRATCH = ".ateam-scratch/**"
 
 DESTRUCTIVE_PATTERNS: list[str] = [
-    r"\bgit\s+push\b",
-    r"\bgit\s+merge\b",
-    r"\bgit\s+rebase\b",
-    r"\bgit\s+reset\s+--hard\b",
-    r"\bgit\s+checkout\s+\.",
-    r"\bgit\s+clean\b",
-    r"\bgit\s+branch\s+-[dD]\b",
-    r"\brm\s+-[a-zA-Z]*r[a-zA-Z]*f\b|\brm\s+-[a-zA-Z]*f[a-zA-Z]*r\b",
+    # git <global options>* <verb>; global options cover -C <dir>, -c k=v, --no-pager, etc.
+    r"\bgit\b(?:\s+(?:-[cC]\s*\S+|--?\S+))*\s+(?:push|merge|rebase|clean)\b",
+    r"\bgit\b(?:\s+(?:-[cC]\s*\S+|--?\S+))*\s+stash(?!\s+(?:list|show)\b)",
+    r"\bgit\b(?:\s+(?:-[cC]\s*\S+|--?\S+))*\s+reset\b[^\n;&|]*--hard",
+    r"\bgit\b(?:\s+(?:-[cC]\s*\S+|--?\S+))*\s+(?:checkout|restore)\b[^\n;&|]*\s\.(?:\s|$)",
+    r"\bgit\b(?:\s+(?:-[cC]\s*\S+|--?\S+))*\s+branch\b[^\n;&|]*\s-[dDM]\b",
     r"\bdocker\s+compose\s+down\b",
     r"\bsudo\b",
-    r"\bcurl\b.*\|\s*(ba|z)?sh\b",
-    r"\bwget\b.*\|\s*(ba|z)?sh\b",
+    r"\bcurl\b.*\|\s*(?:ba|z)?sh\b",
+    r"\bwget\b.*\|\s*(?:ba|z)?sh\b",
+    r"\bfind\b[^\n;&|]*(?:-delete\b|-exec\s+rm\b)",
+    r"\bxargs\b[^\n;&|]*\brm\b",
 ]
 
 INVESTIGATE_ALLOWED_PREFIXES: list[str] = [
-    "git log", "git show", "git diff", "git blame", "git status", "git branch", "git rev-parse",
-    "ls", "cat", "head", "tail", "grep", "rg", "find", "wc", "tree", "file", "stat", "pwd",
+    "git log", "git show", "git diff", "git blame", "git status", "git branch", "git rev-parse", "git ls-files",
+    "ls", "cat", "head", "tail", "grep", "rg", "find", "wc", "tree", "file", "stat", "pwd", "sort", "uniq", "cut", "awk", "sed -n",
     'python -c "import', "python -m pytest --collect-only", "python --version",
 ]
 
-_READ_ONLY_PROTECTED = re.compile(r"^\s*(cat|head|tail|less|git\s+diff|git\s+show|git\s+log|ls|wc|grep|rg)\b")
-_SEGMENT_SPLIT = re.compile(r"\s*(?:&&|\|\||;|\n)\s*")
+_SEGMENT_SPLIT = re.compile(r"\s*(?:&&|\|\||;|\n|\|)\s*")
+# A mention of a protected directory: at the start or after a separator-like character, any case.
+_PROTECTED_MENTION = re.compile(r"""(?i)(?:^|[\s/'"=:(`$])\.(?:ateam|claude)(?=$|[\s/'"\\);:`])""")
+# Anything that writes, in a segment that mentions a protected directory.
+_WRITE_OPS = re.compile(
+    r"""(?:>>?|<<|\btee\b|\bsed\b[^\n]*\s-[a-zA-Z]*i\b|\bcp\b|\bmv\b|\btouch\b|\brm\b|\bmkdir\b|\brmdir\b|\bchmod\b|\bchown\b|\bln\b|\binstall\b|\btruncate\b|\bdd\b|\bpatch\b|\bgit\s+(?:add|commit|checkout|restore|rm|mv|apply)\b)"""
+)
+_READ_PREFIX = re.compile(
+    r"^\s*(?:cat|head|tail|less|more|wc|grep|rg|ls|stat|file|diff|sort|uniq|cut|awk|sed\s+-n|git\s+(?:diff|show|log|blame|status|ls-files|grep))\b"
+)
+_CD = re.compile(r"^\s*(?:cd|pushd)\b")
+_GIT_BRANCH = re.compile(r"^\s*git\s+branch\b(?P<rest>.*)$")
 
 
-def _protected_mention(cmd: str) -> bool:
-    return ".ateam/" in cmd or ".ateam\\" in cmd or ".claude/" in cmd or ".claude\\" in cmd
+def _rm_recursive(segment: str) -> bool:
+    tokens = segment.split()
+    if not tokens or tokens[0] != "rm":
+        return False
+    for t in tokens[1:]:
+        if t == "--recursive" or (t.startswith("-") and not t.startswith("--") and ("r" in t or "R" in t)):
+            return True
+    return False
+
+
+def _starts_with_prefix(segment: str, prefix: str) -> bool:
+    seg = segment.lstrip()
+    if not seg.startswith(prefix):
+        return False
+    if len(seg) == len(prefix) or not prefix[-1].isalnum():
+        return True
+    return not seg[len(prefix)].isalnum()
+
+
+def _git_branch_read_only(segment: str) -> bool:
+    m = _GIT_BRANCH.match(segment)
+    if not m:
+        return True
+    args = m.group("rest").split()
+    if any(a in ("-d", "-D", "-m", "-M", "-c", "-C", "-f", "--force", "--delete", "--move", "--copy") for a in args):
+        return False
+    return all(a.startswith("-") for a in args)
 
 
 @dataclass
@@ -72,7 +107,7 @@ class Policy:
         return None if rel_posix == "." else rel_posix
 
     def path_writable(self, rel: str) -> tuple[bool, str]:
-        if any(matches(g, rel) for g in self.protected):
+        if any(matches(g.lower(), rel.lower()) for g in self.protected):
             return False, f"{rel} is protected; contracts and records are read-only for workers"
         if matches(SCRATCH, rel):
             return (self.role != Role.investigate, "INVESTIGATE never writes files")
@@ -90,14 +125,21 @@ class Policy:
         for pattern in DESTRUCTIVE_PATTERNS:
             if re.search(pattern, cmd):
                 return False, f"destructive command matched {pattern!r}"
-        segments = [s for s in _SEGMENT_SPLIT.split(cmd) if s.strip()]
+        segments = [seg for seg in _SEGMENT_SPLIT.split(cmd) if seg.strip()]
         for seg in segments:
-            if _protected_mention(seg) and not _READ_ONLY_PROTECTED.match(seg):
-                return False, "shell access to .ateam/ or .claude/ is limited to reading"
+            if _rm_recursive(seg):
+                return False, "recursive rm is not allowed"
+            if _PROTECTED_MENTION.search(seg):
+                if _CD.match(seg):
+                    return False, "changing directory into .ateam/ or .claude/ is not allowed"
+                if _WRITE_OPS.search(seg) or not _READ_PREFIX.match(seg):
+                    return False, "shell access to .ateam/ or .claude/ is limited to reading"
         if self.role == Role.investigate:
             for seg in segments:
-                if not any(seg.lstrip().startswith(p) for p in INVESTIGATE_ALLOWED_PREFIXES):
+                if not any(_starts_with_prefix(seg, p) for p in INVESTIGATE_ALLOWED_PREFIXES):
                     return False, f"INVESTIGATE may only run read-only inspection commands; {seg.strip()[:40]!r} is not allowed"
+                if _WRITE_OPS.search(seg) or not _git_branch_read_only(seg):
+                    return False, f"INVESTIGATE may not write or change state; {seg.strip()[:40]!r} is not allowed"
         return True, ""
 
     # -- SDK hooks ----------------------------------------------------------

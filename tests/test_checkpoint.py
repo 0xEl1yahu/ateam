@@ -31,3 +31,10 @@ def test_collect_facts(target_repo, sample_contract, records_three):
     assert cp.contract_hash == sample_contract.content_hash() and cp.record_hashes["R-0001"] == records_three["R-0001"].content_hash()
     assert cp.session_id == "s1" and cp.checks[0]["name"] == "unit" and cp.notes is None and cp.warnings
     assert cp.to_dict()["head"] == cp.head
+
+
+def test_load_handoff_non_utf8_never_raises(tmp_path):
+    (tmp_path / ".ateam-scratch").mkdir()
+    (tmp_path / ".ateam-scratch/handoff.yaml").write_bytes(b"progress: \xff\xfe bad bytes\n")
+    notes, warnings = load_handoff(tmp_path)
+    assert (notes is None and warnings) or isinstance(notes, dict)

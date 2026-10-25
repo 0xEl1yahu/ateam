@@ -58,7 +58,8 @@ CREATE TABLE IF NOT EXISTS attempts (
 CREATE TABLE IF NOT EXISTS checkpoints (
     seq INTEGER PRIMARY KEY AUTOINCREMENT, contract_id TEXT NOT NULL, attempt_id INTEGER,
     facts TEXT NOT NULL, at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS run_lock (plan_id TEXT NOT NULL, acquired_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS run_lock (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1), plan_id TEXT NOT NULL, acquired_at TEXT NOT NULL, pid INTEGER);
 """
 
 
@@ -82,6 +83,9 @@ class StateDB:
 
     def init_schema(self) -> None:
         with self.conn:
+            cols = [r["name"] for r in self.conn.execute("PRAGMA table_info(run_lock)")]
+            if cols and "singleton" not in cols:  # pre-release shape without the uniqueness constraint
+                self.conn.execute("DROP TABLE run_lock")
             self.conn.executescript(_SCHEMA)
             if self.conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 0:
                 self.conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
@@ -116,6 +120,10 @@ class StateDB:
     def contract_status(self, contract_id: str) -> str | None:
         row = self.conn.execute("SELECT status FROM contracts WHERE contract_id=?", (contract_id,)).fetchone()
         return row["status"] if row else None
+
+    def contract_hash(self, contract_id: str) -> str | None:
+        row = self.conn.execute("SELECT content_hash FROM contracts WHERE contract_id=?", (contract_id,)).fetchone()
+        return row["content_hash"] if row else None
 
     def feature_status(self, feature_id: str) -> str | None:
         row = self.conn.execute("SELECT status FROM features WHERE feature_id=?", (feature_id,)).fetchone()
@@ -197,12 +205,18 @@ class StateDB:
     # -- run lock -----------------------------------------------------------
 
     def acquire_run_lock(self, plan_id: str) -> bool:
-        with self.conn:
-            row = self.conn.execute("SELECT plan_id FROM run_lock LIMIT 1").fetchone()
-            if row is None:
-                self.conn.execute("INSERT INTO run_lock (plan_id, acquired_at) VALUES (?, ?)", (plan_id, _now()))
-                return True
-            return row["plan_id"] == plan_id
+        """True when this plan holds the single run lock. Exclusive across processes via the singleton row."""
+        import os
+
+        try:
+            with self.conn:
+                self.conn.execute(
+                    "INSERT INTO run_lock (singleton, plan_id, acquired_at, pid) VALUES (1, ?, ?, ?)",
+                    (plan_id, _now(), os.getpid()),
+                )
+            return True
+        except sqlite3.IntegrityError:
+            return self.run_lock_holder() == plan_id
 
     def release_run_lock(self, plan_id: str) -> None:
         with self.conn:

@@ -68,3 +68,106 @@ async def test_pre_tool_use_injects_once(policy_build):
 def test_hook_matchers(policy_build):
     hm = policy_build.hook_matchers()
     assert set(hm) == {"PreToolUse"} and hm["PreToolUse"][0].matcher == "Edit|Write|MultiEdit|NotebookEdit|Bash|Read"
+
+
+BUILD_MUST_DENY = [
+    # protected dirs via any write operator, not only "echo >"
+    "cat src/api/x.py > .ateam/contracts/C-0001.yaml",
+    "cat > .ateam/contracts/C-0001.yaml <<'EOF'\nid: x\nEOF",
+    "head -1 src/api/x.py | tee .ateam/config.yaml",
+    "git diff | tee .ateam/config.yaml",
+    "sed -i '' 's/a/b/' .ateam/config.yaml",
+    "cd .ateam && echo hacked > contracts/C-0001.yaml",
+    "cd .ateam; echo hacked > config.yaml",
+    "pushd .claude && touch settings.json",
+    "cp src/api/x.py .ateam",
+    "cp src/api/x.py .ateam/",
+    "mv src/api/x.py .claude/x",
+    "P=.ateam; echo h > $P/x",
+    "echo h > .ATEAM/config.yaml",
+    "echo h > ./.ateam/config.yaml",
+    "touch .ateam/contracts/new.yaml",
+    "rm .ateam/contracts/C-0001.yaml",
+    # destructive equivalents
+    "git -C . push origin main",
+    "git -c user.name=x push",
+    "git --no-pager push",
+    "rm -Rf src",
+    "rm -r -f src",
+    "rm -rf src",
+    "rm --recursive --force src",
+    "git checkout -- .",
+    "git restore .",
+    "git restore --staged --worktree .",
+    "git reset HEAD~3 --hard",
+    "git stash -u && git stash drop",
+    "find . -name '*.py' -delete",
+    "find . -name '*.pyc' -exec rm {} \;",
+    "git clean -fdx",
+    "git branch -D main",
+]
+
+BUILD_MUST_ALLOW = [
+    "cat .ateam/contracts/C-0001.yaml",
+    "head -20 .ateam/records/R-0001-x.yaml",
+    "git diff .ateam/",
+    "git log --oneline -- .ateam/records",
+    "grep -rn reading .ateam/records",
+    "python -m pytest tests && git commit -am 'add route'",
+    "git commit -m 'moved docs out of the old folder'",
+    "git stash list",
+    "git branch --show-current",
+    "ls -la src/api",
+    "rm src/api/old.py",
+    "find src -name '*.py' | wc -l",
+    "echo 'progress: half' > .ateam-scratch/handoff.yaml",
+]
+
+
+@pytest.mark.parametrize("cmd", BUILD_MUST_DENY)
+def test_build_command_denied(policy_build, cmd):
+    ok, reason = policy_build.command_allowed(cmd)
+    assert not ok, f"should deny: {cmd!r}"
+
+
+@pytest.mark.parametrize("cmd", BUILD_MUST_ALLOW)
+def test_build_command_allowed(policy_build, cmd):
+    ok, reason = policy_build.command_allowed(cmd)
+    assert ok, f"should allow: {cmd!r} ({reason})"
+
+
+INVESTIGATE_MUST_DENY = [
+    "ls > out.txt",
+    "cat x | tee out.txt",
+    "find . -name '*.pyc' -delete",
+    "git branch new-branch",
+    "lsof -i",
+    "catx file",
+    "ls; touch x",
+    "git log | xargs rm",
+]
+
+INVESTIGATE_MUST_ALLOW = [
+    "git log --oneline && ls src",
+    "git branch --list",
+    "git branch -a",
+    "cat src/app.py | head -5",
+    "grep -rn greet src | wc -l",
+    "find src -name '*.py'",
+]
+
+
+@pytest.mark.parametrize("cmd", INVESTIGATE_MUST_DENY)
+def test_investigate_command_denied(policy_investigate, cmd):
+    assert not policy_investigate.command_allowed(cmd)[0], f"should deny: {cmd!r}"
+
+
+@pytest.mark.parametrize("cmd", INVESTIGATE_MUST_ALLOW)
+def test_investigate_command_allowed(policy_investigate, cmd):
+    ok, reason = policy_investigate.command_allowed(cmd)
+    assert ok, f"should allow: {cmd!r} ({reason})"
+
+
+def test_protected_paths_are_case_insensitive(policy_build):
+    assert not policy_build.path_writable(".ATEAM/contracts/C-0001.yaml")[0]
+    assert "protected" in policy_build.path_writable(".ATEAM/contracts/C-0001.yaml")[1]

@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 spikes/*/out/
 .superpowers/
+*.egg-info/
