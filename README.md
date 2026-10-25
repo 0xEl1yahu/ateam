@@ -16,6 +16,28 @@ python3 -m venv .venv
 
 Workers run in a clean room built from SDK options (no setting sources, strict MCP config, slash commands disabled, auto-memory off). Claude Code's `--bare` flag is deliberately not used: it authenticates only with an API key.
 
+## Setting up a fresh target repo
+
+Install once per machine (above). Then, per target repository, five steps, all ending up committed in that repo:
+
+1. **Bootstrap.** `mkdir -p .ateam/records .ateam/contracts`; add `.ateam-scratch/` to the tracked `.gitignore`; copy `examples/CLAUDE.target.md` to `CLAUDE.md` so a Claude session a person opens there knows `.ateam/` is managed through the CLI; optionally copy `examples/config.example.yaml` to `.ateam/config.yaml` to name the target branch and the deterministic checks.
+2. **First records.** Copy `examples/record.example.yaml` once per decision or invariant you already hold, bound to the paths it governs. A handful, not fifty. `ateam records validate`, then `ateam records approve R-0001` for each; approval commits only `.ateam/`.
+3. **One contract per task.** Copy `examples/contract.example.yaml`: the paths a worker may touch, the acceptance criteria and their checks, the allocation tier. `ateam contracts freeze C-0001` selects the binding records and makes the contract binding. Commit.
+4. **Run a worker in a worktree.** `git worktree add ../repo-C-0001 -b ateam/C-0001 main`, then `ateam worker run C-0001 --role build --cwd ../repo-C-0001`. Read the report, the diff and `ateam status`.
+5. **Verify and merge yourself.** Run the contract's checks in the worktree, optionally a TEST worker (`--role test`), then merge the branch. This loop is manual until pass two.
+
+`docs/first-run-walkthrough.md` is the same sequence on a scratch repo with the expected output at every step.
+
+## Using it for development today
+
+In pass one you are the planner and the integrator; ATeam is the enforcer. You decide the records and write the contracts. ATeam guarantees that a worker starts only under a frozen, unchanged contract, sees the binding records up front and again when it touches a bound file, cannot edit protected files, push, `rm` or leave its declared paths, and reports in a typed schema that the tree and scope check cross-examine. Telemetry per attempt (tier, model, tokens, cost, turns, wall time, outcome) accumulates in the state store for calibrating the tiers.
+
+Not yet automated: discovering records from an existing codebase (`ateam init`), breaking a feature into contracts (`ateam plan`), scheduling several workers, running the deterministic checks plus the TEST role as a gate, and integrating onto a branch with a merge proposal for approval. Those are pass two; every interface they need exists.
+
+A good first real use: a small, well-understood feature in a throwaway clone of one of your repos. Three records, two contracts, one BUILD run each, then a TEST run on the same worktree with `--role test --tier light` to see the verdict format.
+
+Everything here is readable by an agent as well as a person: markdown, YAML and the JSON Schema from `ateam schema`. Workers themselves run in a clean room and read none of it; they receive only the brief ATeam assembles.
+
 ## Commands
 
 Every command except `ateam schema` takes `--target PATH` (default: the current directory), which must contain an `.ateam/` directory.
