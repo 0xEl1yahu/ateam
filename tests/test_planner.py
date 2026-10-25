@@ -110,3 +110,48 @@ def test_self_dependency_message_and_duplicate_deps_deduped(target_repo, target_
     assert any("itself" in p for p in e.value.problems)
     r = report_to_plan(report(contract("A"), contract("B", deps=[0, 0])), "x", "P-0001", target_paths.contracts, records_three, CFG, target_repo, target_paths.records)
     assert r.contracts[1].depends_on == ["C-0001"]
+
+
+def test_missing_budget_derived_from_build_tier_and_given_budget_kept(target_repo, target_paths, records_three):
+    from ateam.allocation import budget_for
+
+    tiers = load_tiers()
+    given = {"attempts": 5, "usd_per_attempt": 1.5, "max_turns": 7}
+    careful = dict(complexity="high", risk="high", tier={"build": "careful", "test": "careful", "investigate": "none"})
+    kept = {**contract("Kept"), "budget": given}
+    rep = report(contract("Light"), contract("Careful", **careful), kept)
+    r = report_to_plan(rep, "x", "P-0001", target_paths.contracts, records_three, CFG, target_repo, target_paths.records, tiers=tiers)
+    assert r.contracts[0].budget == budget_for("light", tiers)
+    assert r.contracts[1].budget == budget_for("careful", tiers)
+    assert r.contracts[2].budget.model_dump() == given
+
+
+def test_depends_on_plans_unknown_is_note_and_self_dropped(target_repo, target_paths, records_three):
+    from ateam.plans.model import Plan
+
+    rep = report(contract("A"))
+    rep.update(depends_on_plans=["P-0001", "P-0002", "P-0009"], files_read=["a.py"], out_of_scope=["ui"], verification_approach="run unit")
+    existing = {"P-0002": Plan(id="P-0002", title="t", request="r")}
+    r = report_to_plan(rep, "x", "P-0001", target_paths.contracts, records_three, CFG, target_repo, target_paths.records, existing_plans=existing)
+    assert r.plan.depends_on_plans == ["P-0002", "P-0009"]
+    assert any("depends_on_plans names unknown plan P-0009" in n for n in r.problems)
+    assert not any("unknown plan P-0002" in n for n in r.problems)
+    assert any("P-0001" in n and "own id" in n for n in r.problems)
+    assert r.plan.files_read == ["a.py"] and r.plan.out_of_scope == ["ui"] and r.plan.verification_approach == "run unit"
+
+
+def test_old_report_without_new_fields_still_converts(target_repo, target_paths, records_three):
+    r = report_to_plan(report(contract("A")), "x", "P-0001", target_paths.contracts, records_three, CFG, target_repo, target_paths.records)
+    assert r.plan.depends_on_plans == [] and r.plan.files_read == [] and r.plan.verification_approach == ""
+
+
+def test_review_prints_new_sections(target_repo, target_paths, records_three):
+    rep = report(contract("A"))
+    rep.update(depends_on_plans=["P-0002"], files_read=[f"f{i}.py" for i in range(25)], out_of_scope=["the UI"], verification_approach="run the unit suite")
+    r = report_to_plan(rep, "x", "P-0001", target_paths.contracts, records_three, CFG, target_repo, target_paths.records)
+    text = render_plan_review(r, load_tiers())
+    assert "Depends on plans: P-0002" in text
+    assert "Files read (25):" in text and "f19.py" in text and "f20.py" not in text
+    assert "Out of scope:" in text and "the UI" in text
+    assert "Verification approach: run the unit suite" in text
+    assert text.index("C-0001") < text.index("Depends on plans:")

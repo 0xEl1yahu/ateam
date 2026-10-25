@@ -567,3 +567,104 @@ def test_approve_notes_overrides_below_rubric_floor(monkeypatch, cli_target):
     r = run("approve", "P-0001", "--skip-records", "--tier", "C-0003=light", "--target", str(cli_target))
     assert r.exit_code == 0, r.output
     assert "below the rubric" in r.output and "C-0003" in r.output
+
+
+# ---------------------------------------------------------------- investigation brief wiring
+
+
+def _capture_investigation(monkeypatch, report):
+    from ateam.runner import investigate as inv_mod
+    from ateam.runner.run import WorkerResult
+
+    seen: dict = {}
+
+    async def fake(**kw):
+        seen.update(kw)
+        db = kw["db"]
+        a = db.start_attempt(kw["name"], "investigate", "light", "haiku", {})
+        db.finish_attempt(a, "completed", None, 1, 1, 0.001, 1, 0.1, "s")
+        res = WorkerResult("success", False, "completed", "s", 1, 0.001, {}, {}, report, [], [], None, 0.1)
+        return inv_mod.InvestigationResult(res=res, attempt_id=a, tampered=[])
+
+    monkeypatch.setattr("ateam.cli.run_investigation", fake, raising=False)
+    return seen
+
+
+def _section(brief: str, heading: str) -> str:
+    sections = ("\n" + brief).split("\n## ")[1:]
+    return next(sec.split("\n", 1)[1] for sec in sections if sec.split("\n", 1)[0] == heading)
+
+
+def test_plan_brief_contains_rules_records_and_plan_index(monkeypatch, cli_target):
+    from ateam.plans.model import Plan
+    from ateam.plans.store import save_plan
+
+    (cli_target / "CLAUDE.md").write_text("Never touch the vault.\n")
+    p = TargetPaths.from_root(cli_target)
+    save_plan(p.plans, Plan(id="P-0001", title="Earlier plan", request="r", contracts=["C-0001"]))
+    commit_intent(p, "seed plan", ["plans"])
+    seen = _capture_investigation(monkeypatch, _canned_plan())
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    brief = seen["brief_text"]
+    assert "Never touch the vault." in _section(brief, "Rules")
+    assert "R-0001" in _section(brief, "Records").split("Proposed, not yet approved")[1]
+    index = _section(brief, "Existing plans and contracts")
+    assert "P-0001" in index and "C-0001" in index
+    assert "add a health function" in _section(brief, "Request")
+    assert str(p.scratch_root / "P-0002" / "handoff.yaml") in _section(brief, "Handoff file")
+    assert "files_read" in seen["prompt"] and "Read the Rules section first" in seen["prompt"]
+
+
+def test_init_brief_has_discovery_limits_and_rules(monkeypatch, cli_target):
+    (cli_target / "CLAUDE.md").write_text("Routes never read env.\n")
+    seen = _capture_investigation(monkeypatch, _canned_discovery())
+    r = run("init", "--max-candidates", "5", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    brief = seen["brief_text"]
+    assert "Routes never read env." in _section(brief, "Rules")
+    assert "at most 5 candidates" in _section(brief, "Discovery limits")
+    assert str(TargetPaths.from_root(cli_target).scratch_root / "init" / "handoff.yaml") in brief
+    assert seen["prompt"].startswith("Discover this repository's existing engineering intent. Read the Rules section")
+
+
+def test_plan_stores_new_fields_and_review_prints_them(monkeypatch, cli_target):
+    from ateam.plans.store import load_plans
+
+    rep = _canned_plan()
+    rep.update(files_read=["src/app.py"], out_of_scope=["auth"], verification_approach="run the health test",
+               depends_on_plans=[])
+    _capture_investigation(monkeypatch, rep)
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert "run the health test" in r.output
+    stored = load_plans(TargetPaths.from_root(cli_target).plans)["P-0001"]
+    assert stored.files_read == ["src/app.py"] and stored.out_of_scope == ["auth"]
+    assert "verification_approach: run the health test" in run("plans", "show", "P-0001", "--target", str(cli_target)).output
+
+
+def test_plan_missing_budget_uses_tier(monkeypatch, cli_target):
+    from ateam.allocation import budget_for
+    from ateam.tiers import load_tiers
+
+    _capture_investigation(monkeypatch, _canned_plan())
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    c = load_contracts(TargetPaths.from_root(cli_target).contracts)["C-0002"]
+    assert c.budget == budget_for("light", load_tiers())
+
+
+def test_plan_brief_assembly_failure_is_rejected_not_stranded(monkeypatch, cli_target):
+    from ateam.plans.model import PlanStatus
+    from ateam.plans.store import load_plans
+
+    _capture_investigation(monkeypatch, _canned_plan())
+
+    def boom(**kw):
+        raise OSError("disk on fire")
+
+    monkeypatch.setattr("ateam.cli.assemble_investigation_brief", boom, raising=False)
+    r = run("plan", "x", "--target", str(cli_target))
+    assert r.exit_code == 1 and "Traceback" not in r.output
+    plans = load_plans(TargetPaths.from_root(cli_target).plans)
+    assert plans["P-0001"].status == PlanStatus.plan_rejected

@@ -8,6 +8,7 @@ from pathlib import Path
 import click
 
 from ateam import SPIKED_CLI_VERSION, __version__
+from ateam.brief import DEFAULT_MAX_CANDIDATES, assemble_investigation_brief
 from ateam.config import TargetConfig, load_config
 from ateam.gitops import GitRepo
 from ateam.paths import TargetPaths, home_dir, lookup_target, normalise_remote, origin_url, record_target, repo_id, repo_id_source
@@ -173,26 +174,19 @@ def _derivation(target: Path) -> str:
 # ---------------------------------------------------------------- init (discovery)
 
 
-def _records_index(records) -> str:
-    approved = [r for r in records.values() if r.status == "approved"]
-    if not approved:
-        return "Approved records: none yet; no approved records apply to any path in this target."
-    lines = ["Approved records (id, kind, binds, statement):"]
-    lines += [f"- {r.id} {r.kind} [{', '.join(r.binds.paths) or 'global'}] {r.statement.strip()}" for r in sorted(approved, key=lambda r: r.id)]
-    return "\n".join(lines)
-
-
 @main.command()
 @click.option("--remote", default=None, help="Private remote for the intent repo, when creating it.")
-@click.option("--max-candidates", default=12, show_default=True, type=int)
+@click.option("--max-candidates", default=DEFAULT_MAX_CANDIDATES, show_default=True, type=int)
 @click.option("--tier", default="standard", show_default=True, type=click.Choice(["light", "standard", "careful"]))
 @TARGET_OPTION
 def init(remote: str | None, max_candidates: int, tier: str, target: Path) -> None:
     """Discover a small baseline of records from the target and propose them for review."""
     import asyncio
 
+    from ateam.contracts.store import load_contracts
     from ateam.discovery import candidates_to_records, render_discovery_report
     from ateam.intent import init_intent
+    from ateam.plans.store import load_plans
     from ateam.records.store import load_records, save_record
     from ateam.roles import DISCOVERY_SPEC, Role
     from ateam.tiers import load_tiers
@@ -206,15 +200,17 @@ def init(remote: str | None, max_candidates: int, tier: str, target: Path) -> No
         record_target(target)
     ctx = Context(target)
     records = load_records(ctx.paths.records)
-    brief = "\n\n".join([
-        f"Propose at most {max_candidates} candidate records; at most {ctx.config.global_record_cap} may be global (no paths).",
-        _records_index(records),
-        "Do not re-propose anything already covered above.",
-    ])
+    brief = assemble_investigation_brief(
+        kind="discovery", target_root=ctx.paths.root, config=ctx.config, records=records,
+        plans=load_plans(ctx.paths.plans), contracts=load_contracts(ctx.paths.contracts),
+        scratch_dir=ctx.paths.scratch_root / "init", max_candidates=max_candidates,
+    )
     tiers = load_tiers(ctx.config.tiers)
     result = asyncio.run(run_investigation(
         paths=ctx.paths, config=ctx.config, target_git=ctx.git, name="init", spec=DISCOVERY_SPEC,
-        prompt="Discover this repository's existing engineering intent and report candidates.", brief_text=brief,
+        prompt=("Discover this repository's existing engineering intent. Read the Rules section of your brief first, "
+                "then the code and history. Report candidates with evidence, and list unknowns."),
+        brief_text=brief,
         tier=tiers[tier][Role.investigate], db=ctx.db, tier_name=tier,
     ))
     if result.tampered:
@@ -244,9 +240,9 @@ def plan(request: str, tier: str, target: Path) -> None:
     """Turn a feature request into contracts and a plan for approval."""
     import asyncio
 
-    from ateam.allocation import rubric_text
-    from ateam.contracts.store import save_contract
+    from ateam.contracts.store import load_contracts, save_contract
     from ateam.planner import PlanError, render_plan_review, report_to_plan
+    from ateam.plans.store import load_plans
     from ateam.plans.store import next_id as next_plan_id
     from ateam.plans.store import save_plan
     from ateam.records.store import load_records, save_record
@@ -265,15 +261,6 @@ def plan(request: str, tier: str, target: Path) -> None:
     pid = f"P-{max(disk_next, db_next):04d}"
     ctx.db.transition("feature", pid, "requested", by="owner", reason=request[:200])
     ctx.db.transition("feature", pid, "investigating", by="ateam")
-    records = load_records(ctx.paths.records)
-    tiers = load_tiers(ctx.config.tiers)
-    brief = "\n\n".join([
-        f"Feature request from the owner:\n{request}",
-        _records_index(records),
-        "Configured deterministic checks (use only these names): " + (", ".join(f"{c.name} (`{c.cmd}`)" for c in ctx.config.checks) or "none"),
-        "Tier names: light, standard, careful; investigate may also be none.",
-        "Allocation rubric:\n" + rubric_text(),
-    ])
     def _rejected(reason: str) -> None:
         """Leave a visible, terminal trace: a rejected plan file (committed) and the feature state."""
         rejected = Plan(id=pid, title=request[:80], request=request, status=PlanStatus.plan_rejected,
@@ -290,9 +277,25 @@ def plan(request: str, tier: str, target: Path) -> None:
             ctx.db.transition("feature", pid, "plan_rejected", by="ateam", reason=reason)
 
     try:
+        records = load_records(ctx.paths.records)
+        tiers = load_tiers(ctx.config.tiers)
+        existing_plans = load_plans(ctx.paths.plans)
+        brief = assemble_investigation_brief(
+            kind="planning", target_root=ctx.paths.root, config=ctx.config, records=records,
+            plans=existing_plans, contracts=load_contracts(ctx.paths.contracts),
+            scratch_dir=ctx.paths.scratch_root / pid, request=request,
+        )
+    except Exception as e:  # noqa: BLE001  the feature is already investigating; never strand it
+        _rejected(f"brief assembly failed: {type(e).__name__}")
+        _fail(f"could not assemble the planning brief: {e}. Re-run: ateam plan \"{request}\"")
+
+    try:
         result = asyncio.run(run_investigation(
             paths=ctx.paths, config=ctx.config, target_git=ctx.git, name=pid, spec=PLANNER_SPEC,
-            prompt="Produce the plan for the feature request in your brief.", brief_text=brief,
+            prompt=("Produce the plan for the Request in your brief. Read the Rules section first; anything it reserves "
+                    "for the owner goes under unknowns, not into a contract. Fill every field of the report: contracts, "
+                    "proposed_records, depends_on_plans, files_read, out_of_scope, verification_approach, unknowns, notes."),
+            brief_text=brief,
             tier=tiers[tier][Role.investigate], db=ctx.db, tier_name=tier,
         ))
     except Exception as e:  # noqa: BLE001  the session is the untrusted part; never leave the plan half-open
@@ -306,7 +309,8 @@ def plan(request: str, tier: str, target: Path) -> None:
         _rejected("planner produced no report")
         _fail(f"planning produced no report (subtype {result.res.subtype}{', ' + result.res.error if result.res.error else ''})")
     try:
-        pr = report_to_plan(result.res.report, request, pid, ctx.paths.contracts, records, ctx.config, ctx.paths.root, ctx.paths.records)
+        pr = report_to_plan(result.res.report, request, pid, ctx.paths.contracts, records, ctx.config, ctx.paths.root, ctx.paths.records,
+                            tiers=tiers, existing_plans=existing_plans)
     except PlanError as e:
         _rejected("planner output invalid")
         click.echo("The planner's output is not usable; nothing was written. Problems:")

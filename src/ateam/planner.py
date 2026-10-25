@@ -12,7 +12,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from ateam.allocation import check_allocation, default_tiers, investigate_tier_for, tier_for_complexity, tier_for_test
+from ateam.allocation import budget_for, check_allocation, default_tiers, investigate_tier_for, tier_for_complexity, tier_for_test
 from ateam.config import TargetConfig
 from ateam.contracts.model import Acceptance, Allocation, Budget, Contract, ContractStatus, Level
 from ateam.contracts.select import select_records
@@ -23,7 +23,7 @@ from ateam.plans.model import Plan, PlanHistoryEntry, PlanStatus
 from ateam.records.graph import RecordGraph
 from ateam.records.model import Record
 from ateam.roles import Role
-from ateam.tiers import ORDER, at_least
+from ateam.tiers import ORDER, at_least, load_tiers
 
 
 class PlanError(Exception):
@@ -65,6 +65,7 @@ def _has_cycle(raw: list[dict]) -> bool:
 def report_to_plan(
     report: dict, request: str, plan_id: str, contracts_dir: Path, records: dict[str, Record], config: TargetConfig,
     repo_root: Path, records_dir: Path, by: str = "ateam-plan",
+    tiers: dict | None = None, existing_plans: dict[str, Plan] | None = None,
 ) -> PlanResult:
     raw = list(report.get("contracts") or [])
     fatal: list[str] = []
@@ -92,6 +93,17 @@ def report_to_plan(
     if fatal:
         raise PlanError(fatal)
 
+    tiers = tiers or load_tiers()
+    existing_plans = existing_plans or {}
+    depends_on_plans: list[str] = []
+    for dep in dict.fromkeys(report.get("depends_on_plans") or []):
+        if dep == plan_id:
+            notes.append(f"depends_on_plans named this plan's own id {plan_id}; dropped")
+        else:
+            depends_on_plans.append(dep)
+            if dep not in existing_plans:
+                notes.append(f"depends_on_plans names unknown plan {dep}")
+
     start = int(next_contract_id(contracts_dir).split("-")[1])
     ids = [f"C-{start + i:04d}" for i in range(len(raw))]
     contracts: list[Contract] = []
@@ -100,7 +112,7 @@ def report_to_plan(
         try:
             alloc = Allocation.model_validate(c["allocation"])
             acceptance = [Acceptance.model_validate(a) for a in c.get("acceptance", [])]
-            budget = Budget.model_validate(c["budget"]) if c.get("budget") else Budget()
+            given_budget = Budget.model_validate(c["budget"]) if c.get("budget") else None
         except (ValidationError, KeyError) as e:
             raise PlanError([f"{cid} ({c.get('title', '?')}): {str(e).splitlines()[0]}"]) from e
         defaults = default_tiers(alloc)
@@ -126,6 +138,7 @@ def report_to_plan(
             tier["investigate"] = defaults["investigate"]
             notes.append(f"{cid}: investigate tier {inv!r} unknown; set to {tier['investigate']!r}")
         alloc = alloc.model_copy(update={"tier": tier})
+        budget = given_budget or budget_for(tier["build"], tiers)
         notes.extend(f"{cid}: {p}" for p in check_allocation(alloc))
         scope = [*c["paths"], *c.get("incidental", [])]
         for a in acceptance:
@@ -148,6 +161,8 @@ def report_to_plan(
     plan = Plan(
         id=plan_id, title=(report.get("title") or request)[:80], request=request, status=PlanStatus.plan_proposed,
         contracts=ids, proposed_records=[r.id for r in proposed.proposed], unknowns=list(report.get("unknowns") or []),
+        depends_on_plans=depends_on_plans, files_read=list(report.get("files_read") or []),
+        out_of_scope=list(report.get("out_of_scope") or []), verification_approach=report.get("verification_approach") or "",
         history=[PlanHistoryEntry(at=datetime.now(UTC), by=by, to=PlanStatus.plan_proposed)],
     )
     return PlanResult(plan=plan, contracts=contracts, proposed=proposed, problems=notes, bound_preview=bound_preview)
@@ -176,6 +191,12 @@ def render_plan_review(result: PlanResult, tiers) -> str:
         bound = result.bound_preview.get(c.id, [])
         lines.append("  bound records: " + (", ".join(bound) if bound else "none (no approved records apply)"))
         lines.append("")
+    lines.append("Depends on plans: " + (", ".join(p.depends_on_plans) or "none"))
+    shown = p.files_read[:20]
+    lines.append(f"Files read ({len(p.files_read)}):" + (" " + ", ".join(shown) + (", ..." if len(p.files_read) > 20 else "") if shown else " none"))
+    lines.append("Out of scope: " + ("; ".join(p.out_of_scope) or "none"))
+    lines.append("Verification approach: " + (p.verification_approach or "none"))
+    lines.append("")
     if result.proposed.proposed or result.proposed.dropped or result.proposed.skipped_rejected:
         lines.append("Records proposed by this plan:")
         lines.append(render_discovery_report(result.proposed).replace("\nNext: ateam records review   (approve as requirement or observation, reject with a reason, or skip)", ""))

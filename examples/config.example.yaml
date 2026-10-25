@@ -12,3 +12,4 @@ protected_paths: [".claude/**"]  # inside the worktree; the intent repo and stat
 max_workers: 2
 global_record_cap: 5
 tiers: {}                       # overrides, e.g. {standard: {build: {model: opus}}}
+brief_docs: ["docs/design.md"]    # extra files (relative to the target root) shown to ateam init and ateam plan, beside CLAUDE.md and AGENTS.md

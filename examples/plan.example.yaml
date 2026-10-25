@@ -8,6 +8,12 @@ contracts: ["C-0001", "C-0002"]  # draft until the plan is approved, then frozen
 proposed_records: ["R-0004"]     # records the planner proposed; reviewed at approval, never approved by code
 unknowns:
   - "Should PATCH accept re-reading when the book was never read?"
+depends_on_plans: []             # other plans that must be merged first
+files_read:                      # files the planner read while investigating
+  - "src/api/books.py"
+out_of_scope:                    # what this plan deliberately leaves alone
+  - "Changing the books database schema"
+verification_approach: "Run the unit suite; call PATCH on a scratch book and read it back."
 tier_overrides: {}               # filled by `ateam approve --tier C-0002=careful` or `--tier C-0002:test=careful`
 history:
   - {at: 2026-10-25T12:00:00Z, by: ateam-plan, to: plan_proposed}

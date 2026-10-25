@@ -54,3 +54,15 @@ def test_rubric_text_mentions_three_dimensions_and_no_file_count():
     for word in ("Complexity", "Risk", "Uncertainty", "light", "standard", "careful"):
         assert word in text
     assert "file count" in text.lower() and "not a signal" in text.lower()
+
+
+@pytest.mark.parametrize("tier,attempts", [("light", 2), ("standard", 3), ("careful", 3)])
+def test_budget_for_each_tier(tier, attempts):
+    from ateam.allocation import budget_for
+    from ateam.roles import Role
+    from ateam.tiers import load_tiers
+
+    tiers = load_tiers()
+    b = budget_for(tier, tiers)
+    assert b.attempts == attempts
+    assert b.usd_per_attempt == tiers[tier][Role.build].usd and b.max_turns == tiers[tier][Role.build].max_turns

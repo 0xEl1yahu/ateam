@@ -22,3 +22,11 @@ def test_content_hash_ignores_status_and_history():
     q = p.model_copy(update={"status": PlanStatus.plan_approved, "history": [PlanHistoryEntry(at=datetime.now(UTC), by="owner", to=PlanStatus.plan_approved)]})
     assert q.content_hash() == h
     assert p.model_copy(update={"contracts": ["C-0002"]}).content_hash() != h
+
+
+def test_plan_new_fields_default_and_hash():
+    p = Plan(id="P-0001", title="T", request="r")
+    assert p.depends_on_plans == [] and p.files_read == [] and p.out_of_scope == [] and p.verification_approach == ""
+    h = p.content_hash()
+    for name, value in (("depends_on_plans", ["P-0002"]), ("files_read", ["a.py"]), ("out_of_scope", ["x"]), ("verification_approach", "run tests")):
+        assert p.model_copy(update={name: value}).content_hash() != h, name

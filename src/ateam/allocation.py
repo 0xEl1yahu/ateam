@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from importlib import resources
 
-from ateam.contracts.model import Allocation, Level
-from ateam.tiers import ORDER, at_least
+from ateam.contracts.model import Allocation, Budget, Level
+from ateam.roles import Role
+from ateam.tiers import ORDER, TierSpec, at_least
 
 _COMPLEXITY = {Level.low: "light", Level.medium: "standard", Level.high: "careful"}
 _INVESTIGATE = {Level.low: "none", Level.medium: "light", Level.high: "standard"}
@@ -24,6 +25,12 @@ def tier_for_test(risk: Level, build_tier: str) -> str:
     """Risk sets a floor for the TEST tier; TEST never runs below the BUILD it checks."""
     floor = _RISK_FLOOR[Level(risk)]
     return "careful" if Level(risk) == Level.high else at_least(build_tier, floor)
+
+
+def budget_for(tier_name: str, tiers: dict[str, dict[Role, TierSpec]]) -> Budget:
+    """A contract's default budget: what the BUILD tier allows per attempt; the light tier gets one fewer attempt."""
+    spec = tiers[tier_name][Role.build]
+    return Budget(attempts=2 if tier_name == "light" else 3, usd_per_attempt=spec.usd, max_turns=spec.max_turns)
 
 
 def default_tiers(a: Allocation) -> dict[str, str]:

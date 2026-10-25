@@ -27,6 +27,7 @@ class TargetConfig(BaseModel):
     max_workers: int = 2
     global_record_cap: int = 5
     tiers: dict[str, dict] = Field(default_factory=dict)
+    brief_docs: list[str] = Field(default_factory=list)  # target-relative files included in investigation briefs
 
 
 def load_config(paths: TargetPaths) -> TargetConfig:
