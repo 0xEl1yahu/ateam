@@ -169,6 +169,32 @@ class StateDB:
             else:
                 self.conn.execute("UPDATE contracts SET status=?, updated_at=? WHERE contract_id=?", (to, _now(), id))
 
+    def transition_path(self, kind: Kind, id: str, steps: list[str], by: str, reason: str | None = None) -> None:
+        """Several transitions in one transaction: every step is checked first, then all are written or none."""
+        table = FEATURE_TRANSITIONS if kind == "feature" else CONTRACT_TRANSITIONS
+        start = self.feature_status(id) if kind == "feature" else self.contract_status(id)
+        current = start
+        for to in steps:
+            if to not in table.get(current, set()):
+                raise InvalidTransition(f"{kind} {id}: {current} -> {to} is not allowed")
+            current = to
+        with self.conn:
+            current = start
+            for to in steps:
+                self.conn.execute(
+                    "INSERT INTO transitions (kind, id, from_status, to_status, by, reason, at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (kind, id, current, to, by, reason, _now()),
+                )
+                current = to
+            if kind == "feature":
+                self.conn.execute(
+                    "INSERT INTO features (feature_id, status, updated_at) VALUES (?, ?, ?) "
+                    "ON CONFLICT(feature_id) DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at",
+                    (id, current, _now()),
+                )
+            else:
+                self.conn.execute("UPDATE contracts SET status=?, updated_at=? WHERE contract_id=?", (current, _now(), id))
+
     def transitions(self, kind: Kind, id: str) -> list[dict[str, Any]]:
         rows = self.conn.execute("SELECT * FROM transitions WHERE kind=? AND id=? ORDER BY seq", (kind, id))
         return [dict(r) for r in rows]

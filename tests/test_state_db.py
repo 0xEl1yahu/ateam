@@ -32,6 +32,24 @@ def test_contract_transition_rules(tmp_path):
     assert rows[-1]["from_status"] == "draft" and rows[-1]["to_status"] == "ready" and rows[-1]["by"] == "ateam"
 
 
+def test_transition_path_writes_every_step_in_one_go(tmp_path):
+    db = fresh(tmp_path)
+    db.upsert_contract("C-0001", "P-0001", "ready", "h")
+    db.transition_path("contract", "C-0001", ["building", "verifying", "verified"], by="verify", reason="r")
+    assert db.contract_status("C-0001") == "verified"
+    rows = db.transitions("contract", "C-0001")
+    assert [(r["from_status"], r["to_status"]) for r in rows] == [("ready", "building"), ("building", "verifying"), ("verifying", "verified")]
+    assert {r["by"] for r in rows} == {"verify"} and {r["reason"] for r in rows} == {"r"}
+
+
+def test_transition_path_with_an_invalid_step_writes_nothing(tmp_path):
+    db = fresh(tmp_path)
+    db.upsert_contract("C-0001", "P-0001", "ready", "h")
+    with pytest.raises(InvalidTransition):
+        db.transition_path("contract", "C-0001", ["building", "verified"], by="verify")
+    assert db.contract_status("C-0001") == "ready" and db.transitions("contract", "C-0001") == []
+
+
 def test_record_hashes(tmp_path):
     db = fresh(tmp_path)
     db.set_record_hash("R-0001", "abc"); db.set_record_hash("R-0001", "def")

@@ -668,3 +668,215 @@ def test_plan_brief_assembly_failure_is_rejected_not_stranded(monkeypatch, cli_t
     assert r.exit_code == 1 and "Traceback" not in r.output
     plans = load_plans(TargetPaths.from_root(cli_target).plans)
     assert plans["P-0001"].status == PlanStatus.plan_rejected
+
+
+# ---- minimal verify (bootstrap): deterministic checks, scope, tamper, intent first then the store
+
+def _verify_setup(cli_target, tmp_path, checks, env=None):
+    """C-0001 frozen with the given (name, cmd) checks, and a linked worktree off main."""
+    from ateam.config import NamedCheck, load_config, save_config
+    from ateam.contracts.store import save_contract
+
+    paths = TargetPaths.from_root(cli_target)
+    run("records", "approve", "R-0001", "--target", str(cli_target))
+    c = load_contracts(paths.contracts)["C-0001"]
+    save_contract(paths.contracts, c.model_copy(update={"checks": [NamedCheck(name=n, cmd=cmd) for n, cmd in checks]}))
+    subpaths = ["contracts"]
+    if env:
+        save_config(paths, load_config(paths).model_copy(update={"env": env}))
+        subpaths.append("config.yaml")
+    if not GitRepo(paths.intent).is_clean():
+        commit_intent(paths, "checks", subpaths)
+    assert run("contracts", "freeze", "C-0001", "--target", str(cli_target)).exit_code == 0
+    wt = tmp_path / "wt"
+    GitRepo(cli_target).worktree_add(wt, "ateam/C-0001", "main")
+    return wt
+
+
+def _do_work(wt, test_name="test_reading_state_present", extra=None):
+    (wt / "tests" / "api").mkdir(parents=True, exist_ok=True)
+    (wt / "tests" / "api" / "test_books.py").write_text(f"def {test_name}():\n    assert True\n")
+    (wt / "src" / "api" / "x.py").write_text("ROUTES = ['books']\n")
+    if extra:
+        (wt / extra).write_text("x\n")
+    g = GitRepo(wt); g.run("add", "-A"); g.run("commit", "-q", "-m", "work")
+
+
+def _verify(cli_target, wt):
+    return run("verify", "C-0001", "--cwd", str(wt), "--target", str(cli_target))
+
+
+def _statuses(cli_target):
+    file_status = load_contracts(TargetPaths.from_root(cli_target).contracts)["C-0001"].status
+    db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
+    return file_status, db.contract_status("C-0001"), db
+
+
+def test_verify_passing_work_reaches_verified_in_file_and_store(cli_target, tmp_path):
+    wt = _verify_setup(cli_target, tmp_path, [("unit", "true")])
+    _do_work(wt)
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 0, r.output
+    assert "C-0001 -> verified" in r.output and "unit: passed" in r.output
+    assert "A3" in r.output and "not checked by minimal verify" in r.output
+    file_status, store_status, db = _statuses(cli_target)
+    assert file_status == store_status == "verified"
+    rows = db.transitions("contract", "C-0001")
+    assert [r_["to_status"] for r_ in rows][-3:] == ["building", "verifying", "verified"]
+    assert all(r_["by"] == "verify" and "verifier: minimal" in r_["reason"] for r_ in rows[-3:])
+    cp = db.latest_checkpoint("C-0001")
+    assert cp["warnings"] == ["verifier: minimal"] and cp["notes"] is None and cp["checks"][0]["name"] == "unit"
+    intent = GitRepo(TargetPaths.from_root(cli_target).intent)
+    assert intent.is_clean() and intent.run("log", "-1", "--format=%s").strip() == "ateam: verify C-0001 -> verified"
+    assert run("brief", "C-0001", "--role", "build", "--target", str(cli_target)).exit_code == 0   # checkpoint shape intact
+    assert run("contracts", "validate", "--target", str(cli_target)).exit_code == 0
+
+
+def test_verify_failing_check_is_implementation(cli_target, tmp_path):
+    wt = _verify_setup(cli_target, tmp_path, [("unit", "echo boom; false"), ("lint", "true")])
+    _do_work(wt)
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 1 and "C-0001 -> failed (implementation)" in r.output
+    assert "unit: failed" in r.output and "boom" in r.output and "lint: passed" in r.output
+    assert _statuses(cli_target)[:2] == ("failed", "failed")
+
+
+def test_verify_errored_check_is_environment(cli_target, tmp_path):
+    wt = _verify_setup(cli_target, tmp_path, [("unit", "exit 127")])
+    _do_work(wt)
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 1 and "C-0001 -> failed (environment)" in r.output and "unit: errored" in r.output
+
+
+def test_verify_missing_acceptance_test_and_scope_breach_fail(cli_target, tmp_path):
+    wt = _verify_setup(cli_target, tmp_path, [("unit", "true")])
+    _do_work(wt, test_name="test_something_else", extra="README.md")
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 1 and "C-0001 -> failed (implementation)" in r.output
+    assert "README.md" in r.output and "test_reading_state_present" in r.output
+
+
+def test_verify_failed_then_fixed_then_failing_again(cli_target, tmp_path):
+    flag = tmp_path / "pass"
+    wt = _verify_setup(cli_target, tmp_path, [("unit", f"test -e {flag}")])
+    _do_work(wt)
+    assert _verify(cli_target, wt).exit_code == 1
+    r = _verify(cli_target, wt)   # failed -> failed: the file status is unchanged, nothing to commit
+    assert r.exit_code == 1 and "C-0001 -> failed" in r.output and "Traceback" not in r.output
+    assert _statuses(cli_target)[:2] == ("failed", "failed")
+    flag.write_text("")
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 0 and _statuses(cli_target)[:2] == ("verified", "verified")
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 4 and "verified" in r.output
+
+
+def test_verify_guards_refuse_before_any_check_runs(cli_target, tmp_path):
+    sentinel = tmp_path / "ran"
+    wt = _verify_setup(cli_target, tmp_path, [("unit", f"touch {sentinel}")])
+    r = run("verify", "C-0001", "--cwd", str(cli_target), "--target", str(cli_target))
+    assert r.exit_code == 4 and "isolated worktree" in r.output
+    other = tmp_path / "other"; other.mkdir(); GitRepo(other).run("init", "-q")
+    assert run("verify", "C-0001", "--cwd", str(other), "--target", str(cli_target)).exit_code == 4
+    assert run("verify", "C-0009", "--cwd", str(wt), "--target", str(cli_target)).exit_code == 1
+    (wt / "src" / "api" / "x.py").write_text("uncommitted\n")
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 1 and "commit the work first" in r.output
+    assert not sentinel.exists()
+    assert _statuses(cli_target)[:2] == ("ready", "ready")
+
+
+def test_verify_refuses_paused_and_unfrozen(cli_target, tmp_path):
+    wt = tmp_path / "wt"; GitRepo(cli_target).worktree_add(wt, "wt-v", "main")
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 4 and "not frozen" in r.output
+    wt2 = _verify_setup(cli_target, tmp_path / "b", [("unit", "true")])
+    _do_work(wt2)
+    _, _, db = _statuses(cli_target)
+    db.transition("contract", "C-0001", "building", by="t"); db.transition("contract", "C-0001", "paused", by="t")
+    from ateam.contracts.store import save_contract
+    paths = TargetPaths.from_root(cli_target)
+    save_contract(paths.contracts, load_contracts(paths.contracts)["C-0001"].model_copy(update={"status": "paused"}))
+    commit_intent(paths, "pause", ["contracts"])
+    r = _verify(cli_target, wt2)
+    assert r.exit_code == 4 and "paused" in r.output
+
+
+def test_verify_refuses_a_contract_without_checks(cli_target, tmp_path):
+    wt = _verify_setup(cli_target, tmp_path, [])
+    _do_work(wt)
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 1 and "at least one deterministic check" in r.output
+    assert _statuses(cli_target)[:2] == ("ready", "ready")
+
+
+def test_verify_head_moved_during_checks_is_tamper(cli_target, tmp_path):
+    wt = _verify_setup(cli_target, tmp_path, [("unit", "git commit -q --allow-empty -m sneaky")])
+    _do_work(wt)
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 1 and "C-0001 -> failed (tamper)" in r.output
+
+
+def test_verify_check_writing_into_intent_repo_is_tamper(cli_target, tmp_path):
+    intent = TargetPaths.from_root(cli_target).intent
+    wt = _verify_setup(cli_target, tmp_path, [("unit", f"touch {intent}/planted")])
+    _do_work(wt)
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 1 and "C-0001 -> failed (tamper)" in r.output
+    assert _statuses(cli_target)[:2] == ("failed", "failed")
+
+
+def test_verify_checks_get_a_scrubbed_environment(cli_target, tmp_path, monkeypatch):
+    out = tmp_path / "env.txt"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sekrit"); monkeypatch.setenv("GITHUB_TOKEN", "t")
+    monkeypatch.setenv("VIRTUAL_ENV", "/v"); monkeypatch.setenv("PYTHONPATH", "/p")
+    wt = _verify_setup(cli_target, tmp_path, [("unit", f"env > {out}")], env={"FOO": "bar"})
+    _do_work(wt)
+    assert _verify(cli_target, wt).exit_code == 0
+    names = {line.split("=", 1)[0] for line in out.read_text().splitlines() if "=" in line}
+    assert not names & {"ANTHROPIC_API_KEY", "GITHUB_TOKEN", "VIRTUAL_ENV", "PYTHONPATH"}
+    assert "FOO" in names and "PATH" in names
+
+
+def test_verify_interrupted_store_walk_is_recovered_without_rerunning_checks(cli_target, tmp_path, monkeypatch):
+    count = tmp_path / "count"
+    wt = _verify_setup(cli_target, tmp_path, [("unit", f"echo x >> {count}")])
+    _do_work(wt)
+
+    def boom(self, *a, **k):
+        raise RuntimeError("crash between the intent commit and the store")
+
+    with monkeypatch.context() as m:   # never monkeypatch.undo(): it would also drop the fixture's ATEAM_HOME
+        m.setattr(StateDB, "transition_path", boom)
+        r = _verify(cli_target, wt)
+    assert r.exit_code != 0
+    assert _statuses(cli_target)[:2] == ("verified", "ready")
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 0 and "recovered" in r.output
+    assert _statuses(cli_target)[:2] == ("verified", "verified")
+    assert count.read_text().count("x") == 1
+
+
+def test_verify_failed_intent_commit_stops_before_the_store(cli_target, tmp_path, monkeypatch):
+    from ateam.intent import IntentError
+
+    wt = _verify_setup(cli_target, tmp_path, [("unit", "true")])
+    _do_work(wt)
+
+    def refuse(*a, **k):
+        raise IntentError("disk full")
+
+    monkeypatch.setattr("ateam.cli.commit_intent", refuse)
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 1 and "disk full" in r.output and "checkout --" in r.output and "C-0001-" in r.output
+    assert _statuses(cli_target)[1] == "ready"
+    dirty = GitRepo(TargetPaths.from_root(cli_target).intent).status_porcelain()
+    assert len(dirty) == 1 and dirty[0][1].startswith("contracts/C-0001-")
+
+
+def test_verify_leaves_the_owner_checkout_untouched(cli_target, tmp_path):
+    before = (GitRepo(cli_target).head(), GitRepo(cli_target).status_porcelain())
+    wt = _verify_setup(cli_target, tmp_path, [("unit", "true")])
+    _do_work(wt)
+    assert _verify(cli_target, wt).exit_code == 0
+    assert (GitRepo(cli_target).head(), GitRepo(cli_target).status_porcelain()) == before

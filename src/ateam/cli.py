@@ -914,6 +914,27 @@ def brief(contract_id: str, role: str, target: Path) -> None:
     click.echo(render_brief(assemble_brief(cs[contract_id], selected, prev, Role(role), scratch_dir=ctx.paths.scratch_root / contract_id)))
 
 
+def _require_isolated_worktree(ctx: Context, worktree: Path) -> GitRepo:
+    """The linked worktree of the target at `worktree`, or exit 4: never the owner's checkout, a nested or a foreign one."""
+    from ateam.gitops import GitError
+
+    try:
+        wt_git = GitRepo.discover(worktree)
+        linked = wt_git.is_linked_worktree()
+    except GitError:
+        linked = False
+    target_root = ctx.paths.root.resolve()
+    if not linked or wt_git.root.resolve() == target_root:
+        _fail(f"{worktree} is not an isolated worktree of the target; workers never run in the owner's checkout", code=4)
+    if target_root in wt_git.root.resolve().parents:
+        _fail(f"{worktree} is inside the target checkout; create worktrees outside it", code=4)
+    wt_common = (wt_git.root / wt_git.run("rev-parse", "--git-common-dir").strip()).resolve()
+    target_git = (ctx.paths.root / ctx.git.run("rev-parse", "--git-dir").strip()).resolve()
+    if wt_common != target_git:
+        _fail(f"{worktree} is not a worktree of the target repository {ctx.paths.root}", code=4)
+    return wt_git
+
+
 @main.group()
 def worker() -> None:
     """Run a single worker (low-level; the scheduler arrives in pass two)."""
@@ -938,7 +959,6 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
     from ateam.runner.run import default_base, run_contract_attempt
     from ateam.tiers import load_tiers
 
-    from ateam.gitops import GitError
     from ateam.runner.binding import ContractNotBinding
 
     ctx = _context(target)
@@ -946,20 +966,7 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
     if contract_id not in cs:
         _fail(f"unknown contract {contract_id}")
     contract = cs[contract_id]
-    try:
-        wt_git = GitRepo.discover(worktree)
-        linked = wt_git.is_linked_worktree()
-    except GitError:
-        linked = False
-    target_root = ctx.paths.root.resolve()
-    if not linked or wt_git.root.resolve() == target_root:
-        _fail(f"{worktree} is not an isolated worktree of the target; workers never run in the owner's checkout", code=4)
-    if target_root in wt_git.root.resolve().parents:
-        _fail(f"{worktree} is inside the target checkout; create worktrees outside it", code=4)
-    wt_common = (wt_git.root / wt_git.run("rev-parse", "--git-common-dir").strip()).resolve()
-    target_git = (ctx.paths.root / ctx.git.run("rev-parse", "--git-dir").strip()).resolve()
-    if wt_common != target_git:
-        _fail(f"{worktree} is not a worktree of the target repository {ctx.paths.root}", code=4)
+    wt_git = _require_isolated_worktree(ctx, worktree)
     worktree = wt_git.root
     tiers = load_tiers(ctx.config.tiers)
     if tier and tier not in tiers:
@@ -983,6 +990,123 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
     click.echo(f"scope ok={scope.ok} outside={scope.outside} dirty={scope.dirty} changed={tree.changed_vs_base}")
     click.echo(json.dumps(res.report, indent=2) if res.report else "no structured report")
     sys.exit(0 if (res.report and scope.ok) else (3 if res.report else 1))
+
+
+# ---------------------------------------------------------------- verify (minimal)
+
+
+@main.command()
+@click.argument("contract_id")
+@click.option("--cwd", "worktree", type=click.Path(file_okay=False, exists=True, path_type=Path), required=True, help="Worktree holding the committed work.")
+@TARGET_OPTION
+def verify(contract_id: str, worktree: Path, target: Path) -> None:
+    """Minimal verification: the contract's checks, scope and acceptance tests, judged from the worktree.
+
+    No TEST worker yet: judgment criteria are listed, not checked. Exit 0 verified, 1 failed or refused, 4 guard."""
+    import os
+
+    from ateam import verify as v
+    from ateam.checkpoint import Checkpoint
+    from ateam.contracts.model import ContractStatus
+    from ateam.contracts.store import load_contracts, save_contract
+    from ateam.gitops import GitError
+    from ateam.intent import intent_git
+    from ateam.records.store import load_records
+    from ateam.runner.binding import ContractNotBinding, require_binding
+    from ateam.runner.run import default_base
+    from ateam.treecheck import scope_check, tree_state
+
+    ctx = _context(target)
+    cs = load_contracts(ctx.paths.contracts)
+    if contract_id not in cs:
+        _fail(f"unknown contract {contract_id}")
+    wt_git = _require_isolated_worktree(ctx, worktree)
+    contract = cs[contract_id]
+    intent = intent_git(ctx.paths)
+
+    # A verify that committed its result but died before the store caught up: finish the walk, do not rerun.
+    stored = ctx.db.contract_status(contract_id)
+    if (contract.status in (ContractStatus.verified, ContractStatus.failed) and stored != contract.status
+            and stored in ("ready", "building", "verifying", "failed")
+            and ctx.db.contract_hash(contract_id) == contract.content_hash()
+            and intent.run("log", "-1", "--format=%s").strip() == f"ateam: verify {contract_id} -> {contract.status}"):
+        ctx.db.transition_path("contract", contract_id, v.walk_to(stored, contract.status), by="verify",
+                               reason=f"{v.VERIFIER}; recovered an interrupted store update")
+        click.echo(f"recovered: the intent repo already records {contract_id} -> {contract.status}; "
+                   "the state store now agrees (checks not rerun)")
+        sys.exit(0 if contract.status == ContractStatus.verified else 1)
+
+    if contract.status == ContractStatus.paused:
+        _fail(f"{contract_id} is paused; the owner resumes it before it is verified", code=4)
+    try:
+        require_binding(contract, load_records(ctx.paths.records), ctx.db)
+        require_clean(ctx.paths)
+    except (ContractNotBinding, IntentError) as e:
+        _fail(str(e), code=4)
+    if not contract.checks:
+        _fail(f"minimal verify needs at least one deterministic check; {contract_id} has none")
+    base = default_base(wt_git, ctx.config.target_branch)
+    tree = tree_state(wt_git, base)
+    scope = scope_check(tree, contract.paths, contract.incidental)
+    if scope.dirty:
+        _fail(f"the worktree has uncommitted changes ({', '.join(scope.dirty)}); commit the work first")
+
+    click.echo(f"verifying {contract_id} in {wt_git.root} against base {base[:12]} ({v.VERIFIER})")
+    before = v.snapshot(wt_git, intent, ctx.git)
+    results = v.run_checks(contract.checks, wt_git.root, v.check_env(os.environ, ctx.config.env))
+    after = v.snapshot(wt_git, intent, ctx.git)
+    tamper = v.tampered(before, after)
+    acceptance = v.acceptance_presence(contract, wt_git.root)
+
+    # The contract and its records must still be the ones the checks were run for.
+    current = load_contracts(ctx.paths.contracts).get(contract_id)
+    try:
+        if current is None:
+            raise ContractNotBinding(f"{contract_id} disappeared")
+        require_binding(current, load_records(ctx.paths.records), ctx.db)
+        if not tamper:
+            require_clean(ctx.paths)
+    except (ContractNotBinding, IntentError) as e:
+        _fail(f"{e}; the contract or the intent repo changed while the checks ran, nothing was recorded", code=4)
+
+    outcome = v.decide(scope, results, acceptance, tamper)
+    for r in results:
+        state = "passed" if r.passed else ("errored" if r.errored else "failed")
+        click.echo(f"  {r.name}: {state}" + ("" if r.passed or r.exit_code is None else f" (exit {r.exit_code})"))
+        if not r.passed and r.tail.strip():
+            click.echo("\n".join("      " + line for line in r.tail.splitlines()[-20:]))
+    for a in acceptance:
+        state = {True: "present", False: "MISSING", None: "not checked by minimal verify"}[a.ok]
+        click.echo(f"  {a.id} [{a.kind}]: {state}" + ("" if a.ok is None else f" ({a.detail})"))
+    if not scope.ok:
+        click.echo("  scope: outside the contract's paths: " + ", ".join(scope.outside))
+    for t in tamper:
+        click.echo(f"  tamper: {t}")
+
+    # The intent repo is the truth; the state store follows it.
+    final = current.model_copy(update={"status": ContractStatus(outcome.status)})
+    saved = save_contract(ctx.paths.contracts, final)
+    rel = f"contracts/{saved.name}"
+    try:
+        commit_intent(ctx.paths, f"ateam: verify {contract_id} -> {outcome.status}", [rel])
+    except (IntentError, GitError) as e:
+        if "nothing to commit" not in str(e):
+            click.echo(f"error: could not commit the verification in the intent repo: {e}")
+            click.echo("Nothing was recorded in the state store. Restore the contract file and re-run:")
+            click.echo(f"  git -C \"{ctx.paths.intent}\" checkout -- {rel}")
+            sys.exit(1)
+    log = wt_git.run("log", "--format=%h %s", f"{base}..{after.worktree_head}") if after.worktree_head != base else ""
+    ctx.db.set_checkpoint(contract_id, None, Checkpoint(
+        base=base, head=after.worktree_head, commits=[line for line in log.splitlines() if line],
+        diff_names=tree.changed_vs_base, dirty=list(after.worktree_dirty), checks=[r.fact() for r in results],
+        contract_hash=final.content_hash(), record_hashes={ref.id: ref.hash for ref in final.records},
+        session_id=None, notes=None, warnings=[v.VERIFIER],
+    ).to_dict())
+    summary = (f"{outcome.failure_class}: " if outcome.failure_class else "") + ("; ".join(outcome.reasons) or "all checks passed")
+    ctx.db.transition_path("contract", contract_id, v.walk_to(ctx.db.contract_status(contract_id), outcome.status),
+                           by="verify", reason=f"{v.VERIFIER}; {summary}"[:500])
+    click.echo(f"{contract_id} -> {outcome.status}" + (f" ({outcome.failure_class})" if outcome.failure_class else ""))
+    sys.exit(0 if outcome.status == ContractStatus.verified else 1)
 
 
 if __name__ == "__main__":
