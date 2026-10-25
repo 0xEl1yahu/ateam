@@ -79,15 +79,34 @@ def _split_segments(cmd: str) -> list[str]:
     A & that belongs to >&, <& or &> is a redirect, not a separator."""
     segments: list[str] = []
     buf: list[str] = []
-    quote: str | None = None
+    quote: str | None = None   # "'", '"' or "$'" (ANSI-C quoting)
+    redir_at = -2              # index of the last unescaped < or >
     i = 0
     while i < len(cmd):
         ch = cmd[i]
         if quote:
             buf.append(ch)
-            if ch == quote and (quote == "'" or cmd[i - 1] != "\\"):
+            if quote == "'":
+                closes = ch == "'"
+            else:
+                closes = ch == quote[-1]
+                if closes:
+                    n = 0
+                    while cmd[i - 1 - n : i - n] == "\\" and i - 1 - n >= 0:
+                        n += 1
+                    closes = n % 2 == 0
+            if closes:
                 quote = None
             i += 1
+            continue
+        if ch == "\\":   # outside quotes a backslash makes the next character literal
+            buf.append(cmd[i : i + 2])
+            i += 2
+            continue
+        if cmd[i : i + 2] == "$'":
+            quote = "$'"
+            buf.append("$'")
+            i += 2
             continue
         if ch in ("'", '"'):
             quote = ch
@@ -101,8 +120,10 @@ def _split_segments(cmd: str) -> list[str]:
             segments.append("".join(buf)); buf = []; i += 2; continue
         if ch in (";", "|", "\n"):
             segments.append("".join(buf)); buf = []; i += 1; continue
-        if ch == "&" and cmd[i - 1 : i] not in (">", "<") and cmd[i + 1 : i + 2] != ">":
+        if ch == "&" and redir_at != i - 1 and cmd[i + 1 : i + 2] != ">":
             segments.append("".join(buf)); buf = []; i += 1; continue
+        if ch in ("<", ">"):
+            redir_at = i
         buf.append(ch)
         i += 1
     segments.append("".join(buf))

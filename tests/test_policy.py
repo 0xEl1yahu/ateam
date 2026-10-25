@@ -237,6 +237,12 @@ INVESTIGATE_CD_DENY = [
     "ls &cd ..",
     "ls & pushd ..",
     "ls &\ncd ..",
+    r"ls \<& cd ..; cat .ateam/state.db",
+    r"ls \<& cd /",
+    r"cat x \<& pushd ..",
+    r"ls \'; cd ..; ls \'",
+    r'ls "a\\"; cd ..',
+    r"ls $'\''; cd ..",
 ]
 
 
@@ -655,9 +661,27 @@ def test_investigate_cd_symlink_inside_allowed_and_both_bases_guard_home(lnk_fix
         assert not ok and "ATeam's home" in reason, cmd
 
 
+RM_REASON = "rm is not allowed for workers; use `git rm` for tracked files, cleanup happens at integration"
+
+
 def test_build_background_job_does_not_hide_rm(policy_build):
     ok, reason = policy_build.command_allowed("ls & rm -rf x")
-    assert not ok and "rm" in reason
+    assert not ok and reason == RM_REASON
+
+
+@pytest.mark.parametrize("cmd", [r"ls \>& rm -rf x", r"ls \<& rm -rf x"])
+def test_build_escaped_redirect_char_does_not_hide_rm(policy_build, cmd):
+    ok, reason = policy_build.command_allowed(cmd)
+    assert not ok and reason == RM_REASON, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "grep -n 'a & b' x.py", 'grep -n "a; b" x.py', "printf '%s\\n' a", "grep -n 'it'\"'\"'s' x.py",
+    'grep -n "a\\\\" x.py', "ls $'a;b'",
+])
+def test_build_quoted_and_escaped_text_stays_allowed(policy_build, cmd):
+    ok, reason = policy_build.command_allowed(cmd)
+    assert ok, (cmd, reason)
 
 
 def test_build_ampersand_forms_still_allowed(policy_build):
