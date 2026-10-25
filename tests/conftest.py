@@ -64,3 +64,22 @@ def sample_record():
         fingerprint=compute_fingerprint(evidence),
         history=[HistoryEntry(at=datetime(2026, 10, 24, 10, 12, tzinfo=UTC), by="ateam-init", to=Status.proposed, why="found in spec")],
     )
+
+
+@pytest.fixture
+def records_three(sample_record):
+    """R-0001 approved binds src/api/**; R-0002 approved global; R-0003 proposed binds src/**."""
+    from ateam.records.model import Binds, Evidence, Origin, Status, compute_fingerprint
+
+    r1 = sample_record.model_copy(update={"status": Status.approved, "binds": Binds(paths=["src/api/**"])})
+    ev2 = [Evidence(type="doc", ref="README.md#principles")]
+    r2 = sample_record.model_copy(update={
+        "id": "R-0002", "status": Status.approved, "statement": "No analytics or third-party requests at runtime",
+        "evidence": ev2, "fingerprint": compute_fingerprint(ev2), "binds": Binds(), "serves": ["privacy"],
+    })
+    ev3 = [Evidence(type="code", ref="src/app.py:1")]
+    r3 = sample_record.model_copy(update={
+        "id": "R-0003", "status": Status.proposed, "origin": Origin.inferred, "statement": "Modules under src expose a greet function",
+        "evidence": ev3, "fingerprint": compute_fingerprint(ev3), "binds": Binds(paths=["src/**"]), "serves": ["friendly api"],
+    })
+    return {"R-0001": r1, "R-0002": r2, "R-0003": r3}
