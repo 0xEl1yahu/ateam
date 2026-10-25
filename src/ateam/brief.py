@@ -104,13 +104,18 @@ DEFAULT_MAX_CANDIDATES = 12
 def _rules(target_root: Path, config: TargetConfig) -> str:
     parts: list[str] = []
     missing: list[str] = []
-    for rel in ["CLAUDE.md", "AGENTS.md", *config.brief_docs]:
-        f = target_root / rel
+    root = target_root.resolve()
+    for rel in dict.fromkeys(["CLAUDE.md", "AGENTS.md", *config.brief_docs]):
+        f = (target_root / rel).resolve()
+        if not f.is_relative_to(root):
+            if rel in config.brief_docs:
+                missing.append(f"{rel} (outside the target)")
+            continue
         if not f.is_file():
             if rel in config.brief_docs:
                 missing.append(rel)
             continue
-        text = f.read_text(errors="replace")
+        text = _demote_headings(f.read_text(errors="replace"), 3)
         if len(text) > DOC_CAP:
             text = text[:DOC_CAP] + f"\n[truncated at {DOC_CAP} characters]"
         parts.append(f"### {rel}\n{text.rstrip()}")
@@ -140,9 +145,9 @@ def _plans(plans: dict[str, Plan], contracts: dict[str, Contract]) -> str:
     return "\n".join(lines)
 
 
-def _demote_headings(text: str) -> str:
-    """Push a document's own headings down two levels so they cannot be read as top-level brief sections."""
-    return "\n".join("##" + line if line.startswith("#") else line for line in text.splitlines())
+def _demote_headings(text: str, levels: int = 2) -> str:
+    """Push a document's own headings down so they cannot be read as top-level brief sections."""
+    return "\n".join("#" * levels + line if line.startswith("#") else line for line in text.splitlines())
 
 
 def assemble_investigation_brief(
@@ -169,7 +174,7 @@ def assemble_investigation_brief(
         ("Existing plans and contracts", _plans(plans, contracts)),
     ]
     if kind == "planning":
-        sections.append(("Request", (request or "").strip()))
+        sections.append(("Request", _demote_headings((request or "").strip())))
     else:
         n = DEFAULT_MAX_CANDIDATES if max_candidates is None else max_candidates
         sections.append(("Discovery limits", f"Propose at most {n} candidates; at most {config.global_record_cap} may be global."))

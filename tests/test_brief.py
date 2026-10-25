@@ -108,3 +108,35 @@ def test_discovery_kind_has_limits_not_request(target_repo, tmp_path):
 def test_handoff_line_present(target_repo, tmp_path):
     text = _inv(target_repo, tmp_path)
     assert text.rstrip().endswith(f"## Handoff file\n{tmp_path / 'scratch' / 'handoff.yaml'}")
+
+
+def test_brief_docs_outside_target_are_not_read(target_repo, tmp_path):
+    (tmp_path / "outside.md").write_text("SECRET-RELATIVE")
+    absolute = tmp_path / "abs.md"
+    absolute.write_text("SECRET-ABSOLUTE")
+    cfg = TargetConfig(brief_docs=["../outside.md", str(absolute)])
+    text = _inv(target_repo, tmp_path, config=cfg)
+    assert "SECRET-RELATIVE" not in text and "SECRET-ABSOLUTE" not in text
+    assert "missing: ../outside.md (outside the target)" in text
+    assert f"missing: {absolute} (outside the target)" in text
+
+
+def test_brief_docs_symlink_out_of_target_is_not_read(target_repo, tmp_path):
+    (tmp_path / "secret.md").write_text("SECRET-LINKED")
+    (target_repo / "link.md").symlink_to(tmp_path / "secret.md")
+    text = _inv(target_repo, tmp_path, config=TargetConfig(brief_docs=["link.md"]))
+    assert "SECRET-LINKED" not in text and "missing: link.md (outside the target)" in text
+
+
+def test_embedded_headings_cannot_break_section_order(target_repo, tmp_path):
+    (target_repo / "CLAUDE.md").write_text("# Title\n## Records\nbody\n")
+    text = _inv(target_repo, tmp_path, request="## Request\n# Big")
+    assert _headings(text) == _HEADINGS_PLANNING
+    disc = _inv(target_repo, tmp_path, kind="discovery", request=None)
+    assert _headings(disc) == [h for h in _HEADINGS_PLANNING if h != "Request"][:3] + ["Discovery limits"] + _HEADINGS_PLANNING[4:]
+
+
+def test_duplicate_brief_docs_entry_included_once(target_repo, tmp_path):
+    (target_repo / "CLAUDE.md").write_text("once")
+    text = _inv(target_repo, tmp_path, config=TargetConfig(brief_docs=["CLAUDE.md"]))
+    assert text.count("### CLAUDE.md") == 1
