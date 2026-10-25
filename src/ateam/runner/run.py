@@ -71,7 +71,9 @@ async def run_worker(prompt: str, options: ClaudeAgentOptions, policy: Policy) -
     )
 
 
-def build_policy(worktree: Path, role: Role, contract: Contract, config: TargetConfig, records: dict[str, Record]) -> Policy:
+def build_policy(
+    worktree: Path, role: Role, contract: Contract, config: TargetConfig, records: dict[str, Record], scratch_dir: Path | None = None
+) -> Policy:
     bound: dict[str, list[Record]] = {}
     for ref in contract.records:
         r = records.get(ref.id)
@@ -79,7 +81,10 @@ def build_policy(worktree: Path, role: Role, contract: Contract, config: TargetC
             continue
         for g in r.binds.paths:
             bound.setdefault(g, []).append(r)
-    return Policy(worktree=worktree, role=role, allowed_paths=list(contract.paths), protected=list(config.protected_paths), bound=bound)
+    return Policy(
+        worktree=worktree, role=role, allowed_paths=list(contract.paths), protected=list(config.protected_paths),
+        bound=bound, scratch_dir=scratch_dir,
+    )
 
 
 def default_base(git_worktree: GitRepo, target_branch: str) -> str:
@@ -115,7 +120,7 @@ async def run_contract_attempt(
     else:
         tier, tier_name = resolve(contract, role, tiers), contract.allocation.tier[role.value]
     scratch = prepare_scratch(paths, contract.id)
-    policy = build_policy(worktree, role, contract, config, records)
+    policy = build_policy(worktree, role, contract, config, records, scratch_dir=scratch)
     selected = [records[ref.id] for ref in contract.records if ref.id in records]
     prev_raw = db.latest_checkpoint(contract.id)
     prev = Checkpoint.from_dict(prev_raw) if prev_raw else None

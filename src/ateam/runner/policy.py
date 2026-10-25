@@ -134,6 +134,7 @@ class Policy:
     allowed_paths: list[str]
     protected: list[str]
     bound: dict[str, list[Record]] = field(default_factory=dict)
+    scratch_dir: Path | None = None   # the worker's own scratch dir under ATeam home; the only writable place outside the worktree
     denials: list[str] = field(default_factory=list)
     injected: set[str] = field(default_factory=set)
 
@@ -151,6 +152,24 @@ class Policy:
             return None
         rel_posix = PurePosixPath(rel).as_posix()
         return None if rel_posix == "." else rel_posix
+
+    def _in_scratch(self, file_path: str) -> bool:
+        if self.scratch_dir is None:
+            return False
+        try:
+            Path(file_path).resolve().relative_to(self.scratch_dir.resolve())
+            return True
+        except ValueError:
+            return False
+
+    def path_writable_abs(self, file_path: str) -> tuple[bool, str]:
+        """Writability for any path: inside the worktree by the role rules, inside the worker's scratch dir, nothing else."""
+        rel = self.relative(file_path)
+        if rel is not None:
+            return self.path_writable(rel)
+        if self._in_scratch(file_path):
+            return (self.role != Role.investigate, "INVESTIGATE never writes files")
+        return False, "path is outside the worktree and outside your scratch directory"
 
     def path_writable(self, rel: str) -> tuple[bool, str]:
         if any(matches(g.lower(), rel.lower()) for g in self.protected):
@@ -172,7 +191,10 @@ class Policy:
             if re.search(pattern, cmd):
                 return False, f"destructive command matched {pattern!r}"
         segments = _split_segments(_strip_heredocs(cmd))
+        home = str(self.scratch_dir.resolve().parent.parent) if self.scratch_dir is not None else None
         for seg in segments:
+            if home and home in seg and str(self.scratch_dir.resolve()) not in seg and str(self.scratch_dir) not in seg:
+                return False, "ATeam's home (intent repo, state store, logs) is off limits to workers"
             if _is_rm(seg):
                 return False, "rm is not allowed for workers; use `git rm` for tracked files, cleanup happens at integration"
             if _PROTECTED_MENTION.search(seg):
@@ -197,10 +219,7 @@ class Policy:
 
     def _decide(self, tool_name: str, tool_input: dict[str, Any]) -> tuple[bool, str]:
         if tool_name in WRITE_TOOLS:
-            rel = self.relative(str(tool_input.get("file_path", "")))
-            if rel is None:
-                return False, "path is outside the worktree"
-            return self.path_writable(rel)
+            return self.path_writable_abs(str(tool_input.get("file_path", "")))
         if tool_name == "Bash":
             return self.command_allowed(str(tool_input.get("command", "")))
         return True, ""

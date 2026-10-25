@@ -224,3 +224,55 @@ def test_investigate_command_allowed(policy_investigate, cmd):
 def test_protected_paths_are_case_insensitive(policy_build):
     assert not policy_build.path_writable(".ATEAM/contracts/C-0001.yaml")[0]
     assert "protected" in policy_build.path_writable(".ATEAM/contracts/C-0001.yaml")[1]
+
+
+# ---- Task 5: the worker's own scratch dir is the only writable place outside the worktree
+
+def _with_scratch(policy, scratch):
+    from dataclasses import replace
+
+    return replace(policy, scratch_dir=scratch)
+
+
+def test_write_to_own_scratch_allowed_build_and_test(policy_build, policy_test, tmp_path):
+    scratch = tmp_path / "home" / "scratch" / "C-0001"; scratch.mkdir(parents=True)
+    for pol in (policy_build, policy_test):
+        p = _with_scratch(pol, scratch)
+        ok, _ = p.path_writable_abs(str(scratch / "handoff.yaml"))
+        assert ok, pol.role
+
+
+def test_investigate_never_writes_even_to_scratch(policy_investigate, tmp_path):
+    scratch = tmp_path / "home" / "scratch" / "C-0001"; scratch.mkdir(parents=True)
+    assert not _with_scratch(policy_investigate, scratch).path_writable_abs(str(scratch / "handoff.yaml"))[0]
+
+
+def test_write_to_other_contract_scratch_denied(policy_build, tmp_path):
+    scratch = tmp_path / "home" / "scratch" / "C-0001"; other = tmp_path / "home" / "scratch" / "C-0002"
+    scratch.mkdir(parents=True); other.mkdir(parents=True)
+    ok, reason = _with_scratch(policy_build, scratch).path_writable_abs(str(other / "handoff.yaml"))
+    assert not ok and "outside" in reason
+
+
+def test_write_to_intent_repo_denied(policy_build, target_paths, tmp_path):
+    scratch = tmp_path / "home" / "scratch" / "C-0001"; scratch.mkdir(parents=True)
+    ok, _ = _with_scratch(policy_build, scratch).path_writable_abs(str(target_paths.records / "R-0001-x.yaml"))
+    assert not ok
+
+
+@pytest.mark.asyncio
+async def test_can_use_tool_scratch_rules(policy_build, tmp_path):
+    scratch = tmp_path / "home" / "scratch" / "C-0001"; scratch.mkdir(parents=True)
+    p = _with_scratch(policy_build, scratch)
+    assert isinstance(await p.can_use_tool("Write", {"file_path": str(scratch / "handoff.yaml"), "content": "x"}, None), PermissionResultAllow)
+    assert isinstance(await p.can_use_tool("Write", {"file_path": str(scratch.parent / "C-0002" / "h.yaml"), "content": "x"}, None), PermissionResultDeny)
+
+
+def test_bash_touching_intent_repo_denied(policy_build, target_paths):
+    scratch = target_paths.scratch_root / "C-0001"; scratch.mkdir(parents=True)  # the real layout: home/scratch/<contract>
+    p = _with_scratch(policy_build, scratch)
+    assert not p.command_allowed(f"echo x > {target_paths.records / 'R-0001.yaml'}")[0]
+    assert not p.command_allowed(f"cat {target_paths.intent / 'config.yaml'}")[0]
+    assert not p.command_allowed(f"sqlite3 {target_paths.intent.parent / 'state.db'} 'select 1'")[0]
+    assert p.command_allowed(f"echo 'progress: x' > {scratch / 'handoff.yaml'}")[0]
+    assert p.command_allowed(f"cat {scratch / 'handoff.yaml'}")[0]
