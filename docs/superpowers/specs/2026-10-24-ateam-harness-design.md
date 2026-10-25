@@ -386,6 +386,16 @@ Downstream revalidation: after a verified contract merges onto the integration b
 
 Deferred until real failures are observed: token-budget allocation, context-pressure detection and session rotation, semantic retrieval or embeddings, summarisation hierarchies, live context sync between concurrent workers, custom compression. Auto-memory stays off for workers: it is shared across all worktrees of a repo and has no approval step, so it would be an unreviewed back-channel.
 
+## Observability and provenance (pass two)
+
+Owner decision, 2026-10-25: every worker attempt leaves an event log that is the primary record of what happened, so an error, a mistake, a lesson or a memory can be traced to the specific event that produced it. tmux is an optional viewer over those logs, never the execution substrate: workers are headless SDK sessions and are not steered through a terminal.
+
+- **Event log per attempt.** `~/.ateam/<repo-id>/logs/<attempt-id>.jsonl`, append-only, one JSON object per line with `seq`, `at`, `attempt`, `contract`, `role`, `type` and a typed payload. Event types: `session_start`, `assistant_text`, `tool_call`, `tool_result` (truncated, with a hash of the full content), `policy_denial`, `record_injected`, `check_run`, `state_transition`, `pause`, `report`, `session_end`, `error`. The coordinator writes the log as the SDK stream arrives, so a crash mid-attempt still leaves everything up to the crash.
+- **Event references.** An event is addressed as `A-<attempt-id>#<seq>`. `evidence` entries on records gain the type `event`, so a record proposed from a failure cites the exact denial, check or report that motivated it. Telemetry rows, checkpoints and pause reasons carry the `seq` of the event that caused them.
+- **Lessons are evidence-based.** A line added to `CLAUDE.md`, a new record, or a change to the policy that follows a mistake cites its event reference in the commit message and, for records, in `evidence`. "We saw this go wrong" becomes "A-0042#17: PreToolUse denied `git push` after the worker reported done". The pass-two `ateam lessons` command lists proposed records and policy changes with their events.
+- **Viewer.** `ateam watch [P-0001]` opens a tmux session with one window per running attempt tailing its log, a status window, and a window for pauses awaiting the owner. Closing it changes nothing. `ateam log A-0042 [--type policy_denial] [--since seq]` prints events without tmux, for SSH or after the fact.
+- **Retention and privacy.** Logs live in ATeam's home next to the state store, not in the intent repo, because tool results contain code and secrets may pass through them. They are never pushed. Retention is a config value with a default measured in days; events referenced by a record are kept regardless.
+
 ## Discovery
 
 `ateam init <target>`:
