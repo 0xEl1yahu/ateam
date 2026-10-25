@@ -175,10 +175,10 @@ class StateDB:
 
     def finish_verification(
         self, contract_id: str, start: str, steps: list[str], by: str, reason: str, checkpoint: dict[str, Any],
-        pending_key: str | None,
+        clear_keys: list[str],
     ) -> None:
         """Record a verification in one transaction: the transitions, the final status, the checkpoint, and the
-        removal of the pending marker. Steps are checked from `start`, the status seen before the checks ran, so a
+        removal of the verify markers in `clear_keys`. Steps are checked from `start`, the status seen before the checks ran, so a
         store row rewritten behind the verifier's back cannot change the walk; nothing is written if a step is invalid."""
         current = start
         for to in steps:
@@ -198,14 +198,28 @@ class StateDB:
                 "INSERT INTO checkpoints (contract_id, attempt_id, facts, at) VALUES (?, ?, ?, ?)",
                 (contract_id, None, json.dumps(checkpoint, default=str), _now()),
             )
-            if pending_key:
-                self.conn.execute("DELETE FROM meta WHERE key=?", (pending_key,))
+            for key in clear_keys:
+                self.conn.execute("DELETE FROM meta WHERE key=?", (key,))
 
-    def fingerprint(self) -> str:
-        """A hash of the whole store's content as committed, including writes made by other connections."""
+    def fingerprint(self, contract_id: str) -> str:
+        """A hash of everything the store holds about one contract, plus every record hash, as committed (writes by
+        other connections included). Other contracts' rows are left out, so parallel work does not change it."""
         import hashlib
 
-        return hashlib.sha256("\n".join(self.conn.iterdump()).encode()).hexdigest()
+        queries = [
+            ("SELECT * FROM contracts WHERE contract_id=?", (contract_id,)),
+            ("SELECT * FROM transitions WHERE kind='contract' AND id=? ORDER BY seq", (contract_id,)),
+            ("SELECT * FROM checkpoints WHERE contract_id=? ORDER BY seq", (contract_id,)),
+            ("SELECT * FROM attempts WHERE contract_id=? ORDER BY attempt_id", (contract_id,)),
+            ("SELECT * FROM meta WHERE key LIKE 'verify-%:' || ? ORDER BY key", (contract_id,)),
+            ("SELECT record_id, hash FROM record_hashes ORDER BY record_id", ()),
+        ]
+        h = hashlib.sha256()
+        for sql, args in queries:
+            for row in self.conn.execute(sql, args):
+                h.update(repr(tuple(row)).encode())
+            h.update(b"|")
+        return h.hexdigest()
 
     def transitions(self, kind: Kind, id: str) -> list[dict[str, Any]]:
         rows = self.conn.execute("SELECT * FROM transitions WHERE kind=? AND id=? ORDER BY seq", (kind, id))

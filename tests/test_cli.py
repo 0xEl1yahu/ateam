@@ -672,6 +672,9 @@ def test_plan_brief_assembly_failure_is_rejected_not_stranded(monkeypatch, cli_t
 
 # ---- minimal verify (bootstrap): deterministic checks, scope, tamper, intent first then the store
 
+from ateam.contracts.model import ContractStatus  # noqa: E402
+
+
 def _verify_setup(cli_target, tmp_path, checks, env=None):
     """C-0001 frozen with the given (name, cmd) checks, and a linked worktree off main."""
     from ateam.config import NamedCheck, load_config, save_config
@@ -796,7 +799,7 @@ def test_verify_refuses_paused_and_unfrozen(cli_target, tmp_path):
     db.transition("contract", "C-0001", "building", by="t"); db.transition("contract", "C-0001", "paused", by="t")
     from ateam.contracts.store import save_contract
     paths = TargetPaths.from_root(cli_target)
-    save_contract(paths.contracts, load_contracts(paths.contracts)["C-0001"].model_copy(update={"status": "paused"}))
+    save_contract(paths.contracts, load_contracts(paths.contracts)["C-0001"].model_copy(update={"status": ContractStatus.paused}))
     commit_intent(paths, "pause", ["contracts"])
     r = _verify(cli_target, wt2)
     assert r.exit_code == 4 and "paused" in r.output
@@ -838,7 +841,7 @@ def test_verify_checks_get_a_scrubbed_environment(cli_target, tmp_path, monkeypa
     assert "FOO" in names and "PATH" in names
 
 
-def test_verify_interrupted_store_walk_is_recovered_without_rerunning_checks(cli_target, tmp_path, monkeypatch):
+def test_verify_interrupted_verified_is_re_earned_not_recovered(cli_target, tmp_path, monkeypatch):
     count = tmp_path / "count"
     wt = _verify_setup(cli_target, tmp_path, [("unit", f"echo x >> {count}")])
     _do_work(wt)
@@ -852,12 +855,74 @@ def test_verify_interrupted_store_walk_is_recovered_without_rerunning_checks(cli
     assert r.exit_code != 0
     assert _statuses(cli_target)[:2] == ("verified", "ready")
     r = _verify(cli_target, wt)
-    assert r.exit_code == 0 and "recovered" in r.output
+    assert r.exit_code == 0 and "recovered" not in r.output and "verifying again" in r.output
     file_status, store_status, db = _statuses(cli_target)
     assert (file_status, store_status) == ("verified", "verified")
-    assert db.latest_checkpoint("C-0001")["warnings"][0] == "verifier: minimal"
-    assert db.get_meta("verify-pending:C-0001") is None
+    assert db.get_meta("verify-pending:C-0001") is None and db.get_meta("verify-running:C-0001") is None
+    assert count.read_text().count("x") == 2   # verified is only ever earned by a run that finished its checks
+
+
+def test_verify_interrupted_failed_is_finished_even_after_later_intent_commits(cli_target, tmp_path, monkeypatch):
+    count = tmp_path / "count"
+    wt = _verify_setup(cli_target, tmp_path, [("unit", f"echo x >> {count}; false")])
+    _do_work(wt)
+
+    def boom(self, *a, **k):
+        raise RuntimeError("crash between the intent commit and the store")
+
+    with monkeypatch.context() as m:
+        m.setattr(StateDB, "finish_verification", boom)
+        assert _verify(cli_target, wt).exit_code != 0
+    paths = TargetPaths.from_root(cli_target)
+    (paths.intent / "notes.md").write_text("owner note\n")
+    commit_intent(paths, "ateam: an unrelated owner commit", ["notes.md"])
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 1 and "recovered" in r.output
+    file_status, store_status, db = _statuses(cli_target)
+    assert (file_status, store_status) == ("failed", "failed") and db.get_meta("verify-pending:C-0001") is None
     assert count.read_text().count("x") == 1
+
+
+def test_verify_forged_pending_marker_cannot_produce_verified(cli_target, tmp_path):
+    """The state a check could leave behind if it forged the commit and the marker and then killed verify."""
+    import json
+    from ateam.contracts.store import save_contract
+    count = tmp_path / "count"
+    wt = _verify_setup(cli_target, tmp_path, [("unit", f"echo x >> {count}; false")])
+    _do_work(wt)
+    paths = TargetPaths.from_root(cli_target)
+    intent = GitRepo(paths.intent)
+    parent = intent.head()
+    save_contract(paths.contracts, load_contracts(paths.contracts)["C-0001"].model_copy(update={"status": ContractStatus.verified}))
+    commit_intent(paths, "ateam: verify C-0001 -> verified", ["contracts"])
+    _, _, db = _statuses(cli_target)
+    db.set_meta("verify-pending:C-0001", json.dumps({
+        "status": "verified", "parent": parent, "subject": "ateam: verify C-0001 -> verified", "start": "ready",
+        "steps": ["building", "verifying", "verified"], "reason": "forged", "checkpoint": {}}))
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 1 and "recovered" not in r.output and "C-0001 -> failed (implementation)" in r.output
+    assert _statuses(cli_target)[:2] == ("failed", "failed") and count.read_text().count("x") == 1
+
+
+def test_verify_killed_during_its_checks_is_recorded_as_tamper(cli_target, tmp_path):
+    import json
+    wt = _verify_setup(cli_target, tmp_path, [("unit", "true")])
+    _do_work(wt)
+    _, _, db = _statuses(cli_target)
+    db.set_meta("verify-running:C-0001", json.dumps({"start": "ready", "parent": GitRepo(TargetPaths.from_root(cli_target).intent).head()}))
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 1 and "C-0001 -> failed (tamper)" in r.output and "stopped while its checks ran" in r.output
+    file_status, store_status, db = _statuses(cli_target)
+    assert (file_status, store_status) == ("failed", "failed") and db.get_meta("verify-running:C-0001") is None
+    assert _verify(cli_target, wt).exit_code == 0   # the next run is an ordinary verify
+
+
+def test_verify_parallel_store_writes_for_other_contracts_are_not_tamper(cli_target, tmp_path):
+    db_path = home_dir(cli_target) / "state.db"
+    wt = _verify_setup(cli_target, tmp_path, [("unit", f"sqlite3 {db_path} \"INSERT INTO meta VALUES ('other', 'x', 't')\"")])
+    _do_work(wt)
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 0 and "C-0001 -> verified" in r.output, r.output
 
 
 def test_verify_forged_verify_commit_from_a_check_is_recorded_as_tamper(cli_target, tmp_path):
@@ -927,12 +992,13 @@ def test_verify_crash_before_the_intent_commit_leaves_a_marker_that_is_cleared_s
         m.setattr("ateam.cli.commit_intent", crash)
         assert _verify(cli_target, wt).exit_code != 0
     paths = TargetPaths.from_root(cli_target)
-    r = _verify(cli_target, wt)   # the saved but uncommitted file is still there: refuse, say how to restore
-    assert r.exit_code == 4 and "checkout --" in r.output
+    r = _verify(cli_target, wt)   # the saved but uncommitted file is still there: refuse and name it
+    assert r.exit_code == 4 and "uncommitted changes" in r.output and "contracts/C-0001-" in r.output
     GitRepo(paths.intent).run("checkout", "--", "contracts")
     r = _verify(cli_target, wt)
     assert r.exit_code == 0 and "C-0001 -> verified" in r.output
-    assert _statuses(cli_target)[2].get_meta("verify-pending:C-0001") is None
+    db = _statuses(cli_target)[2]
+    assert db.get_meta("verify-pending:C-0001") is None and db.get_meta("verify-running:C-0001") is None
 
 
 def test_verify_failed_intent_commit_stops_before_the_store(cli_target, tmp_path, monkeypatch):
