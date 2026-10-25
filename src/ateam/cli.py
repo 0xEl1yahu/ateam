@@ -40,7 +40,21 @@ def _fail(message: str, code: int = 1) -> None:
     sys.exit(code)
 
 
-@click.group()
+class _Group(click.Group):
+    """Turns store errors (malformed YAML under .ateam/) into one error line for every command."""
+
+    def invoke(self, ctx: click.Context):  # type: ignore[override]
+        from ateam.contracts.store import ContractStoreError
+        from ateam.records.store import RecordStoreError
+
+        try:
+            return super().invoke(ctx)
+        except (RecordStoreError, ContractStoreError) as e:
+            click.echo(f"error: {e}")
+            sys.exit(1)
+
+
+@click.group(cls=_Group)
 @click.version_option(__version__, prog_name="ateam")
 def main() -> None:
     """ATeam: durable intent, role-separated workers, human approval gates."""
@@ -366,7 +380,7 @@ def worker() -> None:
 @click.argument("contract_id")
 @click.option("--role", type=click.Choice(["build", "investigate", "test"]), required=True)
 @click.option("--cwd", "worktree", type=click.Path(file_okay=False, exists=True, path_type=Path), required=True, help="Worktree to run in.")
-@click.option("--base", default=None, help="Base commit for the diff and scope check (default: worktree HEAD).")
+@click.option("--base", default=None, help="Base commit for the diff and scope check (default: merge-base with the target branch).")
 @click.option("--tier", default=None, help="Override the contract's tier for this role.")
 @click.option("--resume", default=None, help="Resume a previous session id.")
 @click.option("--prompt", default=None, help="Override the default prompt.")
@@ -378,7 +392,7 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
     from ateam.contracts.store import load_contracts
     from ateam.records.store import load_records
     from ateam.roles import Role
-    from ateam.runner.run import prepare_worktree, run_contract_attempt
+    from ateam.runner.run import default_base, run_contract_attempt
     from ateam.tiers import load_tiers
 
     from ateam.gitops import GitError
@@ -394,20 +408,30 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
         linked = wt_git.is_linked_worktree()
     except GitError:
         linked = False
-    if not linked or wt_git.root.resolve() == ctx.paths.root.resolve():
+    target_root = ctx.paths.root.resolve()
+    if not linked or wt_git.root.resolve() == target_root:
         _fail(f"{worktree} is not an isolated worktree of the target; workers never run in the owner's checkout", code=4)
-    prepare_worktree(worktree)
+    if target_root in wt_git.root.resolve().parents:
+        _fail(f"{worktree} is inside the target checkout; create worktrees outside it", code=4)
+    wt_common = (wt_git.root / wt_git.run("rev-parse", "--git-common-dir").strip()).resolve()
+    target_git = (ctx.paths.root / ctx.git.run("rev-parse", "--git-dir").strip()).resolve()
+    if wt_common != target_git:
+        _fail(f"{worktree} is not a worktree of the target repository {ctx.paths.root}", code=4)
+    worktree = wt_git.root
     tiers = load_tiers(ctx.config.tiers)
     if tier and tier not in tiers:
         _fail(f"unknown tier {tier!r}; known: {', '.join(tiers)}")
     try:
         res, tree, scope, cp = asyncio.run(run_contract_attempt(
-            paths=ctx.paths, config=ctx.config, git_worktree=wt_git, worktree=worktree, base=base or wt_git.head(),
+            paths=ctx.paths, config=ctx.config, git_worktree=wt_git, worktree=worktree,
+            base=base or default_base(wt_git, ctx.config.target_branch),
             contract=contract, records=load_records(ctx.paths.records), role=Role(role), tiers=tiers,
             db=ctx.db, resume=resume, prompt=prompt, tier_override=tier,
         ))
     except ContractNotBinding as e:
         _fail(str(e), code=4)
+    except ValueError as e:
+        _fail(str(e))
     click.echo(f"session {res.session_id} subtype={res.subtype} turns={res.num_turns} cost=${res.cost_usd:.4f} wall={res.wall_s:.0f}s")
     if res.denials:
         click.echo("denials: " + "; ".join(res.denials))

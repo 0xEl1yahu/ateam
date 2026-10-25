@@ -82,6 +82,14 @@ def build_policy(worktree: Path, role: Role, contract: Contract, config: TargetC
     return Policy(worktree=worktree, role=role, allowed_paths=list(contract.paths), protected=list(config.protected_paths), bound=bound)
 
 
+def default_base(git_worktree: GitRepo, target_branch: str) -> str:
+    """The commit the worktree forked from: merge-base with the target branch, else HEAD."""
+    try:
+        return git_worktree.run("merge-base", target_branch, "HEAD").strip()
+    except Exception:  # noqa: BLE001
+        return git_worktree.head()
+
+
 def prepare_worktree(worktree: Path) -> None:
     """Create the worker's scratch directory and keep it out of git status (idempotent)."""
     git = GitRepo(worktree)
@@ -106,6 +114,7 @@ async def run_contract_attempt(
         tier, tier_name = tiers[tier_override][role], tier_override
     else:
         tier, tier_name = resolve(contract, role, tiers), contract.allocation.tier[role.value]
+    prepare_worktree(worktree)
     policy = build_policy(worktree, role, contract, config, records)
     selected = [records[ref.id] for ref in contract.records if ref.id in records]
     prev_raw = db.latest_checkpoint(contract.id)

@@ -52,3 +52,15 @@ def test_rejects_non_runnable_status(tmp_path, sample_contract, records_three):
     db.upsert_contract(frozen.id, frozen.plan, "integrated", frozen.content_hash())
     with pytest.raises(ContractNotBinding, match="integrated"):
         require_binding(frozen.model_copy(update={"status": "integrated"}), recs, db)
+
+
+def test_rejects_when_state_store_status_disagrees(tmp_path, sample_contract, records_three):
+    db = _db(tmp_path)
+    frozen, recs = _frozen(sample_contract, records_three)
+    db.upsert_contract(frozen.id, frozen.plan, frozen.status, frozen.content_hash())
+    db.transition("contract", frozen.id, "building", by="ateam")
+    db.transition("contract", frozen.id, "verifying", by="ateam")
+    db.transition("contract", frozen.id, "verified", by="ateam")
+    db.transition("contract", frozen.id, "integrated", by="ateam")
+    with pytest.raises(ContractNotBinding, match="integrated"):
+        require_binding(frozen, recs, db)   # file still says ready

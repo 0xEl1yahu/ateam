@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -22,8 +23,8 @@ DESTRUCTIVE_PATTERNS: list[str] = [
     r"\bgit\b(?:\s+(?:-[cC]\s*\S+|--?\S+))*\s+(?:push|merge|rebase|clean)\b",
     r"\bgit\b(?:\s+(?:-[cC]\s*\S+|--?\S+))*\s+stash(?!\s+(?:list|show)\b)",
     r"\bgit\b(?:\s+(?:-[cC]\s*\S+|--?\S+))*\s+reset\b[^\n;&|]*--hard",
-    r"\bgit\b(?:\s+(?:-[cC]\s*\S+|--?\S+))*\s+(?:checkout|restore)\b[^\n;&|]*\s\.(?:\s|$)",
-    r"\bgit\b(?:\s+(?:-[cC]\s*\S+|--?\S+))*\s+branch\b[^\n;&|]*\s-[dDM]\b",
+    r"\bgit\b(?:\s+(?:-[cC]\s*\S+|--?\S+))*\s+(?:checkout|restore)\b[^\n;&|]*\s(?:\.|\./|:/|'\*'|\*)(?:\s|$|[;&|])",
+    r"\bgit\b(?:\s+(?:-[cC]\s*\S+|--?\S+))*\s+branch\b[^\n;&|]*\s(?:-[dDMf]|--(?:delete|force|move))\b",
     r"\bdocker\s+compose\s+down\b",
     r"\bsudo\b",
     r"\bcurl\b.*\|\s*(?:ba|z)?sh\b",
@@ -34,32 +35,84 @@ DESTRUCTIVE_PATTERNS: list[str] = [
 
 INVESTIGATE_ALLOWED_PREFIXES: list[str] = [
     "git log", "git show", "git diff", "git blame", "git status", "git branch", "git rev-parse", "git ls-files",
-    "ls", "cat", "head", "tail", "grep", "rg", "find", "wc", "tree", "file", "stat", "pwd", "sort", "uniq", "cut", "awk", "sed -n",
+    "git stash list", "git stash show", "git grep",
+    "ls", "cat", "head", "tail", "grep", "rg", "find", "wc", "tree", "du", "file", "stat", "pwd", "sort", "uniq", "cut", "awk", "sed -n",
     'python -c "import', "python -m pytest --collect-only", "python --version",
+    'python3 -c "import', "python3 -m pytest --collect-only", "python3 --version",
 ]
 
-_SEGMENT_SPLIT = re.compile(r"\s*(?:&&|\|\||;|\n|\|)\s*")
 # A mention of a protected directory: at the start or after a separator-like character, any case.
-_PROTECTED_MENTION = re.compile(r"""(?i)(?:^|[\s/'"=:(`$])\.(?:ateam|claude)(?=$|[\s/'"\\);:`])""")
+_PROTECTED_MENTION = re.compile(r"(?i)(?<![\w-])\.(?:ateam|claude)(?![\w-])")
 # Anything that writes, in a segment that mentions a protected directory.
-_WRITE_OPS = re.compile(
-    r"""(?:>>?|<<|\btee\b|\bsed\b[^\n]*\s-[a-zA-Z]*i\b|\bcp\b|\bmv\b|\btouch\b|\brm\b|\bmkdir\b|\brmdir\b|\bchmod\b|\bchown\b|\bln\b|\binstall\b|\btruncate\b|\bdd\b|\bpatch\b|\bgit\s+(?:add|commit|checkout|restore|rm|mv|apply)\b)"""
+# Commands that change files or git state (no redirects here; redirect targets are checked separately).
+_MUTATORS = re.compile(
+    r"""(?:\btee\b|\bsed\b[^\n]*\s(?:-[a-zA-Z]*i\b|--in-place\b)|\bcp\b|\bmv\b|\btouch\b|\brm\b|\bmkdir\b|\brmdir\b|\bchmod\b|\bchown\b|\bln\b|\binstall\b|\btruncate\b|\bdd\b|\bpatch\b|\bgit\s+(?:add|commit|checkout|restore|rm|mv|apply)\b)"""
 )
+# Anything that writes at all, for roles that may not write (INVESTIGATE).
+_WRITE_OPS = re.compile(r"(?:>>?|<<|\s-o\b|\s--output\b|\s-fprint\b)|" + _MUTATORS.pattern)
+_REDIRECT_TARGET = re.compile(r">>?\s*(\S+)")
 _READ_PREFIX = re.compile(
-    r"^\s*(?:cat|head|tail|less|more|wc|grep|rg|ls|stat|file|diff|sort|uniq|cut|awk|sed\s+-n|git\s+(?:diff|show|log|blame|status|ls-files|grep))\b"
+    r"^\s*(?:cat|head|tail|less|more|wc|grep|rg|ls|stat|file|diff|sort|uniq|cut|awk|find|tree|du|sed\s+-n|git\s+(?:diff|show|log|blame|status|ls-files|grep|branch|stash\s+(?:list|show)))\b"
 )
+_HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n(.*?)(?:^|\n)\2(?:\n|$)", re.S)
+_GIT_GLOBAL_OPTS = re.compile(r"^(\s*git)(?:\s+(?:-[cC]\s*\S+|--?\S+))+(\s+)")
+_WRAPPERS = {"command", "env", "exec", "nice", "nohup", "time", "builtin"}
+_DANGEROUS_RM_TARGETS = {".", "./", "*", "./*", "/"}
 _CD = re.compile(r"^\s*(?:cd|pushd)\b")
 _GIT_BRANCH = re.compile(r"^\s*git\s+branch\b(?P<rest>.*)$")
 
 
-def _rm_recursive(segment: str) -> bool:
+def _split_segments(cmd: str) -> list[str]:
+    """Split on &&, ||, ;, | and newlines, but never inside single or double quotes."""
+    segments: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    i = 0
+    while i < len(cmd):
+        ch = cmd[i]
+        if quote:
+            buf.append(ch)
+            if ch == quote and (quote == "'" or cmd[i - 1] != "\\"):
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        two = cmd[i : i + 2]
+        if two in ("&&", "||"):
+            segments.append("".join(buf)); buf = []; i += 2; continue
+        if ch in (";", "|", "\n"):
+            segments.append("".join(buf)); buf = []; i += 1; continue
+        buf.append(ch)
+        i += 1
+    segments.append("".join(buf))
+    return [seg for seg in segments if seg.strip()]
+
+
+def _strip_heredocs(cmd: str) -> str:
+    """Drop heredoc bodies so file contents are not mistaken for commands."""
+    return _HEREDOC.sub(lambda m: m.group(0)[: m.start(3) - m.start(0)], cmd)
+
+
+def _normalise_git(segment: str) -> str:
+    """`git --no-pager -C x log` -> `git log`, so prefix rules see the verb."""
+    return _GIT_GLOBAL_OPTS.sub(r"\1\2", segment, count=1)
+
+
+def _rm_recursive(segment: str) -> tuple[bool, list[str]]:
+    """(is a recursive rm, its non-flag targets); sees through wrappers, paths and a leading backslash."""
     tokens = segment.split()
-    if not tokens or tokens[0] != "rm":
-        return False
-    for t in tokens[1:]:
-        if t == "--recursive" or (t.startswith("-") and not t.startswith("--") and ("r" in t or "R" in t)):
-            return True
-    return False
+    while tokens and tokens[0] in _WRAPPERS:
+        tokens = tokens[1:]
+    if not tokens or tokens[0].lstrip("\\").rsplit("/", 1)[-1] != "rm":
+        return False, []
+    recursive = any(
+        t == "--recursive" or (t.startswith("-") and not t.startswith("--") and ("r" in t or "R" in t)) for t in tokens[1:]
+    )
+    return recursive, [t for t in tokens[1:] if not t.startswith("-")]
 
 
 def _starts_with_prefix(segment: str, prefix: str) -> bool:
@@ -121,24 +174,50 @@ class Policy:
 
     # -- commands -----------------------------------------------------------
 
+    def _rm_wipes_tracked(self, targets: list[str]) -> tuple[bool, str]:
+        """A recursive rm may clear caches and build output, never tracked trees or anything outside the worktree."""
+        for t in targets:
+            if t in _DANGEROUS_RM_TARGETS or t.startswith(("/", "~")) or ".." in PurePosixPath(t).parts:
+                return True, f"recursive rm of {t!r} is not allowed"
+        if not targets:
+            return False, ""
+        try:
+            out = subprocess.run(
+                ["git", "ls-files", "-z", "--", *targets], cwd=self.worktree, text=True, capture_output=True, check=True
+            ).stdout
+        except (OSError, subprocess.CalledProcessError):
+            return True, "recursive rm refused: could not confirm the targets are untracked"
+        tracked = [x for x in out.split("\0") if x]
+        if tracked:
+            return True, f"recursive rm would delete tracked files ({tracked[0]}{', ...' if len(tracked) > 1 else ''})"
+        return False, ""
+
     def command_allowed(self, cmd: str) -> tuple[bool, str]:
         for pattern in DESTRUCTIVE_PATTERNS:
             if re.search(pattern, cmd):
                 return False, f"destructive command matched {pattern!r}"
-        segments = [seg for seg in _SEGMENT_SPLIT.split(cmd) if seg.strip()]
+        segments = _split_segments(_strip_heredocs(cmd))
         for seg in segments:
-            if _rm_recursive(seg):
-                return False, "recursive rm is not allowed"
+            recursive, targets = _rm_recursive(seg)
+            if recursive:
+                bad, why = self._rm_wipes_tracked(targets)
+                if bad:
+                    return False, why
             if _PROTECTED_MENTION.search(seg):
                 if _CD.match(seg):
                     return False, "changing directory into .ateam/ or .claude/ is not allowed"
-                if _WRITE_OPS.search(seg) or not _READ_PREFIX.match(seg):
+                if _MUTATORS.search(seg):
+                    return False, "shell access to .ateam/ or .claude/ is limited to reading"
+                if any(_PROTECTED_MENTION.search(t) for t in _REDIRECT_TARGET.findall(seg)):
+                    return False, "redirecting output into .ateam/ or .claude/ is not allowed"
+                if not _READ_PREFIX.match(_normalise_git(seg)):
                     return False, "shell access to .ateam/ or .claude/ is limited to reading"
         if self.role == Role.investigate:
             for seg in segments:
-                if not any(_starts_with_prefix(seg, p) for p in INVESTIGATE_ALLOWED_PREFIXES):
+                norm = _normalise_git(seg)
+                if not any(_starts_with_prefix(norm, p) for p in INVESTIGATE_ALLOWED_PREFIXES):
                     return False, f"INVESTIGATE may only run read-only inspection commands; {seg.strip()[:40]!r} is not allowed"
-                if _WRITE_OPS.search(seg) or not _git_branch_read_only(seg):
+                if _WRITE_OPS.search(norm) or not _git_branch_read_only(norm):
                     return False, f"INVESTIGATE may not write or change state; {seg.strip()[:40]!r} is not allowed"
         return True, ""
 

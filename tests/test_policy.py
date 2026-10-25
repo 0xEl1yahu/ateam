@@ -105,6 +105,31 @@ BUILD_MUST_DENY = [
     "find . -name '*.pyc' -exec rm {} \;",
     "git clean -fdx",
     "git branch -D main",
+    # second review: siblings
+    "echo h >.ateam/config.yaml",
+    "cat src/api/x.py >.ateam/contracts/C-0001.yaml",
+    "tee {.ateam,}/config.yaml < src/api/x.py",
+    "touch {.ateam,.claude}/x",
+    "chmod 000 .ateam>/dev/null",
+    "\\rm -rf src",
+    "/bin/rm -rf src",
+    "command rm -rf src",
+    "env rm -rf src",
+    "git branch --delete main",
+    "git branch -f main HEAD~5",
+    "git branch --move main old",
+    "git checkout -- ./",
+    "git restore ./",
+    "git restore :/",
+    "git restore '*'",
+    "git checkout .; echo done",
+    "git restore .&&ls",
+    "rm -rf /",
+    "rm -rf ~",
+    "rm -rf ../other",
+    "rm -rf *",
+    "rm -rf .",
+    "rm -rf /tmp/x",
 ]
 
 BUILD_MUST_ALLOW = [
@@ -121,6 +146,21 @@ BUILD_MUST_ALLOW = [
     "rm src/api/old.py",
     "find src -name '*.py' | wc -l",
     "echo 'progress: half' > .ateam-scratch/handoff.yaml",
+    # second review: false positives that must stay allowed
+    "rm -rf .pytest_cache",
+    "rm -r build",
+    "rm -rf dist *.egg-info",
+    "cat > src/api/x.py <<'EOF'\nRECORDS = '.ateam/records'\nEOF",
+    "find .ateam/records -name '*.yaml'",
+    "tree .ateam",
+    "du -sh .ateam",
+    "cat .ateam/config.yaml > /tmp/y",
+    "git checkout -- src/api/x.py",
+    "git checkout main",
+    "git restore --staged src",
+    "ls tests/.ateam_fixtures",
+    "python test_ateam.py",
+    "git --no-pager log --oneline -5",
 ]
 
 
@@ -148,6 +188,11 @@ INVESTIGATE_MUST_DENY = [
 ]
 
 INVESTIGATE_MUST_ALLOW = [
+    "git --no-pager log --oneline -5",
+    "git -C src log --oneline",
+    "git stash list",
+    "python3 --version",
+    'python3 -c "import sys; print(sys.version)"',
     "git log --oneline && ls src",
     "git branch --list",
     "git branch -a",

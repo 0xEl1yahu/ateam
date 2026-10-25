@@ -143,3 +143,46 @@ def test_schema_command_prints_json_schema():
     for kind in ("records", "contracts", "config"):
         r = run("schema", kind)
         assert r.exit_code == 0 and json.loads(r.output)["type"] == "object"
+
+
+
+def _frozen_target(cli_target):
+    run("records", "approve", "R-0001", "--target", str(cli_target))
+    run("contracts", "freeze", "C-0001", "--target", str(cli_target))
+
+
+def test_worker_run_refuses_foreign_and_nested_worktrees(cli_target, tmp_path):
+    _frozen_target(cli_target)
+    other = tmp_path / "other"; other.mkdir()
+    g = GitRepo(other); g.run("init", "-q", "-b", "main"); g.run("config", "user.email", "t@e"); g.run("config", "user.name", "t")
+    (other / "f").write_text("x"); g.run("add", "f"); g.run("commit", "-q", "-m", "i")
+    foreign_wt = tmp_path / "foreign-wt"; g.worktree_add(foreign_wt, "x", "main")
+    r = run("worker", "run", "C-0001", "--role", "build", "--cwd", str(foreign_wt), "--target", str(cli_target))
+    assert r.exit_code == 4 and "not a worktree of the target" in r.output
+    nested = cli_target / "nested-wt"; GitRepo(cli_target).worktree_add(nested, "nested", "main")
+    r2 = run("worker", "run", "C-0001", "--role", "build", "--cwd", str(nested), "--target", str(cli_target))
+    assert r2.exit_code == 4 and "inside the target" in r2.output
+
+
+def test_worker_run_uses_worktree_root_and_prepares_after_guards(cli_target, tmp_path):
+    _frozen_target(cli_target)
+    wt = tmp_path / "wt"; GitRepo(cli_target).worktree_add(wt, "wt-y", "main")
+    r = run("worker", "run", "C-0001", "--role", "investigate", "--cwd", str(wt / "src"), "--target", str(cli_target))
+    # investigate has no tier on this contract: clean refusal, exit 1, and no scratch dir created before the guards
+    assert r.exit_code == 1 and "no investigate tier" in r.output and "Traceback" not in r.output
+    assert not (wt / ".ateam-scratch").exists() and not (wt / "src/.ateam-scratch").exists()
+
+
+def test_default_base_is_merge_base_with_target_branch(cli_target, tmp_path):
+    from ateam.runner.run import default_base
+    wt = tmp_path / "wt"; g = GitRepo(cli_target); g.worktree_add(wt, "wt-z", "main")
+    fork = g.head()
+    (wt / "src/api/x.py").write_text("changed\n"); GitRepo(wt).run("add", "-A"); GitRepo(wt).run("commit", "-q", "-m", "work")
+    assert default_base(GitRepo(wt), "main") == fork
+
+
+def test_malformed_record_file_is_reported_by_every_command(cli_target):
+    (cli_target / ".ateam/records/notes.yaml").write_text("just: notes\n")
+    for args in (["records", "list"], ["records", "show", "R-0001"], ["records", "approve", "R-0001"], ["contracts", "freeze", "C-0001"], ["brief", "C-0001", "--role", "build"]):
+        r = run(*args, "--target", str(cli_target))
+        assert r.exit_code == 1 and "notes.yaml" in r.output and "Traceback" not in r.output, args

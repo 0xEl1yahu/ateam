@@ -22,6 +22,11 @@ def require_binding(contract: Contract, records: dict[str, Record], db: StateDB)
         raise ContractNotBinding(f"{contract.id} is a draft; freeze it first")
     if contract.status not in RUNNABLE:
         raise ContractNotBinding(f"{contract.id} is {contract.status}; only ready, building, failed or paused contracts run")
+    stored = db.contract_status(contract.id)
+    if stored not in RUNNABLE:
+        raise ContractNotBinding(f"{contract.id} is {stored} in the state store; only ready, building, failed or paused contracts run")
+    if stored != contract.status:
+        raise ContractNotBinding(f"{contract.id} file says {contract.status} but the state store says {stored}; the file was edited after freeze")
     if contract.content_hash() != frozen_hash:
         raise ContractNotBinding(f"{contract.id} differs from its frozen hash (hand edit after freeze); re-freeze with --force if intended")
     drifted = drift(contract, records)

@@ -18,7 +18,7 @@ Workers run in a clean room built from SDK options (no setting sources, strict M
 
 ## Commands
 
-Every command takes `--target PATH` (default: the current directory), which must contain an `.ateam/` directory.
+Every command except `ateam schema` takes `--target PATH` (default: the current directory), which must contain an `.ateam/` directory.
 
 ```bash
 ateam doctor --target ~/code/myrepo            # versions, target branch, workspace health
@@ -34,7 +34,7 @@ ateam contracts freeze C-0001 [--force]        # selects bound records, snapshot
 ateam contracts validate                       # hand edits and record drift against the freeze
 ateam schema records|contracts|config          # JSON Schema for editors
 ateam brief C-0001 --role build                # print the brief a worker would receive
-ateam worker run C-0001 --role build --cwd /path/to/worktree [--base REF] [--tier light] [--resume ID]
+ateam worker run C-0001 --role build --cwd /path/to/worktree [--base REF] [--tier light] [--resume ID]   # base defaults to the merge-base with the target branch
 ateam status
 ```
 
