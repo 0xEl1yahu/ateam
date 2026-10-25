@@ -13,11 +13,12 @@ def test_relative_rejects_escape(policy_build):
 
 def test_path_rules_per_role(policy_build, policy_test, policy_investigate):
     assert policy_build.path_writable("src/api/x.py")[0]
-    assert policy_build.path_writable(".ateam-scratch/handoff.yaml")[0]
+    assert not policy_build.path_writable(".ateam-scratch/handoff.yaml")[0]  # scratch lives outside the worktree now
     assert not policy_build.path_writable("src/data/y.py")[0]
     assert not policy_build.path_writable(".ateam/contracts/C-0001.yaml")[0]
     assert not policy_build.path_writable(".claude/settings.json")[0]
-    assert policy_test.path_writable(".ateam-scratch/notes.md")[0] and not policy_test.path_writable("src/api/x.py")[0]
+    assert not policy_test.path_writable(".ateam-scratch/notes.md")[0] and not policy_test.path_writable("src/api/x.py")[0]
+    assert "scratch directory" in policy_test.path_writable("src/api/x.py")[1]
     assert not policy_investigate.path_writable(".ateam-scratch/notes.md")[0]
 
 
@@ -156,7 +157,6 @@ BUILD_MUST_ALLOW = [
     "git rm src/api/old.py",
     "git rm -q --cached src/api/old.py",
     "find src -name '*.py' | wc -l",
-    "echo 'progress: half' > .ateam-scratch/handoff.yaml",
     # second review: false positives that must stay allowed
     "cat > src/api/x.py <<'EOF'\nRECORDS = '.ateam/records'\nEOF",
     "find .ateam/records -name '*.yaml'",

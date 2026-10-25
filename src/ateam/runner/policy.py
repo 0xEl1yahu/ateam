@@ -15,7 +15,6 @@ from ateam.roles import Role
 
 WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 READ_OR_WRITE_TOOLS = WRITE_TOOLS | {"Read"}
-SCRATCH = ".ateam-scratch/**"
 
 DESTRUCTIVE_PATTERNS: list[str] = [
     # git <global options>* <verb>; global options cover -C <dir>, -c k=v, --no-pager, etc.
@@ -174,12 +173,10 @@ class Policy:
     def path_writable(self, rel: str) -> tuple[bool, str]:
         if any(matches(g.lower(), rel.lower()) for g in self.protected):
             return False, f"{rel} is protected; contracts and records are read-only for workers"
-        if matches(SCRATCH, rel):
-            return (self.role != Role.investigate, "INVESTIGATE never writes files")
         if self.role == Role.investigate:
             return False, "INVESTIGATE never writes files"
         if self.role == Role.test:
-            return False, "TEST may write only under .ateam-scratch/"
+            return False, "TEST may write only in its scratch directory (outside the worktree)"
         if any(matches(g, rel) for g in self.allowed_paths):
             return True, ""
         return False, f"{rel} is outside the contract's declared paths"
