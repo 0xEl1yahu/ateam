@@ -13,7 +13,8 @@ import yaml
 
 from ateam.contracts.store import load_contracts
 from ateam.gitops import GitRepo
-from ateam.paths import home_dir
+from ateam.intent import commit_intent
+from ateam.paths import TargetPaths, home_dir
 from ateam.records.store import load_records, save_record
 from ateam.state.db import StateDB
 
@@ -25,7 +26,7 @@ def run(*args):
 def test_records_validate_reports_errors(cli_target, sample_record):
     bad = sample_record.model_copy(update={"id": "R-0002"})
     bad.binds.paths = ["./src/**"]
-    save_record(cli_target / ".ateam/records", bad)
+    save_record(TargetPaths.from_root(cli_target).records, bad)
     r = run("records", "validate", "--target", str(cli_target))
     assert r.exit_code == 1 and "ERROR R-0002" in r.output and "invalid glob" in r.output
 
@@ -44,7 +45,7 @@ def test_records_list_and_show(cli_target):
 def test_records_approve_commits_and_stores_hash(cli_target):
     r = run("records", "approve", "R-0001", "--target", str(cli_target))
     assert r.exit_code == 0, r.output
-    assert GitRepo(cli_target).run("log", "-1", "--format=%s").strip() == "ateam: approve R-0001"
+    assert GitRepo(TargetPaths.from_root(cli_target).intent).run("log", "-1", "--format=%s").strip() == "ateam: approve R-0001"
     db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
     assert "R-0001" in db.record_hashes()
 
@@ -52,8 +53,8 @@ def test_records_approve_commits_and_stores_hash(cli_target):
 def test_records_approve_shows_overlaps(cli_target, sample_record):
     run("records", "approve", "R-0001", "--target", str(cli_target))
     second = sample_record.model_copy(update={"id": "R-0002", "statement": "Books API returns JSON only"})
-    save_record(cli_target / ".ateam/records", second)
-    GitRepo(cli_target).commit_paths([".ateam"], "seed 2")
+    save_record(TargetPaths.from_root(cli_target).records, second)
+    commit_intent(TargetPaths.from_root(cli_target), "seed 2", ["records"])
     r = run("records", "approve", "R-0002", "--target", str(cli_target))
     assert r.exit_code == 0, r.output
     assert "Overlapping approved records:" in r.output and "R-0001" in r.output
@@ -61,7 +62,7 @@ def test_records_approve_shows_overlaps(cli_target, sample_record):
 
 def test_records_reject_and_guard_message(cli_target):
     r = run("records", "reject", "R-0001", "covered elsewhere", "--target", str(cli_target))
-    assert r.exit_code == 0 and load_records(cli_target / ".ateam/records")["R-0001"].status == "rejected"
+    assert r.exit_code == 0 and load_records(TargetPaths.from_root(cli_target).records)["R-0001"].status == "rejected"
     r2 = run("records", "approve", "R-0001", "--target", str(cli_target))
     assert r2.exit_code == 1 and "expected proposed" in r2.output
 
@@ -71,7 +72,7 @@ def test_contracts_show_and_freeze_selects_records(cli_target):
     assert "Expose reading state" in run("contracts", "show", "C-0001", "--target", str(cli_target)).output
     r = run("contracts", "freeze", "C-0001", "--target", str(cli_target))
     assert r.exit_code == 0 and "R-0001" in r.output, r.output
-    c = load_contracts(cli_target / ".ateam/contracts")["C-0001"]
+    c = load_contracts(TargetPaths.from_root(cli_target).contracts)["C-0001"]
     assert c.records[0].id == "R-0001" and c.records[0].hash and c.status == "ready"
     db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
     assert db.contract_status("C-0001") == "ready"
@@ -79,7 +80,7 @@ def test_contracts_show_and_freeze_selects_records(cli_target):
 
 def test_status_without_ateam_dir(tmp_path, ateam_home):
     r = run("status", "--target", str(tmp_path))
-    assert r.exit_code == 2 and "No .ateam/ directory" in r.output and "see README" in r.output
+    assert r.exit_code == 2 and "No intent repo" in r.output and "ateam intent init" in r.output
 
 
 def test_status_lists_contracts(cli_target):
@@ -94,7 +95,7 @@ def test_doctor_mentions_versions(cli_target):
 
 
 def test_records_validate_reports_malformed_file_without_traceback(cli_target):
-    (cli_target / ".ateam/records/notes.yaml").write_text("just: notes\n")
+    (TargetPaths.from_root(cli_target).records / "notes.yaml").write_text("just: notes\n")
     r = run("records", "validate", "--target", str(cli_target))
     assert r.exit_code == 1 and "ERROR" in r.output and "notes.yaml" in r.output and "Traceback" not in r.output
 
@@ -127,13 +128,13 @@ def test_contracts_validate_reports_hand_edit_and_drift(cli_target, sample_recor
     run("records", "approve", "R-0001", "--target", str(cli_target))
     run("contracts", "freeze", "C-0001", "--target", str(cli_target))
     assert run("contracts", "validate", "--target", str(cli_target)).exit_code == 0
-    c = load_contracts(cli_target / ".ateam/contracts")["C-0001"]
+    c = load_contracts(TargetPaths.from_root(cli_target).contracts)["C-0001"]
     from ateam.contracts.store import save_contract
-    save_contract(cli_target / ".ateam/contracts", c.model_copy(update={"title": "edited by hand"}))
+    save_contract(TargetPaths.from_root(cli_target).contracts, c.model_copy(update={"title": "edited by hand"}))
     r = run("contracts", "validate", "--target", str(cli_target))
     assert r.exit_code == 1 and "C-0001" in r.output and "hand edit" in r.output
-    save_contract(cli_target / ".ateam/contracts", c)
-    save_record(cli_target / ".ateam/records", load_records(cli_target / ".ateam/records")["R-0001"].model_copy(update={"statement": "changed"}))
+    save_contract(TargetPaths.from_root(cli_target).contracts, c)
+    save_record(TargetPaths.from_root(cli_target).records, load_records(TargetPaths.from_root(cli_target).records)["R-0001"].model_copy(update={"statement": "changed"}))
     r2 = run("contracts", "validate", "--target", str(cli_target))
     assert r2.exit_code == 1 and "drift" in r2.output and "R-0001" in r2.output
 
@@ -182,7 +183,7 @@ def test_default_base_is_merge_base_with_target_branch(cli_target, tmp_path):
 
 
 def test_malformed_record_file_is_reported_by_every_command(cli_target):
-    (cli_target / ".ateam/records/notes.yaml").write_text("just: notes\n")
+    (TargetPaths.from_root(cli_target).records / "notes.yaml").write_text("just: notes\n")
     for args in (["records", "list"], ["records", "show", "R-0001"], ["records", "approve", "R-0001"], ["contracts", "freeze", "C-0001"], ["brief", "C-0001", "--role", "build"]):
         r = run(*args, "--target", str(cli_target))
         assert r.exit_code == 1 and "notes.yaml" in r.output and "Traceback" not in r.output, args

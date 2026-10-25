@@ -30,7 +30,7 @@ class Context:
 
 def _context(target: Path, require_ateam: bool = True) -> Context:
     if require_ateam and not TargetPaths.from_root(target).exists():
-        click.echo(f"No .ateam/ directory in {target}. Create .ateam/records/ and .ateam/contracts/ (see README, Your first record and contract); ateam init arrives in pass two.")
+        click.echo(f"No intent repo for {target}. Run: ateam intent init")
         sys.exit(2)
     return Context(target)
 
@@ -121,7 +121,7 @@ def records_show(record_id: str, target: Path) -> None:
 def _service(ctx: Context):
     from ateam.records.service import RecordService
 
-    return RecordService(ctx.paths, ctx.git, ctx.config)
+    return RecordService(ctx.paths, ctx.config)
 
 
 def _print_overlaps(ctx: Context, record_id: str) -> None:
@@ -249,6 +249,13 @@ def contracts_freeze(contract_id: str, force: bool, target: Path) -> None:
     selected = select_records(cs[contract_id].paths, graph, ctx.paths.root)
     frozen = freeze(cs[contract_id], selected)
     save_contract(ctx.paths.contracts, frozen)
+    from ateam.intent import IntentError, commit_intent
+
+    try:
+        commit_intent(ctx.paths, f"ateam: freeze {frozen.id}", ["contracts"])
+    except IntentError as e:
+        if "nothing to commit" not in str(e):
+            _fail(str(e))
     ctx.db.upsert_contract(frozen.id, frozen.plan, frozen.status, frozen.content_hash())
     for r in selected:
         ctx.db.set_record_hash(r.id, r.content_hash())

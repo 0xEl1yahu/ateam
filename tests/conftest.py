@@ -13,8 +13,9 @@ def _git(cwd: Path, *args: str) -> str:
 
 
 @pytest.fixture
-def target_repo(tmp_path: Path) -> Path:
-    """A git repo on `main` with one commit, `src/`, `tests/` and an empty `.ateam/`."""
+def target_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A git repo on `main` with one commit and `src/`, `tests/`; its intent repo is initialised under ATEAM_HOME."""
+    monkeypatch.setenv("ATEAM_HOME", str(tmp_path / "ateam-home"))
     root = tmp_path / "target"
     root.mkdir()
     _git(root, "init", "-q", "-b", "main")
@@ -25,18 +26,26 @@ def target_repo(tmp_path: Path) -> Path:
     (root / "src" / "api" / "x.py").write_text("ROUTES = []\n")
     (root / "tests").mkdir()
     (root / "tests" / "test_app.py").write_text("def test_greet():\n    assert True\n")
-    (root / ".ateam" / "records").mkdir(parents=True)
-    (root / ".ateam" / "contracts").mkdir()
-    (root / ".ateam" / "records" / ".gitkeep").write_text("")
-    (root / ".ateam" / "contracts" / ".gitkeep").write_text("")
-    (root / ".gitignore").write_text(".ateam-scratch/\n__pycache__/\n")
+    (root / ".gitignore").write_text("__pycache__/\n")
     _git(root, "add", "-A")
     _git(root, "commit", "-q", "-m", "initial")
+    from ateam.intent import init_intent
+    from ateam.paths import TargetPaths
+
+    init_intent(TargetPaths.from_root(root))
     return root
 
 
 @pytest.fixture
+def target_paths(target_repo: Path):
+    from ateam.paths import TargetPaths
+
+    return TargetPaths.from_root(target_repo)
+
+
+@pytest.fixture
 def ateam_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Isolated ATeam home. `target_repo` sets the same path, so the two fixtures compose."""
     home = tmp_path / "ateam-home"
     monkeypatch.setenv("ATEAM_HOME", str(home))
     return home
@@ -87,18 +96,16 @@ def records_three(sample_record):
 
 
 @pytest.fixture
-def record_service(target_repo, sample_record):
-    """RecordService over target_repo with sample_record saved and committed as proposed."""
+def record_service(target_paths, sample_record):
+    """RecordService over the target's intent repo with sample_record committed as proposed."""
     from ateam.config import TargetConfig
-    from ateam.gitops import GitRepo
-    from ateam.paths import TargetPaths
+    from ateam.intent import commit_intent
     from ateam.records.service import RecordService
     from ateam.records.store import save_record
 
-    save_record(target_repo / ".ateam/records", sample_record)
-    git = GitRepo(target_repo)
-    git.commit_paths([".ateam"], "seed record")
-    return RecordService(TargetPaths.from_root(target_repo), git, TargetConfig())
+    save_record(target_paths.records, sample_record)
+    commit_intent(target_paths, "seed record", ["records"])
+    return RecordService(target_paths, TargetConfig())
 
 
 @pytest.fixture
@@ -124,15 +131,15 @@ def sample_contract():
 
 
 @pytest.fixture
-def cli_target(target_repo, ateam_home, sample_record, sample_contract):
-    """target_repo with sample_record (proposed) and sample_contract committed; ATEAM_HOME isolated."""
+def cli_target(target_repo, target_paths, sample_record, sample_contract):
+    """target_repo whose intent repo holds sample_record (proposed) and sample_contract, committed."""
     from ateam.contracts.store import save_contract
-    from ateam.gitops import GitRepo
+    from ateam.intent import commit_intent
     from ateam.records.store import save_record
 
-    save_record(target_repo / ".ateam/records", sample_record)
-    save_contract(target_repo / ".ateam/contracts", sample_contract)
-    GitRepo(target_repo).commit_paths([".ateam"], "seed")
+    save_record(target_paths.records, sample_record)
+    save_contract(target_paths.contracts, sample_contract)
+    commit_intent(target_paths, "seed", ["records", "contracts"])
     return target_repo
 
 
