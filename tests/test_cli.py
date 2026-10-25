@@ -904,6 +904,31 @@ def test_verify_forged_pending_marker_cannot_produce_verified(cli_target, tmp_pa
     assert _statuses(cli_target)[:2] == ("failed", "failed") and count.read_text().count("x") == 1
 
 
+def test_verify_marker_steps_and_start_are_never_trusted(cli_target, tmp_path):
+    import json
+    wt = _verify_setup(cli_target, tmp_path, [("unit", "true")])
+    _do_work(wt)
+    _, _, db = _statuses(cli_target)
+    db.set_meta("verify-pending:C-0001", json.dumps({
+        "status": "failed", "parent": "x", "subject": "ateam: verify C-0001 -> failed", "start": "ready",
+        "steps": ["building", "verifying", "verified"], "reason": "forged", "checkpoint": {}}))
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 1 and _statuses(cli_target)[:2] == ("failed", "failed")
+
+
+def test_verify_revert_uses_the_store_status_not_the_marker(cli_target, tmp_path):
+    import json
+    wt = _verify_setup(cli_target, tmp_path, [("unit", "false")])
+    _do_work(wt)
+    _, _, db = _statuses(cli_target)
+    db.set_meta("verify-pending:C-0001", json.dumps({
+        "status": "verified", "parent": "x", "subject": "s", "start": "verified", "steps": [], "reason": "forged",
+        "checkpoint": {}}))
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 1 and "C-0001 -> failed (implementation)" in r.output
+    assert _statuses(cli_target)[:2] == ("failed", "failed")
+
+
 def test_verify_killed_during_its_checks_is_recorded_as_tamper(cli_target, tmp_path):
     import json
     wt = _verify_setup(cli_target, tmp_path, [("unit", "true")])

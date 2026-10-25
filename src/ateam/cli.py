@@ -1045,11 +1045,16 @@ def verify(contract_id: str, worktree: Path, target: Path) -> None:
             _fail(f"an earlier verify of {contract_id} was interrupted and the intent repo has uncommitted changes "
                   f"({', '.join(path for _, path in dirty)}); review them, commit or discard them, and re-run", code=4)
         marker = json.loads(pending_raw or running_raw)
-        before_status = marker["start"]
+        # The walk starts from the store, never from the marker: a marker can be forged by a check.
+        before_status = ctx.db.contract_status(contract_id)
+        if before_status not in ("ready", "building", "failed"):
+            _fail(f"an earlier verify of {contract_id} was interrupted and the state store says {before_status}; "
+                  "investigate before verifying again", code=4)
         if pending_raw and marker["status"] == ContractStatus.failed:
-            set_file_status(contract, "failed", marker["subject"])
-            ctx.db.finish_verification(contract_id, before_status, marker["steps"], by="verify", reason=marker["reason"],
-                                       checkpoint=marker["checkpoint"], clear_keys=[pending_key, running_key])
+            set_file_status(contract, "failed", f"ateam: verify {contract_id} -> failed")
+            ctx.db.finish_verification(contract_id, before_status, v.walk_to(before_status, "failed"), by="verify",
+                                       reason=str(marker.get("reason", ""))[:500], checkpoint=marker["checkpoint"],
+                                       clear_keys=[pending_key, running_key])
             click.echo(f"recovered: an interrupted verify had judged {contract_id} failed; the state store now agrees")
             sys.exit(1)
         if not pending_raw:
@@ -1068,8 +1073,7 @@ def verify(contract_id: str, worktree: Path, target: Path) -> None:
             click.echo(f"{contract_id} -> failed (tamper)")
             sys.exit(1)
         set_file_status(contract, before_status, f"ateam: verify {contract_id} interrupted; back to {before_status}")
-        ctx.db.delete_meta(pending_key)
-        ctx.db.delete_meta(running_key)
+        ctx.db.delete_meta(pending_key, running_key)
         contract = load_contracts(ctx.paths.contracts)[contract_id]
         click.echo(f"note: an earlier verify of {contract_id} was interrupted before it was recorded; verifying again")
 
@@ -1139,8 +1143,7 @@ def verify(contract_id: str, worktree: Path, target: Path) -> None:
         commit_intent(ctx.paths, subject, [rel])
     except (IntentError, GitError) as e:
         if "nothing to commit" not in str(e):
-            ctx.db.delete_meta(pending_key)
-            ctx.db.delete_meta(running_key)
+            ctx.db.delete_meta(pending_key, running_key)
             click.echo(f"error: could not commit the verification in the intent repo: {e}")
             click.echo("Nothing was recorded in the state store. Restore the contract file and re-run:")
             click.echo(f"  git -C \"{ctx.paths.intent}\" checkout -- {rel}")

@@ -96,7 +96,8 @@ def _run_one(check: NamedCheck, cwd: Path, env: dict[str, str], timeout: float) 
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
-        _kill_group(proc.pid)
+        finally:
+            _kill_group(proc.pid)   # also on Ctrl-C: a check never outlives verify
         if timed_out:
             proc.wait()
         size = out.seek(0, os.SEEK_END)

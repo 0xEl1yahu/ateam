@@ -97,8 +97,8 @@ def test_fingerprint_is_scoped_to_one_contract_plus_record_hashes(tmp_path):
 
 def test_delete_meta(tmp_path):
     db = fresh(tmp_path)
-    db.set_meta("k", "v"); db.delete_meta("k"); db.delete_meta("absent")
-    assert db.get_meta("k") is None
+    db.set_meta("k", "v"); db.set_meta("j", "w"); db.delete_meta("k", "j", "absent")
+    assert db.get_meta("k") is None and db.get_meta("j") is None
 
 
 def test_record_hashes(tmp_path):

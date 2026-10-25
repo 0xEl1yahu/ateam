@@ -48,6 +48,29 @@ def test_run_checks_kills_background_children_when_the_check_ends(tmp_path):
     assert not (tmp_path / "late").exists()
 
 
+def test_run_checks_kills_the_group_when_interrupted(tmp_path, monkeypatch):
+    import subprocess
+    pidfile = tmp_path / "pid"
+
+    def interrupted(self, timeout=None):
+        time.sleep(0.5)
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as m:
+        m.setattr(subprocess.Popen, "wait", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            run_checks([_check("slow", f"sleep 30 & echo $! > {pidfile}; wait")], tmp_path, dict(os.environ))
+    pid = int(pidfile.read_text())
+    for _ in range(40):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail("Ctrl-C left the check running")
+
+
 def test_run_checks_timeout_is_environment_and_kills_the_process_group(tmp_path):
     pidfile = tmp_path / "pid"
     [r] = run_checks([_check("slow", f"sleep 30 & echo $! > {pidfile}; wait")], tmp_path, dict(os.environ), timeout=1)

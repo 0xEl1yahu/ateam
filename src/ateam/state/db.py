@@ -107,9 +107,11 @@ class StateDB:
         row = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return row["value"] if row else None
 
-    def delete_meta(self, key: str) -> None:
+    def delete_meta(self, *keys: str) -> None:
+        """Remove every key in one transaction."""
         with self.conn:
-            self.conn.execute("DELETE FROM meta WHERE key=?", (key,))
+            for key in keys:
+                self.conn.execute("DELETE FROM meta WHERE key=?", (key,))
 
     # -- records ------------------------------------------------------------
 
