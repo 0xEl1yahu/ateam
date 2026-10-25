@@ -36,7 +36,7 @@
 src/ateam/plans/__init__.py
 src/ateam/plans/model.py         Plan, PlanStatus, PlanHistoryEntry
 src/ateam/plans/store.py         load_plans(), save_plan(), next_id("P")
-src/ateam/allocation.py          Level maps, tier_for_complexity(), investigate_tier_for(), test_tier_for(), check_allocation()
+src/ateam/allocation.py          Level maps, tier_for_complexity(), investigate_tier_for(), tier_for_test(), check_allocation()
 src/ateam/data/rubric.md         the one-page rubric the planner reads and the owner can edit
 src/ateam/runner/policy.py       INVESTIGATE allow-list without interpreters, sed or awk (modify)
 src/ateam/runner/snapshot.py     CheckoutSnapshot: status, HEAD, stash list; take(), changed()

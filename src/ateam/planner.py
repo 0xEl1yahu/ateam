@@ -12,7 +12,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from ateam.allocation import check_allocation, default_tiers, investigate_tier_for
+from ateam.allocation import check_allocation, default_tiers, investigate_tier_for, tier_for_complexity, tier_for_test
 from ateam.config import TargetConfig
 from ateam.contracts.model import Acceptance, Allocation, Budget, Contract, ContractStatus, Level
 from ateam.contracts.select import select_records
@@ -75,7 +75,9 @@ def report_to_plan(
     for i, c in enumerate(raw):
         title = c.get("title") or f"contract #{i}"
         for d in c.get("depends_on", []):
-            if not isinstance(d, int) or not (0 <= d < len(raw)) or d == i:
+            if isinstance(d, int) and d == i:
+                fatal.append(f"{title}: depends on itself")
+            elif not isinstance(d, int) or not (0 <= d < len(raw)):
                 fatal.append(f"{title}: depends_on index {d} is out of range")
         for name in c.get("checks", []):
             if name not in known_checks:
@@ -106,10 +108,15 @@ def report_to_plan(
         if tier.get("build") not in ORDER:
             notes.append(f"{cid}: build tier {tier.get('build')!r} unknown; set to {defaults['build']!r} from complexity")
             tier["build"] = defaults["build"]
+        floor = tier_for_complexity(alloc.complexity)
+        if at_least(tier["build"], floor) != tier["build"]:
+            notes.append(f"{cid}: build tier raised from {tier['build']!r} to {floor!r} ({alloc.complexity} complexity, per the rubric)")
+            tier["build"] = floor
         test = tier.get("test")
-        wanted = at_least(tier["build"], test if test in ORDER else "light")
+        wanted = at_least(tier_for_test(alloc.risk, tier["build"]), test if test in ORDER else "light")
         if wanted != test:
-            notes.append(f"{cid}: test tier raised from {test!r} to {wanted!r} (TEST never runs below BUILD)")
+            why = "TEST never runs below BUILD" if wanted == tier["build"] and alloc.risk == Level.low else f"{alloc.risk} risk, per the rubric"
+            notes.append(f"{cid}: test tier raised from {test!r} to {wanted!r} ({why})")
             tier["test"] = wanted
         inv = tier.get("investigate", "none")
         if inv == "none" and Level(alloc.uncertainty) in (Level.medium, Level.high):
@@ -128,7 +135,7 @@ def report_to_plan(
                     notes.append(f"{cid}: acceptance {a.id} names {file_part}, outside the contract's paths; a BUILD worker could not write it")
         contracts.append(Contract(
             id=cid, plan=plan_id, title=c["title"], status=ContractStatus.draft,
-            depends_on=[ids[d] for d in c.get("depends_on", [])], paths=list(c["paths"]), incidental=list(c.get("incidental", [])),
+            depends_on=list(dict.fromkeys(ids[d] for d in c.get("depends_on", []))), paths=list(c["paths"]), incidental=list(c.get("incidental", [])),
             acceptance=acceptance, checks=[known_checks[n] for n in c.get("checks", [])], allocation=alloc, budget=budget,
         ))
 

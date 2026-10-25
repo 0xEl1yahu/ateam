@@ -19,7 +19,8 @@ def test_discovery_and_planner_specs_are_investigate_and_strict():
     for spec in (DISCOVERY_SPEC, PLANNER_SPEC):
         assert spec.role == Role.investigate and spec.tools == ["Read", "Glob", "Grep", "Bash"]
         assert spec.report_schema["additionalProperties"] is False
-        assert "ATeam binding record" in spec.system_prompt and "never modify" in spec.system_prompt.lower() or "never" in spec.system_prompt.lower()
+        assert "ATeam binding record" in spec.system_prompt
+        assert "never modify files or state" in spec.system_prompt.lower()
     assert set(DISCOVERY_SCHEMA["properties"]) == {"candidates", "unknowns", "notes"}
     cand = DISCOVERY_SCHEMA["properties"]["candidates"]["items"]["properties"]
     assert set(cand) == {"kind", "statement", "rationale", "origin", "basis", "evidence", "paths", "serves", "confidence"}
@@ -88,9 +89,11 @@ async def test_run_investigation_closes_attempt_on_exception(monkeypatch, inv_en
     async def fake_query(prompt, options):
         yield _result({"candidates": [], "unknowns": [], "notes": "n"})
 
-    monkeypatch.setattr("ateam.runner.run.query", fake_query)
-    monkeypatch.setattr("ateam.runner.investigate.take", lambda git: (_ for _ in ()).throw(RuntimeError("git exploded")))
+    async def boom(prompt, options, policy):
+        raise RuntimeError("session exploded")
+
+    monkeypatch.setattr("ateam.runner.investigate.run_worker", boom)
     with pytest.raises(RuntimeError):
         await _run(inv_env)
     rows = inv_env["db"].telemetry_rows()
-    assert rows == [] or rows[-1]["outcome"] in ("failed", None)
+    assert rows and rows[-1]["outcome"] == "failed" and rows[-1]["failure_class"] == "environment"

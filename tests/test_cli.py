@@ -394,12 +394,13 @@ def test_plan_command_invalid_report_rejects_and_writes_nothing(monkeypatch, cli
     bad = _canned_plan(); bad["contracts"][0]["depends_on"] = [0]
     _patch_investigation(monkeypatch, bad)
     p = TargetPaths.from_root(cli_target)
-    before = GitRepo(p.intent).head()
     r = run("plan", "add a health function", "--target", str(cli_target))
     assert r.exit_code == 1 and "cycle" in r.output
-    assert "P-0001" not in load_plans(p.plans) and "C-0002" not in load_contracts(p.contracts) and GitRepo(p.intent).head() == before
+    # no contract and no proposed record is written; the plan itself is recorded as rejected so the id is not reused
+    assert "C-0002" not in load_contracts(p.contracts) and load_plans(p.plans)["P-0001"].status == "plan_rejected"
+    assert load_plans(p.plans)["P-0001"].contracts == [] and GitRepo(p.intent).is_clean()
     db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
-    assert db.feature_status("P-0001") == "plan_rejected"
+    assert db.feature_status("P-0001") == "plan_rejected" and db.contract_hash("C-0002") is None
 
 
 # ---- stage 2: approve and reject a plan
@@ -482,3 +483,61 @@ def test_status_lists_plans(monkeypatch, cli_target):
     _proposed_plan(monkeypatch, cli_target)
     out = run("status", "--target", str(cli_target)).output
     assert "P-0001" in out and "plan_proposed" in out and "1 contract" in out
+
+
+
+# ---- review round: plan retry after failure, approve commit failure, records review --all
+
+def test_plan_can_be_rerun_after_an_invalid_report(monkeypatch, cli_target):
+    from ateam.plans.store import load_plans
+    bad = _canned_plan(); bad["contracts"][0]["depends_on"] = [0]
+    _patch_investigation(monkeypatch, bad)
+    assert run("plan", "add a health function", "--target", str(cli_target)).exit_code == 1
+    p = TargetPaths.from_root(cli_target)
+    plans = load_plans(p.plans)
+    assert plans["P-0001"].status == "plan_rejected"          # the failure is visible as a plan file
+    assert "P-0001" in run("plans", "list", "--target", str(cli_target)).output
+    _patch_investigation(monkeypatch, _canned_plan())
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert load_plans(p.plans)["P-0002"].status == "plan_proposed"
+
+
+def test_plan_crash_in_investigation_leaves_terminal_state_and_rerun_works(monkeypatch, cli_target):
+    from ateam.plans.store import load_plans
+    from ateam.runner import investigate as inv_mod
+
+    async def boom(**kw):
+        raise RuntimeError("sdk exploded")
+
+    monkeypatch.setattr("ateam.cli.run_investigation", boom)
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 1 and "sdk exploded" in r.output and "Traceback" not in r.output
+    p = TargetPaths.from_root(cli_target)
+    assert load_plans(p.plans)["P-0001"].status == "plan_rejected"
+    _patch_investigation(monkeypatch, _canned_plan())
+    assert run("plan", "add a health function", "--target", str(cli_target)).exit_code == 0
+
+
+def test_approve_commit_failure_prints_recovery_and_leaves_store_untouched(monkeypatch, cli_target):
+    p = _proposed_plan(monkeypatch, cli_target)
+    from ateam.intent import IntentError
+
+    def fail_commit(paths, message, subpaths):
+        raise IntentError("simulated commit failure")
+
+    monkeypatch.setattr("ateam.cli.commit_intent", fail_commit, raising=False)
+    import ateam.cli as cli_mod
+    monkeypatch.setattr(cli_mod, "_commit_intent", fail_commit, raising=False)
+    r = run("approve", "P-0001", "--skip-records", "--target", str(cli_target))
+    assert r.exit_code == 1 and "git -C" in r.output and "checkout" in r.output
+    db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
+    assert db.feature_status("P-0001") == "plan_proposed" and db.contract_hash("C-0002") is None
+
+
+def test_records_review_all_shows_non_proposed_without_prompting(cli_target):
+    run("records", "approve", "R-0001", "--target", str(cli_target))
+    r = run("records", "review", "--all", "--target", str(cli_target), input="")
+    assert r.exit_code == 0 and "R-0001" in r.output and "approved" in r.output and "nothing to decide" in r.output.lower()
+    r2 = run("records", "review", "--target", str(cli_target), input="")
+    assert "nothing proposed" in r2.output.lower()

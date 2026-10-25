@@ -43,10 +43,18 @@ def candidates_to_records(
     now = datetime.now(UTC)
 
     for cand in candidates:
+        if not str(cand.get("statement") or "").strip():
+            result.dropped.append((cand, "empty statement"))
+            continue
         try:
             evidence = [Evidence.model_validate(e) for e in cand.get("evidence", [])]
-        except ValidationError as e:
-            result.dropped.append((cand, f"invalid evidence: {str(e).splitlines()[0]}"))
+            origin = Origin(cand.get("origin", "inferred"))
+            basis = Basis(cand.get("basis", "observation"))
+        except (ValidationError, ValueError) as e:
+            result.dropped.append((cand, f"invalid origin, basis or evidence: {str(e).splitlines()[0]}"))
+            continue
+        if not evidence:
+            result.dropped.append((cand, "no evidence cited; a record needs at least one reference"))
             continue
         fingerprint = compute_fingerprint(evidence)
         if fingerprint in known:
@@ -54,6 +62,7 @@ def candidates_to_records(
                 result.skipped_rejected.append(known[fingerprint].id)
             continue
         if fingerprint in seen_batch:
+            result.dropped.append((cand, "duplicate of an earlier candidate in this batch (same evidence)"))
             continue
 
         paths = list(cand.get("paths") or [])
@@ -62,13 +71,11 @@ def candidates_to_records(
             result.dropped.append((cand, f"dead glob {dead[0]!r}: matches no file in the target"))
             continue
 
-        origin = Origin(cand.get("origin", "inferred"))
         rationale = cand.get("rationale") or None
         if origin == Origin.documented and not any(e.type in DOCUMENTED_EVIDENCE for e in evidence):
             origin = Origin.inferred
             rationale = f"{rationale or ''} (downgraded: no documentary evidence)".strip()
-        basis = Basis(cand.get("basis", "observation"))
-        if evidence and all(e.type in _CODE_ONLY for e in evidence):
+        if all(e.type in _CODE_ONLY for e in evidence):
             basis = Basis.observation
 
         if not paths:

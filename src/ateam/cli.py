@@ -11,6 +11,7 @@ from ateam import SPIKED_CLI_VERSION, __version__
 from ateam.config import TargetConfig, load_config
 from ateam.gitops import GitRepo
 from ateam.paths import TargetPaths, home_dir, lookup_target, normalise_remote, origin_url, record_target, repo_id, repo_id_source
+from ateam.intent import IntentError, commit_intent, require_clean
 from ateam.runner.investigate import run_investigation
 from ateam.state.db import StateDB
 
@@ -175,7 +176,7 @@ def _derivation(target: Path) -> str:
 def _records_index(records) -> str:
     approved = [r for r in records.values() if r.status == "approved"]
     if not approved:
-        return "Approved records: none yet."
+        return "Approved records: none yet; no approved records apply to any path in this target."
     lines = ["Approved records (id, kind, binds, statement):"]
     lines += [f"- {r.id} {r.kind} [{', '.join(r.binds.paths) or 'global'}] {r.statement.strip()}" for r in sorted(approved, key=lambda r: r.id)]
     return "\n".join(lines)
@@ -191,7 +192,7 @@ def init(remote: str | None, max_candidates: int, tier: str, target: Path) -> No
     import asyncio
 
     from ateam.discovery import candidates_to_records, render_discovery_report
-    from ateam.intent import IntentError, commit_intent, init_intent
+    from ateam.intent import init_intent
     from ateam.records.store import load_records, save_record
     from ateam.roles import DISCOVERY_SPEC, Role
     from ateam.tiers import load_tiers
@@ -245,7 +246,6 @@ def plan(request: str, tier: str, target: Path) -> None:
 
     from ateam.allocation import rubric_text
     from ateam.contracts.store import save_contract
-    from ateam.intent import commit_intent
     from ateam.planner import PlanError, render_plan_review, report_to_plan
     from ateam.plans.store import next_id as next_plan_id
     from ateam.plans.store import save_plan
@@ -253,8 +253,15 @@ def plan(request: str, tier: str, target: Path) -> None:
     from ateam.roles import PLANNER_SPEC, Role
     from ateam.tiers import load_tiers
 
+    from datetime import UTC, datetime
+
+    from ateam.plans.model import Plan, PlanHistoryEntry, PlanStatus
+
     ctx = _context(target)
-    pid = next_plan_id(ctx.paths.plans)
+    disk_next = int(next_plan_id(ctx.paths.plans).split("-")[1])
+    db_max = ctx.db.max_feature_id()
+    db_next = int(db_max.split("-")[1]) + 1 if db_max else 1
+    pid = f"P-{max(disk_next, db_next):04d}"
     ctx.db.transition("feature", pid, "requested", by="owner", reason=request[:200])
     ctx.db.transition("feature", pid, "investigating", by="ateam")
     records = load_records(ctx.paths.records)
@@ -266,15 +273,30 @@ def plan(request: str, tier: str, target: Path) -> None:
         "Tier names: light, standard, careful; investigate may also be none.",
         "Allocation rubric:\n" + rubric_text(),
     ])
-    result = asyncio.run(run_investigation(
-        paths=ctx.paths, config=ctx.config, target_git=ctx.git, name=pid, spec=PLANNER_SPEC,
-        prompt="Produce the plan for the feature request in your brief.", brief_text=brief,
-        tier=tiers[tier][Role.investigate], db=ctx.db, tier_name=tier,
-    ))
-
     def _rejected(reason: str) -> None:
-        ctx.db.transition("feature", pid, "plan_proposed", by="ateam")
-        ctx.db.transition("feature", pid, "plan_rejected", by="ateam", reason=reason)
+        """Leave a visible, terminal trace: a rejected plan file (committed) and the feature state."""
+        rejected = Plan(id=pid, title=request[:80], request=request, status=PlanStatus.plan_rejected,
+                        history=[PlanHistoryEntry(at=datetime.now(UTC), by="ateam", to=PlanStatus.plan_rejected, why=reason)])
+        save_plan(ctx.paths.plans, rejected)
+        try:
+            commit_intent(ctx.paths, f"ateam: reject plan {pid} ({reason})", ["plans"])
+        except IntentError:
+            pass
+        current = ctx.db.feature_status(pid)
+        if current == "investigating":
+            ctx.db.transition("feature", pid, "plan_proposed", by="ateam")
+        if ctx.db.feature_status(pid) == "plan_proposed":
+            ctx.db.transition("feature", pid, "plan_rejected", by="ateam", reason=reason)
+
+    try:
+        result = asyncio.run(run_investigation(
+            paths=ctx.paths, config=ctx.config, target_git=ctx.git, name=pid, spec=PLANNER_SPEC,
+            prompt="Produce the plan for the feature request in your brief.", brief_text=brief,
+            tier=tiers[tier][Role.investigate], db=ctx.db, tier_name=tier,
+        ))
+    except Exception as e:  # noqa: BLE001  the session is the untrusted part; never leave the plan half-open
+        _rejected(f"planner session failed: {type(e).__name__}")
+        _fail(f"planning failed before any report: {e}. Re-run: ateam plan \"{request}\"")
 
     if result.tampered:
         _rejected("planner changed the checkout or intent repo")
@@ -347,7 +369,7 @@ def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, targe
     from ateam.contracts.model import Level
     from ateam.contracts.select import freeze, select_records
     from ateam.contracts.store import load_contracts, save_contract
-    from ateam.intent import IntentError, commit_intent, require_clean
+    from ateam.gitops import GitError
     from ateam.plans.model import PlanHistoryEntry, PlanStatus
     from ateam.plans.store import load_plans, save_plan
     from ateam.records.graph import RecordGraph
@@ -381,6 +403,7 @@ def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, targe
     records = load_records(ctx.paths.records)
     graph = RecordGraph(records)
     notes: list[str] = []
+    frozen_all: list[tuple] = []
     click.echo("Frozen contracts, in dependency order:")
     for cid in _dependency_order({cid: cs[cid] for cid in plan_.contracts}):
         c = cs[cid]
@@ -398,9 +421,7 @@ def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, targe
         selected = select_records(c.paths, graph, ctx.paths.root)
         frozen = freeze(c, selected)
         save_contract(ctx.paths.contracts, frozen)
-        ctx.db.upsert_contract(frozen.id, frozen.plan, frozen.status, frozen.content_hash())
-        for r in selected:
-            ctx.db.set_record_hash(r.id, r.content_hash())
+        frozen_all.append((frozen, selected))
         click.echo(f"  {frozen.id}  {frozen.status:<6} build={tier['build']} test={tier['test']} investigate={tier.get('investigate', 'none')}  records: {', '.join(r.id for r in selected) or 'none'}")
     for n in notes:
         click.echo(f"  note: {n}")
@@ -409,7 +430,18 @@ def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, targe
         "history": [*plan_.history, PlanHistoryEntry(at=datetime.now(UTC), by="owner", to=PlanStatus.plan_approved)],
     })
     save_plan(ctx.paths.plans, plan_)
-    commit_intent(ctx.paths, f"ateam: approve plan {plan_id}", ["plans", "contracts"])
+    try:
+        commit_intent(ctx.paths, f"ateam: approve plan {plan_id}", ["plans", "contracts"])
+    except (IntentError, GitError) as e:
+        click.echo(f"error: could not commit the approval in the intent repo: {e}")
+        click.echo(f"Nothing was recorded in the state store. Restore the intent repo and re-run:")
+        click.echo(f"  git -C \"{ctx.paths.intent}\" checkout -- . && git -C \"{ctx.paths.intent}\" clean -fd plans contracts")
+        sys.exit(1)
+    # The intent repo is the truth; only now does the state store follow it.
+    for frozen, selected in frozen_all:
+        ctx.db.upsert_contract(frozen.id, frozen.plan, frozen.status, frozen.content_hash())
+        for r in selected:
+            ctx.db.set_record_hash(r.id, r.content_hash())
     ctx.db.transition("feature", plan_id, "plan_approved", by="owner")
     click.echo(f"{plan_id} -> plan_approved")
 
@@ -422,7 +454,6 @@ def reject(plan_id: str, reason: str, target: Path) -> None:
     """Reject a proposed plan. Its contracts stay draft and are never frozen."""
     from datetime import UTC, datetime
 
-    from ateam.intent import IntentError, commit_intent, require_clean
     from ateam.plans.model import PlanHistoryEntry, PlanStatus
     from ateam.plans.store import load_plans, save_plan
 
@@ -588,13 +619,23 @@ def _lifecycle(ctx: Context, action, *records_out: str) -> None:
 @TARGET_OPTION
 def records_review(review_all: bool, target: Path) -> None:
     """Walk through proposed records: approve as requirement or observation, reject with a reason, or skip."""
-    from ateam.records.lifecycle import LifecycleError
-    from ateam.records.model import Basis
     from ateam.records.store import load_records
 
     ctx = _context(target)
+    recs = load_records(ctx.paths.records)
+    proposed = [rid for rid, r in sorted(recs.items()) if r.status == "proposed"]
+    if review_all:
+        for rid, r in sorted(recs.items()):
+            if r.status != "proposed":
+                click.echo(f"{rid}  {r.status:<10} {r.statement.strip()[:90]}")
+        if not proposed:
+            click.echo("Nothing to decide: no proposed records.")
+            return
+    elif not proposed:
+        click.echo("Nothing proposed. Run ateam init or ateam plan to get proposals.")
+        return
     counts = {"approved": 0, "rejected": 0, "skipped": 0}
-    _review_records(ctx, [rid for rid, r in sorted(load_records(ctx.paths.records).items()) if review_all or r.status == "proposed"], counts)
+    _review_records(ctx, proposed, counts)
     click.echo(f"approved {counts['approved']}, rejected {counts['rejected']}, skipped {counts['skipped']}")
 
 
@@ -710,8 +751,6 @@ def contracts_freeze(contract_id: str, force: bool, target: Path) -> None:
         _fail(f"unknown contract {contract_id}")
     if cs[contract_id].status != ContractStatus.draft and not force:
         _fail(f"{contract_id} is already frozen ({cs[contract_id].status}); pass --force to re-freeze and reset it")
-    from ateam.intent import IntentError, commit_intent, require_clean
-
     recs = load_records(ctx.paths.records)
     try:
         require_clean(ctx.paths)

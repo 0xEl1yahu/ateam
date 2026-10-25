@@ -1,10 +1,10 @@
-# First-run walkthrough (pass one)
+# First-run walkthrough
 
 Date: 2026-10-25. Status: draft for the owner's first hands-on test.
 
 This walks the pass-one slice end to end on a scratch repository, then tells you how to point ATeam at a real one. Every step says what you should see. Where behaviour differs, that is a finding worth noting.
 
-What exists today: records, contracts, approval commits, freezing, briefs, a single clean-room worker run, the policy gate, the tree and scope check, and telemetry. What does not exist yet: `ateam init`, `ateam plan`, the scheduler, the verifier that runs checks plus the TEST role as a gate, integration and merge approval. Those are pass two.
+What exists today: the private intent repo, discovery (`ateam init`), the planner (`ateam plan` and `ateam approve`), records and contracts, briefs, a single clean-room worker run, the policy gate, the tree and scope check, and telemetry. What does not exist yet: the scheduler, the verifier that runs checks plus the TEST role as a gate, integration and merge approval, event logs and the tmux viewer.
 
 ## 0. Setup (two minutes)
 
@@ -51,7 +51,13 @@ Expected: `ateam status` exits 2 with `No intent repo for ... Run: ateam intent 
 ```bash
 ateam intent init          # prints the intent repo path and "nothing was written into the target repository"
 I=$(ateam intent path)
-ateam status               # Features: none / Contracts: none, exit 0
+cat > "$I/config.yaml" <<'EOF'
+target_branch: main
+checks:
+  - {name: unit, cmd: "python3 -m unittest discover -s tests -t . -q"}
+EOF
+git -C "$I" add config.yaml && git -C "$I" commit -q -m "ateam: configure checks"
+ateam status               # Plans: none / Contracts: none, exit 0
 git status --short         # still only your own files; nothing of ATeam's
 ```
 
@@ -75,7 +81,7 @@ ateam plan "Add a health() function to src/api/routes.py that returns the string
 ```
 Expected: the planner runs read-only in this checkout and prints the review: `Plan P-0001: ...`, then one contract block (`C-0001`) with paths that include `src/api/**` and `tests/**`, acceptance criteria with a `test` check naming `tests/test_routes.py::...`, the `unit` check, `complexity: low   risk: low   uncertainty: low` with the planner's reasoning, the tiers with model names, and `bound records: R-0001`. Then open questions and notes, and the two commands `Approve: ateam approve P-0001 ...` and `Reject: ...`. The plan, the draft contract and any proposed records are committed in the intent repo as `ateam: propose plan P-0001`; `ateam status` shows `P-0001  plan_proposed  1 contract(s)`.
 
-If the planner's output is unusable (a dependency cycle, a check that isn't configured), the command prints the problems, writes nothing, marks the plan `plan_rejected`, and you re-run it.
+If the planner's output is unusable (a dependency cycle, a check that isn't configured), the command prints the problems, writes no contracts, records the plan as `plan_rejected` so `ateam plans list` shows what happened, and you re-run it; the next attempt gets the next id.
 
 ```bash
 ateam approve P-0001

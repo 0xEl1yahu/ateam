@@ -58,3 +58,19 @@ def test_render_report_lists_next_command(target_repo, target_paths):
     r = candidates_to_records([cand()], ["which port"], {}, target_repo, target_paths.records, cap_global=5)
     text = render_discovery_report(r)
     assert "R-0001" in text and "ateam records review" in text and "which port" in text and "README.md#rules" in text
+
+
+
+def test_bad_enum_empty_evidence_blank_statement_and_batch_duplicates_are_dropped_not_crashes(target_repo, target_paths):
+    cands = [
+        cand(origin="sort-of-documented"),
+        cand(statement="   ", evidence=[{"type": "doc", "ref": "README.md#a"}]),
+        cand(evidence=[]),
+        cand(statement="one", evidence=[{"type": "doc", "ref": "README.md#dup"}]),
+        cand(statement="two", evidence=[{"type": "doc", "ref": "README.md#dup"}]),
+    ]
+    r = candidates_to_records(cands, [], {}, target_repo, target_paths.records, cap_global=5)
+    assert [p.statement for p in r.proposed] == ["one"]
+    reasons = [why for _, why in r.dropped]
+    assert any("origin" in w or "invalid" in w for w in reasons) and any("statement" in w for w in reasons)
+    assert any("evidence" in w for w in reasons) and any("duplicate" in w for w in reasons)

@@ -93,3 +93,20 @@ def test_render_review_contains_allocation_and_command(target_repo, target_paths
     text = render_plan_review(r, load_tiers())
     for needle in ("P-0001", "C-0001", "complexity: low", "risk: low", "uncertainty: low", "haiku", "A1", "unit", "R-0001", "which port", "ateam approve P-0001", "--tier C-0001=careful"):
         assert needle in text, needle
+
+
+
+def test_rubric_floors_applied_with_notes(target_repo, target_paths, records_three):
+    rep = report(contract("A", complexity="high", risk="high", tier={"build": "light", "test": "light", "investigate": "none"}))
+    r = report_to_plan(rep, "x", "P-0001", target_paths.contracts, records_three, CFG, target_repo, target_paths.records)
+    t = r.contracts[0].allocation.tier
+    assert t["build"] == "careful" and t["test"] == "careful"
+    assert any("build tier raised" in n for n in r.problems) and any("test tier raised" in n for n in r.problems)
+
+
+def test_self_dependency_message_and_duplicate_deps_deduped(target_repo, target_paths, records_three):
+    with pytest.raises(PlanError) as e:
+        report_to_plan(report(contract("A", deps=[0])), "x", "P-0001", target_paths.contracts, records_three, CFG, target_repo, target_paths.records)
+    assert any("itself" in p for p in e.value.problems)
+    r = report_to_plan(report(contract("A"), contract("B", deps=[0, 0])), "x", "P-0001", target_paths.contracts, records_three, CFG, target_repo, target_paths.records)
+    assert r.contracts[1].depends_on == ["C-0001"]

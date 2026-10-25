@@ -33,7 +33,8 @@ DESTRUCTIVE_PATTERNS: list[str] = [
 ]
 
 INVESTIGATE_ALLOWED_PREFIXES: list[str] = [
-    # Read-only inspection only. Nothing here can write a file: no interpreters, no sed/awk, no xargs/env/sh.
+    # Read-only inspection only. No interpreter, sed, awk, xargs, env or shell is allow-listed; per-command rules below
+    # deny the output flags, -exec forms, pagers and substitutions that could still write or run other programs.
     "git log", "git show", "git diff", "git blame", "git status", "git ls-files", "git grep",
     "git branch --list", "git branch -a", "git branch --show-current", "git rev-parse", "git stash list",
     "ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "tree", "du", "stat", "file", "pwd", "sort", "uniq", "cut",
@@ -46,8 +47,17 @@ _PROTECTED_MENTION = re.compile(r"(?i)(?<![\w-])\.(?:ateam|claude)(?![\w-])")
 _MUTATORS = re.compile(
     r"""(?:\btee\b|\bsed\b[^\n]*\s(?:-[a-zA-Z]*i\b|--in-place\b)|\bcp\b|\bmv\b|\btouch\b|\brm\b|\bmkdir\b|\brmdir\b|\bchmod\b|\bchown\b|\bln\b|\binstall\b|\btruncate\b|\bdd\b|\bpatch\b|\bgit\s+(?:add|commit|checkout|restore|rm|mv|apply)\b)"""
 )
-# Anything that writes at all, for roles that may not write (INVESTIGATE).
-_WRITE_OPS = re.compile(r"(?:>>?|<<|\s-o\b|\s--output\b|\s-fprint\b)|" + _MUTATORS.pattern)
+# Anything that writes at all, for roles that may not write (INVESTIGATE). `-o` is handled per command below.
+_WRITE_OPS = re.compile(r"(?:>>?|<<|\s--output\b|\s-fprintf?\b|\s-fls\b)|" + _MUTATORS.pattern)
+_SUBSTITUTION = re.compile(r"\$\(|`|<\(|>\(")
+_ENV_PREFIX = re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_]*=\S*\s+\S")
+_FIND_EXEC = re.compile(r"^\s*find\b.*\s-(?:exec|execdir|ok|okdir|delete)\b")
+_RG_PRE = re.compile(r"^\s*rg\b.*\s--pre(?:-glob)?\b")
+_GIT_GREP_PAGER = re.compile(r"^\s*git\s+grep\b.*\s(?:-O\S*|--open-files-in-pager\b)")
+_GIT_DASH_C = re.compile(r"^\s*git\s+(?:(?:-C\s*\S+|--no-pager|--git-dir=\S+|--work-tree=\S+)\s+)*-c\b")
+_OUTPUT_FLAG_CMDS = re.compile(r"^\s*(?:sort|tree|du)\b.*(?:\s-o\S*|\s--output\b)")
+_PAGER = re.compile(r"(?i)core\.pager|\bpager\.|GIT_PAGER|GIT_EXTERNAL_DIFF|GIT_EDITOR|\bLESSOPEN\b")
+_GLOBBY_ATEAM = re.compile(r"\.ate[a-z]*[*?\[]")
 _REDIRECT_TARGET = re.compile(r">>?\s*(\S+)")
 _READ_PREFIX = re.compile(
     r"^\s*(?:cat|head|tail|less|more|wc|grep|rg|ls|stat|file|diff|sort|uniq|cut|awk|find|tree|du|sed\s+-n|git\s+(?:diff|show|log|blame|status|ls-files|grep|branch|stash\s+(?:list|show)))\b"
@@ -116,6 +126,14 @@ def _starts_with_prefix(segment: str, prefix: str) -> bool:
     return not seg[len(prefix)].isalnum()
 
 
+def _uniq_writes(segment: str) -> bool:
+    tokens = segment.split()
+    if not tokens or tokens[0] != "uniq":
+        return False
+    positional = [t for t in tokens[1:] if not t.startswith("-") or t == "-"]
+    return len(positional) >= 2
+
+
 def _git_branch_read_only(segment: str) -> bool:
     m = _GIT_BRANCH.match(segment)
     if not m:
@@ -171,6 +189,27 @@ class Policy:
         out = {str(path), str(path.resolve())}
         return sorted(out, key=len, reverse=True)
 
+    def _under_home_not_scratch(self, file_path: str) -> bool:
+        """True when a path resolves into ATeam's home but not into this worker's scratch dir."""
+        home = self.ateam_home or Path(os.environ.get("ATEAM_HOME") or (Path.home() / ".ateam"))
+        raw = file_path.strip().strip("'\"")
+        if raw.startswith("~"):
+            raw = os.path.expanduser(raw)
+        raw = raw.replace("$HOME", str(Path.home())).replace("${HOME}", str(Path.home()))
+        raw = raw.replace("$ATEAM_HOME", str(home)).replace("${ATEAM_HOME}", str(home))
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = self.worktree / candidate
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return False
+        try:
+            resolved.relative_to(home.resolve())
+        except ValueError:
+            return False
+        return not self._in_scratch(str(resolved))
+
     def _home_spellings(self) -> list[str]:
         home = self.ateam_home or Path(os.environ.get("ATEAM_HOME") or (Path.home() / ".ateam"))
         out = set(self._spellings(home)) | {"$ATEAM_HOME", "${ATEAM_HOME}", "~/.ateam", "$HOME/.ateam", "${HOME}/.ateam"}
@@ -211,6 +250,12 @@ class Policy:
                 return False, "paths that leave your scratch directory are not allowed"
             if any(sp in seg for sp in home_spellings) and not mentions_scratch:
                 return False, "ATeam's home (intent repo, state store, logs) is off limits to workers; only your scratch directory is writable"
+            if home_spellings:
+                if _GLOBBY_ATEAM.search(seg.replace('"', "").replace("'", "")):
+                    return False, "wildcard paths into ATeam's home are not allowed"
+                for tok in seg.replace('"', "").replace("'", "").split():
+                    if ("/" in tok or tok.startswith(("~", "$", "."))) and not tok.startswith("-") and self._under_home_not_scratch(tok):
+                        return False, "ATeam's home (intent repo, state store, logs) is off limits to workers; only your scratch directory is writable"
             rest = seg
             for sp in [*scratch_spellings, *home_spellings]:
                 rest = rest.replace(sp, " ")
@@ -227,12 +272,21 @@ class Policy:
                 if not _READ_PREFIX.match(_normalise_git(seg)):
                     return False, "shell access to .ateam/ or .claude/ is limited to reading"
         if self.role == Role.investigate:
+            if _SUBSTITUTION.search(cmd):
+                return False, "INVESTIGATE may not use command or process substitution"
+            if _PAGER.search(cmd):
+                return False, "INVESTIGATE may not set pagers, editors or diff drivers"
             for seg in segments:
+                if _ENV_PREFIX.match(seg):
+                    return False, f"INVESTIGATE may not set environment variables for a command; {seg.strip()[:40]!r}"
+                if _GIT_DASH_C.match(seg):
+                    return False, "INVESTIGATE may not pass git -c"
                 norm = _normalise_git(seg)
                 if not any(_starts_with_prefix(norm, p) for p in INVESTIGATE_ALLOWED_PREFIXES):
                     return False, f"INVESTIGATE may only run read-only inspection commands; {seg.strip()[:40]!r} is not allowed"
-                if _WRITE_OPS.search(norm) or not _git_branch_read_only(norm):
-                    return False, f"INVESTIGATE may not write or change state; {seg.strip()[:40]!r} is not allowed"
+                if (_WRITE_OPS.search(norm) or _FIND_EXEC.match(norm) or _RG_PRE.match(norm) or _GIT_GREP_PAGER.match(norm)
+                        or _OUTPUT_FLAG_CMDS.match(norm) or _uniq_writes(norm) or not _git_branch_read_only(norm)):
+                    return False, f"INVESTIGATE may not write, run other programs or change state; {seg.strip()[:40]!r} is not allowed"
         return True, ""
 
     # -- SDK hooks ----------------------------------------------------------
@@ -242,6 +296,10 @@ class Policy:
             return self.path_writable_abs(str(tool_input.get("file_path", "")))
         if tool_name == "Bash":
             return self.command_allowed(str(tool_input.get("command", "")))
+        if tool_name in ("Read", "Glob", "Grep"):
+            target = str(tool_input.get("file_path") or tool_input.get("path") or "")
+            if target and self._under_home_not_scratch(target):
+                return False, "ATeam's home (intent repo, state store, logs) is not readable by workers; only your scratch directory is"
         return True, ""
 
     async def can_use_tool(self, tool_name: str, input_data: dict[str, Any], context: Any) -> Any:

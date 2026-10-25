@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 
@@ -379,3 +381,85 @@ def test_investigate_allowlist_has_no_interpreters_or_stream_editors():
     joined = " ".join(INVESTIGATE_ALLOWED_PREFIXES)
     for bad in ("python", "sed", "awk", "xargs", "env", "sh", "bash", "perl", "ruby", "node"):
         assert not any(p.split()[0] == bad for p in INVESTIGATE_ALLOWED_PREFIXES), f"{bad} must not be allow-listed: {joined}"
+
+
+
+# ---- review round: recognised-command writes, substitution, interpreter smuggling, home reads
+
+@pytest.fixture
+def policy_inplace(target_repo, target_paths):
+    from ateam.roles import Role
+    from ateam.runner.policy import Policy
+
+    scratch = target_paths.scratch_root / "init"; scratch.mkdir(parents=True)
+    return Policy(worktree=target_repo, role=Role.investigate, allowed_paths=[], protected=[".claude/**"], bound={},
+                  scratch_dir=scratch, ateam_home=target_paths.scratch_root.parent.parent)
+
+
+INPLACE_DENY_2 = [
+    "uniq f g",
+    "cat f | uniq - g",
+    "sort f -og",
+    "sort -o out f",
+    "tree -o out src",
+    "du --output=x src",
+    "find . -fls out",
+    'ls $(python3 -c "open(\'x\',\'w\')")',
+    "ls `python3 -c 'print(1)'`",
+    'cat <(python3 -c "print(1)")',
+    'find . -exec python3 -c "print(1)" \\;',
+    "find . -execdir cat {} \\;",
+    "find . -ok rm {} \\;",
+    "rg --pre sh pattern",
+    "git grep -O sh foo",
+    "git grep --open-files-in-pager=sh foo",
+    "git -c core.pager=sh log",
+    "git -c core.pager=python3 show HEAD:setup.py",
+    "git -c core.pager=python3${IFS}-c${IFS}print(1) log",
+    "GIT_PAGER=sh git log",
+]
+
+INPLACE_ALLOW_2 = [
+    "grep -o 'def [a-z_]*' src/app.py",
+    "find src -name '*.py' -o -name '*.md'",
+    "ls -o src",
+    "git log -p -3",
+    "git show HEAD:src/app.py",
+    "git --no-pager log --oneline -3",
+    "git -C src log --oneline -3",
+    "grep -rn greet src | sort | uniq -c",
+    "cut -d: -f1 src/app.py | sort -u",
+    "wc -l src/app.py tests/test_app.py",
+]
+
+
+@pytest.mark.parametrize("cmd", INPLACE_DENY_2)
+def test_inplace_denied_round2(policy_inplace, cmd):
+    assert not policy_inplace.command_allowed(cmd)[0], f"should deny: {cmd!r}"
+
+
+@pytest.mark.parametrize("cmd", INPLACE_ALLOW_2)
+def test_inplace_allowed_round2(policy_inplace, cmd):
+    ok, reason = policy_inplace.command_allowed(cmd)
+    assert ok, f"should allow: {cmd!r} ({reason})"
+
+
+@pytest.mark.asyncio
+async def test_reads_of_ateam_home_denied_for_read_tools_and_bash(policy_inplace, target_paths):
+    from claude_agent_sdk import PermissionResultDeny
+
+    cfg = target_paths.config_file
+    for tool, inp in (("Read", {"file_path": str(cfg)}), ("Glob", {"pattern": "*.yaml", "path": str(target_paths.intent)}),
+                      ("Grep", {"pattern": "x", "path": str(target_paths.intent.parent)})):
+        assert isinstance(await policy_inplace.can_use_tool(tool, inp, None), PermissionResultDeny), tool
+    out = await policy_inplace.pre_tool_use({"tool_name": "Read", "tool_input": {"file_path": str(cfg)}}, None, None)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    # own scratch stays readable; the worktree stays readable
+    from claude_agent_sdk import PermissionResultAllow
+    assert isinstance(await policy_inplace.can_use_tool("Read", {"file_path": str(policy_inplace.scratch_dir / "handoff.yaml")}, None), PermissionResultAllow)
+    assert isinstance(await policy_inplace.can_use_tool("Read", {"file_path": str(policy_inplace.worktree / "src/app.py")}, None), PermissionResultAllow)
+    home = target_paths.intent.parent.parent
+    rel = Path(__import__("os").path.relpath(cfg, policy_inplace.worktree))
+    for cmd in (f"cat {cfg}", f"cat {rel}", f"git -C {target_paths.intent} log", f"cat {home}/*/intent/config.yaml",
+                f"cat {str(home).replace('.ateam', '.ate*')}/*/intent/config.yaml"):
+        assert not policy_inplace.command_allowed(cmd)[0], cmd

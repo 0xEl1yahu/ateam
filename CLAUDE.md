@@ -11,7 +11,7 @@ These came from corrections the owner made after work was built. Do not re-decid
 3. **Workers never run `rm`.** Deletion is an integration-time action. Tracked files are removed with `git rm` so the change is in the reviewed diff. The policy denies `rm` in every form; do not loosen it.
 4. **A contract is binding or work does not start.** No worker runs unless the contract is frozen, unchanged since the freeze, runnable, and free of record drift. Do not add bypasses.
 5. **Nothing inferred becomes binding without the owner.** Records proposed from code are `proposed` until the owner approves them; plan approval freezes contracts but never approves a record by itself.
-6. **Read-only investigations run in the owner's checkout; enforcement is pre-guard first.** `ateam init` and `ateam plan` use INVESTIGATE sessions with no editing tools, a shell allow-list with no interpreters, and a before-and-after snapshot that marks any change `tamper`. The system prompt explains the role and is never the control.
+6. **Read-only investigations run in the owner's checkout; enforcement is pre-guard first.** `ateam init` and `ateam plan` use INVESTIGATE sessions with no editing tools, a shell allow-list in which no interpreter, stream editor or shell is listed and substitutions, `-exec` forms, pagers and output flags are denied, and a before-and-after snapshot (HEAD, refs, stash list, dirty paths and their content) that marks any change `tamper`. The system prompt explains the role and is never the control.
 
 ## Ask before deciding when a choice is one of these
 
