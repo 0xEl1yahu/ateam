@@ -88,6 +88,7 @@ Three failure classes, each with its own mechanism:
 - **Spike first.** SDK, bare mode, hooks and path-scoped rules are validated by a small executable spike before the integration is committed to.
 - **Feature work happens in git worktrees**, for ATeam's own development as much as for its workers. Never on a branch in the main checkout. (Owner, 2026-10-25.)
 - **Git-native mechanisms only.** Nothing ATeam depends on may live in clone-local state such as `.git/info/exclude` or local config; a fresh clone on another machine must behave identically. Ignore rules go in the target's tracked `.gitignore`. (Owner, 2026-10-25.)
+- **Durable intent lives in a private intent repo, not in the target.** (Owner, 2026-10-25.) Target repos are often public; records and contracts are private engineering notes. `.ateam/` is gitignored in every target and holds nothing. Records, contracts, plans, reports and `config.yaml` live in their own git repository under ATeam's home, `~/.ateam/<repo-id>/intent/`, created by `ateam intent init`, optionally pushed to a private remote so another machine gets the same intent by pulling it. Approval commits land in the intent repo. The target branch is still where integration happens; the target itself carries no ATeam files. See "Intent repo" below. This supersedes the earlier "Two homes for truth" wording that placed `.ateam/` inside the target, and the "Target repo layout" section.
 - **Workers never run `rm`.** Deletion is an integration-time action. A tracked file a worker must remove goes through `git rm`, so the deletion is in the reviewed diff. (Owner, 2026-10-25.)
 - **Approval commits land on the target branch in the owner's checkout.** `ateam approve`, `ateam reject` and `ateam supersede` stage only `.ateam/` paths and commit on the configured target branch. They refuse to act if the checkout is on another branch or `.ateam/` already has uncommitted changes.
 
@@ -164,6 +165,26 @@ ATeam's own machinery, with no native equivalent:
 - Verification gate and integration.
 - Discovery with classification and idempotence.
 - Telemetry for calibration.
+
+## Intent repo (supersedes "Target repo layout" below for the location of `.ateam/`)
+
+```
+~/.ateam/<repo-id>/
+  intent/                 a git repository, created by `ateam intent init`, optional private remote
+    config.yaml           target_branch, setup, env, checks, serialize_checks, protected_paths, max_workers, tiers
+    records/              R-0001-<slug>.yaml ...
+    contracts/            C-0001-<slug>.yaml ...
+    plans/                P-0001-<slug>.yaml   (pass two)
+    reports/              merge proposals      (pass two)
+  state.db                operational state, never versioned, rebuildable
+  worktrees/              (pass two scheduler)
+<target>/
+  .gitignore              gains `.ateam/` (defence in depth; nothing is written there) and the scratch rule if scratch stays in the worktree
+```
+
+The repo id must be the same on every machine that clones the target, or the intent repo cannot follow the code. It is derived from the target's `origin` remote URL when one exists (normalised: scheme, user and `.git` suffix removed), and from the resolved path only for repos with no remote. `ateam doctor` prints both the id and what it was derived from.
+
+Commands: `ateam intent init [--remote URL]` (creates the repo, directories, default config, first commit, and adds the ignore lines to the target), `ateam intent path`, `ateam intent remote URL`, `ateam intent push`, `ateam intent pull`. Approval, reject, supersede, retire and freeze commit in the intent repo with the `ateam:` prefix and refuse when the intent repo is dirty. The previous guard "checkout must be on the target branch" no longer applies to approvals; it still applies to integration.
 
 ## Target repo layout
 
