@@ -1,4 +1,4 @@
-# .ateam/config.yaml: per-target settings. Every key is optional; these are the defaults plus examples.
+# config.yaml in the target's private intent repo ($(ateam intent path)/config.yaml). Every key is optional; these are the defaults plus examples.
 target_branch: main             # approval commits land here; workers' worktrees branch from it
 setup:                          # run once per new worktree, before any worker
   - "python -m venv .venv && .venv/bin/pip install -e '.[dev]'"

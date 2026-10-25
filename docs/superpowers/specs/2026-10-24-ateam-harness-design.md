@@ -188,19 +188,7 @@ Commands: `ateam intent init [--remote URL]` (creates the repo, directories, def
 
 ## Target repo layout
 
-```
-<target>/
-  .ateam/
-    config.yaml          target_branch, setup commands, env, checks, serialize_checks,
-                         protected paths, worker cap, tier map overrides
-    records/             R-0001-reading-state-owner-only.yaml ...
-    plans/               P-0001-<slug>.yaml  (feature request, contracts list, approvals)
-    contracts/           C-0001-<slug>.yaml ...
-    reports/             merge proposals and verification evidence summaries (committed)
-  .claude/worktrees/     not used by ATeam; ATeam uses ../<target>-ateam-worktrees/ or a configured path
-```
-
-Worktrees live outside the target checkout by default, under `~/.ateam/<target-repo-id>/worktrees/<contract-id>/`, so they never appear as untracked files in the target.
+Superseded on 2026-10-25 by "Intent repo" above: the target carries nothing of ATeam's. Worker scratch directories live at `~/.ateam/<repo-id>/scratch/<contract-id>/`, outside the worktree, so no ignore rule is needed in the target.
 
 ## Records
 

@@ -2,7 +2,9 @@
 
 ATeam is an engineering harness around headless Claude Code. It keeps engineering intent in version-controlled records and task contracts inside a target repository, runs role-separated workers (BUILD, INVESTIGATE, TEST) in isolated git worktrees through the Claude Agent SDK, and verifies the worktree itself rather than trusting a worker's report. The owner approves what gets built and what gets merged; ATeam decides how to build and verify in between.
 
-Design: `docs/superpowers/specs/2026-10-24-ateam-harness-design.md`. Pass-one plan: `docs/superpowers/plans/2026-10-24-ateam-foundations.md`.
+Design: `docs/superpowers/specs/2026-10-24-ateam-harness-design.md`. Plans: `docs/superpowers/plans/`.
+
+Durable intent never lives in the target repository. Each target gets a private git repository under `~/.ateam/<repo-id>/intent/` (records, contracts, config), created by `ateam intent init` and optionally pushed to a private remote so another machine pulls the same intent. The repo id derives from the target's `origin` URL, so every clone finds the same intent. The target carries nothing of ATeam's: no `.ateam/`, no ignore lines, no scratch files.
 
 ## Setup
 
@@ -20,9 +22,9 @@ Workers run in a clean room built from SDK options (no setting sources, strict M
 
 Install once per machine (above). Then, per target repository, five steps, all ending up committed in that repo:
 
-1. **Bootstrap.** `mkdir -p .ateam/records .ateam/contracts`; add `.ateam-scratch/` to the tracked `.gitignore`; copy `examples/CLAUDE.target.md` to `CLAUDE.md` so a Claude session a person opens there knows `.ateam/` is managed through the CLI; optionally copy `examples/config.example.yaml` to `.ateam/config.yaml` to name the target branch and the deterministic checks.
-2. **First records.** Copy `examples/record.example.yaml` once per decision or invariant you already hold, bound to the paths it governs. A handful, not fifty. `ateam records validate`, then `ateam records approve R-0001` for each; approval commits only `.ateam/`.
-3. **One contract per task.** Copy `examples/contract.example.yaml`: the paths a worker may touch, the acceptance criteria and their checks, the allocation tier. `ateam contracts freeze C-0001` selects the binding records and makes the contract binding. Commit.
+1. **Bootstrap.** `ateam intent init [--remote git@github.com:you/private-intent.git]` creates the intent repo and prints its path; `ateam intent path` prints it again. Optionally copy `examples/CLAUDE.target.md` to the target's `CLAUDE.md` so a Claude session a person opens there knows the rules (this is the only file you may choose to add to the target, and it is yours to keep private or not). Edit `$(ateam intent path)/config.yaml` to name the target branch and the deterministic checks.
+2. **First records.** Copy `examples/record.example.yaml` into `$(ateam intent path)/records/`, once per decision or invariant you already hold, bound to the paths it governs. A handful, not fifty. Commit them in the intent repo (`git -C "$(ateam intent path)" add -A && git -C "$(ateam intent path)" commit -m "ateam: first records"`), then `ateam records validate` and `ateam records approve R-0001` for each; approvals commit in the intent repo.
+3. **One contract per task.** Copy `examples/contract.example.yaml` into `$(ateam intent path)/contracts/`: the paths a worker may touch, the acceptance criteria and their checks, the allocation tier. Commit it, then `ateam contracts freeze C-0001`, which selects the binding records, makes the contract binding and commits the frozen contract.
 4. **Run a worker in a worktree.** `git worktree add ../repo-C-0001 -b ateam/C-0001 main`, then `ateam worker run C-0001 --role build --cwd ../repo-C-0001`. Read the report, the diff and `ateam status`.
 5. **Verify and merge yourself.** Run the contract's checks in the worktree, optionally a TEST worker (`--role test`), then merge the branch. This loop is manual until pass two.
 
@@ -40,10 +42,12 @@ Everything here is readable by an agent as well as a person: markdown, YAML and 
 
 ## Commands
 
-Every command except `ateam schema` takes `--target PATH` (default: the current directory), which must contain an `.ateam/` directory.
+Every command except `ateam schema` takes `--target PATH` (default: the current directory). All but `intent init`, `intent path` and `doctor` require the target's intent repo to exist.
 
 ```bash
-ateam doctor --target ~/code/myrepo            # versions, target branch, workspace health
+ateam doctor --target ~/code/myrepo            # versions, repo id derivation, intent repo, target branch
+ateam intent init [--remote URL]               # create the private intent repo for this target
+ateam intent path | remote URL | push | pull   # where it is; private remote; sync with another machine
 ateam records validate --target ~/code/myrepo  # schema, globs, supersession, dead globs, hand edits
 ateam records list [--status approved]
 ateam records show R-0001
@@ -60,25 +64,24 @@ ateam worker run C-0001 --role build --cwd /path/to/worktree [--base REF] [--tie
 ateam status
 ```
 
-Approval commands commit only `.ateam/` paths on the configured target branch in your checkout, and refuse to act when the checkout is on another branch or `.ateam/` already has uncommitted changes.
+Approval and freeze commands commit in the intent repo with an `ateam:` message and refuse to act when it has uncommitted changes. They never touch the target.
 
 ## Your first record and contract
 
-There is no `ateam init` or `ateam plan` yet (pass two), so the first record and contract are written by hand. Annotated templates live in [`examples/`](examples/): [`record.example.yaml`](examples/record.example.yaml), [`contract.example.yaml`](examples/contract.example.yaml), [`config.example.yaml`](examples/config.example.yaml), and [`CLAUDE.target.md`](examples/CLAUDE.target.md), a `CLAUDE.md` for the target repo so a Claude session a person opens there knows `.ateam/` is managed through the CLI. A test loads them through the real models, so they cannot drift from the schema. `ateam schema records|contracts|config` prints the JSON Schema for editor validation.
+There is no `ateam init` or `ateam plan` yet (pass two), so the first record and contract are written by hand into the intent repo. Annotated templates live in [`examples/`](examples/): [`record.example.yaml`](examples/record.example.yaml), [`contract.example.yaml`](examples/contract.example.yaml), [`config.example.yaml`](examples/config.example.yaml), and [`CLAUDE.target.md`](examples/CLAUDE.target.md). A test loads them through the real models, so they cannot drift from the schema. `ateam schema records|contracts|config` prints the JSON Schema for editor validation.
 
 ```bash
 cd ~/code/myrepo                                   # a throwaway clone is the safest first target
-mkdir -p .ateam/records .ateam/contracts
-echo '.ateam-scratch/' >> .gitignore                # the worker's handoff dir; tracked, so every clone agrees
-cp ~/code/ateam/examples/CLAUDE.target.md CLAUDE.md # rules for human-driven Claude sessions in this repo (workers never read it)
-cp ~/code/ateam/examples/record.example.yaml   .ateam/records/R-0001-reading-state.yaml
-cp ~/code/ateam/examples/contract.example.yaml .ateam/contracts/C-0001-reading-state-api.yaml
+ateam intent init                                  # private intent repo under ~/.ateam/<repo-id>/intent/
+I=$(ateam intent path)
+cp ~/code/ateam/examples/record.example.yaml   "$I/records/R-0001-reading-state.yaml"
+cp ~/code/ateam/examples/contract.example.yaml "$I/contracts/C-0001-reading-state-api.yaml"
 # edit both: statement, evidence, binds.paths, contract paths and acceptance criteria for your repo
-git add .ateam && git commit -m "ateam: first record and contract"
+git -C "$I" add -A && git -C "$I" commit -m "ateam: first record and contract"
 
 ateam records validate                              # must print 0 error(s)
-ateam records approve R-0001                        # commits only .ateam/ on the target branch
-ateam contracts freeze C-0001                       # selects bound records, snapshots hashes; the contract is now binding
+ateam records approve R-0001                        # commits in the intent repo
+ateam contracts freeze C-0001                       # selects bound records, snapshots hashes, commits; binding from here on
 ateam brief C-0001 --role build                     # exactly what the worker will be told
 
 git worktree add ../myrepo-C-0001 -b ateam/C-0001 main
@@ -86,22 +89,22 @@ ateam worker run C-0001 --role build --cwd ../myrepo-C-0001 --tier light
 ateam status
 ```
 
-A worker refuses to start (exit code 4) unless the contract is frozen, unchanged since the freeze, in a runnable state, and none of its frozen records have changed. `ateam contracts validate` reports hand edits and record drift; `ateam contracts freeze --force` re-freezes deliberately. Workers also refuse to run in the target checkout itself: `--cwd` must be a linked worktree.
+A worker refuses to start (exit code 4) unless the contract is frozen, unchanged since the freeze, in a runnable state, and none of its frozen records have changed. `ateam contracts validate` reports hand edits and record drift; `ateam contracts freeze --force` re-freezes deliberately. Workers refuse to run in the target checkout itself: `--cwd` must be a worktree of the target, outside it.
 
-`ateam worker run` creates `.ateam-scratch/` in the worktree for the worker's handoff notes and refuses to start (exit code 4) unless the target's tracked `.gitignore` already ignores it. ATeam never uses clone-local files such as `.git/info/exclude`, so a fresh clone on another machine behaves identically. Workers may not run `rm` at all; a tracked file is removed with `git rm`, which shows in the diff, and cleanup belongs to integration.
+The worker's handoff notes live in its scratch directory under `~/.ateam/<repo-id>/scratch/<contract-id>/`, never in the worktree, so nothing of ATeam's ever appears in `git status` of the target. Workers may not run `rm` at all; a tracked file is removed with `git rm`, which shows in the diff, and cleanup belongs to integration.
 
-## Target repo layout
+## Layout
 
 ```
-<target>/.ateam/
-  config.yaml      target_branch, setup, env, checks, serialize_checks, protected_paths, max_workers, tiers
-  records/         R-0001-<slug>.yaml  (decision | invariant | convention)
-  contracts/       C-0001-<slug>.yaml
-  plans/           P-0001-<slug>.yaml  (pass two)
-  reports/         merge proposals      (pass two)
+~/.ateam/<repo-id>/
+  intent/            private git repo: config.yaml, records/, contracts/, plans/ (pass two), reports/ (pass two)
+  state.db           operational state (SQLite): state machines, attempts, telemetry, checkpoints, run lock; never authoritative
+  scratch/<C-id>/    the worker's handoff notes
+~/.ateam/targets.json   which target path maps to which id and how the id was derived (doctor warns on change)
+<target>/            nothing of ATeam's
 ```
 
-Operational state (SQLite: state machines, attempts, telemetry, checkpoints, run lock) lives at `~/.ateam/<repo-id>/state.db`, or under `$ATEAM_HOME`. It is never authoritative.
+Override the home with `$ATEAM_HOME`.
 
 ## Tests
 
