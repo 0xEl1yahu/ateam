@@ -208,10 +208,6 @@ INVESTIGATE_MUST_ALLOW = [
     "cat src/app.py | head -5",
     "grep -rn greet src | wc -l",
     "find src -name '*.py'",
-    "cd src && ls",
-    "cd src/api; grep -n ROUTES x.py",
-    "pushd tests && ls",
-    "cd src && cd api && ls",
 ]
 
 CD_WORKTREE_REASON = "INVESTIGATE may cd only to a directory inside the worktree"
@@ -230,6 +226,11 @@ INVESTIGATE_CD_DENY = [
     "cd src tests && ls",
     "cd -P src && ls",
     "cd s* && ls",
+    "cd src && ls",
+    "cd ./src && ls",
+    "cd . && ls",
+    "pushd tests && ls",
+    "cd src && cd api && ls",
 ]
 
 
@@ -242,7 +243,8 @@ def test_investigate_cd_outside_worktree_denied(policy_investigate, cmd):
 
 def test_investigate_cd_absolute_inside_worktree_allowed(policy_investigate):
     root = policy_investigate.worktree
-    for cmd in (f"cd {root}/src && ls", f"cd {root} && ls", f"pushd {root}/tests; ls"):
+    (root / "a b").mkdir()
+    for cmd in (f"cd {root}/src && ls", f"cd {root} && ls", f"pushd {root}/tests; ls", f'cd "{root}/a b" && ls'):
         ok, reason = policy_investigate.command_allowed(cmd)
         assert ok, f"should allow: {cmd!r} ({reason})"
 
@@ -257,7 +259,7 @@ def test_investigate_cd_symlink_out_of_worktree_denied(policy_investigate, tmp_p
     outside = tmp_path / "outside"
     outside.mkdir()
     (policy_investigate.worktree / "link").symlink_to(outside, target_is_directory=True)
-    ok, reason = policy_investigate.command_allowed("cd link && ls")
+    ok, reason = policy_investigate.command_allowed(f"cd {policy_investigate.worktree}/link && ls")
     assert not ok
     assert reason == CD_WORKTREE_REASON
 
@@ -597,32 +599,51 @@ def investigate_with_home(target_repo, policy_investigate):
     return pol
 
 
-@pytest.mark.parametrize("cmd", [
-    "cd src && cat ../../.ateam/state.db",
-    "cd src\ncat ../../.ateam/state.db",
-    "cd src; ls ../../.ateam/*",
-])
-def test_investigate_cd_cannot_reach_ateam_home(investigate_with_home, cmd):
-    ok, reason = investigate_with_home.command_allowed(cmd)
-    assert not ok, f"should deny: {cmd!r}"
-    assert "ATeam's home" in reason
+def test_investigate_cd_relative_fails_but_absolute_home_probe_denied(investigate_with_home):
+    root = investigate_with_home.worktree
+    for cmd in (f"cd {root}/src && cat ../../.ateam/state.db", f"cd {root}/src\ncat ../../.ateam/state.db", f"cd {root}/src; ls ../../.ateam/*"):
+        ok, reason = investigate_with_home.command_allowed(cmd)
+        assert not ok, f"should deny: {cmd!r}"
+        assert "ATeam's home" in reason
 
 
 def test_investigate_cwd_persists_across_calls_for_home_rule(investigate_with_home):
-    assert investigate_with_home.command_allowed("cd src")[0]
-    ok, reason = investigate_with_home.command_allowed("cat ../../.ateam/state.db")
+    root = investigate_with_home.worktree
+    (root / "x" / "x").mkdir(parents=True)
+    assert investigate_with_home.command_allowed(f"cd {root}/x")[0]
+    assert investigate_with_home.command_allowed(f"cd {root}/x/x")[0]
+    ok, reason = investigate_with_home.command_allowed("cat ../../../.ateam/state.db")
     assert not ok and "ATeam's home" in reason
 
 
 def test_investigate_cd_still_allows_ordinary_relative_reads(investigate_with_home):
-    ok, reason = investigate_with_home.command_allowed("cd src && cat ../README.md")
+    root = investigate_with_home.worktree
+    ok, reason = investigate_with_home.command_allowed(f"cd {root}/src && cat ../README.md")
     assert ok, reason
 
 
-def test_investigate_cd_logical_dotdot_through_symlink_denied(policy_investigate):
-    root = policy_investigate.worktree
+@pytest.fixture
+def lnk_fixture(investigate_with_home):
+    root = investigate_with_home.worktree
     (root / "deep" / "a" / "b").mkdir(parents=True)
     (root / "lnk").symlink_to(root / "deep" / "a" / "b", target_is_directory=True)
-    ok, reason = policy_investigate.command_allowed("cd lnk/../.. && ls")
+    return investigate_with_home
+
+
+def test_investigate_cd_logical_dotdot_through_symlink_denied(lnk_fixture):
+    root = lnk_fixture.worktree
+    ok, reason = lnk_fixture.command_allowed(f"cd {root}/lnk/../.. && ls")
     assert not ok and reason == CD_WORKTREE_REASON
-    assert policy_investigate.command_allowed("cd lnk && ls")[0]
+    ok, reason = lnk_fixture.command_allowed(f"cd {root}/lnk; cd ../..; cat .ateam/state.db")
+    assert not ok and reason == CD_WORKTREE_REASON
+    ok, reason = lnk_fixture.command_allowed(f"cd {root}/lnk && cd ../.. && ls .ateam")
+    assert not ok and reason == CD_WORKTREE_REASON
+
+
+def test_investigate_cd_symlink_inside_allowed_and_both_bases_guard_home(lnk_fixture):
+    root = lnk_fixture.worktree
+    assert lnk_fixture.command_allowed(f"cd {root}/lnk && ls")[0]
+    # logical base <root>/lnk reaches home in 2 ups, physical base <root>/deep/a/b in 4
+    for cmd in ("cat ../../.ateam/state.db", "cat ../../../../.ateam/state.db"):
+        ok, reason = lnk_fixture.command_allowed(cmd)
+        assert not ok and "ATeam's home" in reason, cmd

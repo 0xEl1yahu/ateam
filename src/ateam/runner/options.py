@@ -13,8 +13,8 @@ from ateam.tiers import TierSpec
 
 
 def clean_env() -> dict[str, str]:
-    """The parent environment minus every CLAUDE* variable, with auto-memory disabled."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}
+    """The parent environment minus every CLAUDE* variable and CDPATH, with auto-memory disabled."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE") and k != "CDPATH"}  # CDPATH would redirect a bare `cd name`
     env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
     return env
 

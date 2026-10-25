@@ -68,7 +68,7 @@ _HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n(.*?)(?:^|\n)\2(?:\n|$)", 
 _GIT_GLOBAL_OPTS = re.compile(r"^(\s*git)(?:\s+(?:-[cC]\s*\S+|--?\S+))+(\s+)")
 _WRAPPERS = {"command", "env", "exec", "nice", "nohup", "time", "builtin"}
 _CD = re.compile(r"^\s*(?:cd|pushd)\b")
-_CD_WORKTREE_REASON = "INVESTIGATE may cd only to a directory inside the worktree"
+_CD_WORKTREE_REASON = "INVESTIGATE may cd only to a directory inside the worktree"  # absolute paths only; see Policy._cd_target
 _GIT_BRANCH = re.compile(r"^\s*git\s+branch\b(?P<rest>.*)$")
 
 
@@ -208,6 +208,13 @@ class Policy:
         """Every directory a relative path in a command might be resolved from."""
         return [self.worktree, *sorted(self.cwds), *self._pending_cwds]
 
+    def _candidates(self, candidate: Path) -> list[Path]:
+        """The paths a token may name: itself if absolute, else resolved from every base, both textually (bash -L) and physically."""
+        if candidate.is_absolute():
+            return [candidate]
+        joined = [base / candidate for base in self._bases()]
+        return [*joined, *(Path(os.path.normpath(j)) for j in joined)]
+
     def _under_home_not_scratch(self, file_path: str) -> bool:
         """True when a path resolves into ATeam's home but not into this worker's scratch dir."""
         home = self.ateam_home or Path(os.environ.get("ATEAM_HOME") or (Path.home() / ".ateam"))
@@ -217,7 +224,7 @@ class Policy:
         raw = raw.replace("$HOME", str(Path.home())).replace("${HOME}", str(Path.home()))
         raw = raw.replace("$ATEAM_HOME", str(home)).replace("${ATEAM_HOME}", str(home))
         candidate = Path(raw)
-        candidates = [candidate] if candidate.is_absolute() else [base / candidate for base in self._bases()]
+        candidates = self._candidates(candidate)
         for cand in candidates:
             try:
                 resolved = cand.resolve()
@@ -245,7 +252,7 @@ class Policy:
         raw = raw.replace("$HOME", str(Path.home())).replace("${HOME}", str(Path.home()))
         raw = raw.replace("$ATEAM_HOME", str(home)).replace("${ATEAM_HOME}", str(home))
         candidate = Path(raw)
-        candidates = [candidate] if candidate.is_absolute() else [base / candidate for base in self._bases()]
+        candidates = self._candidates(candidate)
         for cand in candidates:
             try:
                 resolved = cand.resolve()
@@ -295,8 +302,13 @@ class Policy:
 
     # -- commands -----------------------------------------------------------
 
-    def _cd_target(self, segment: str, cwd: Path) -> Path | None:
-        """The directory a plain `cd <path>` or `pushd <path>` segment moves to, resolved against cwd; None for any other shape."""
+    def _cd_target(self, segment: str) -> tuple[Path, Path] | None:
+        """(logical, physical) forms of the directory a plain `cd <abs path>` / `pushd <abs path>` segment names, else None.
+
+        Absolute paths only: the Bash tool keeps its working directory between calls and the policy never knows it,
+        so a relative target (or a `..` after a symlinked cd) cannot be judged. Both the textual (bash `cd -L`) and
+        the resolved form must be an existing directory inside the worktree.
+        """
         try:
             words = shlex.split(segment)
         except ValueError:
@@ -304,29 +316,24 @@ class Policy:
         if len(words) != 2 or words[0] not in ("cd", "pushd"):
             return None
         arg = words[1]
-        if arg.startswith(("-", "~")) or _WILDCARD.search(arg) or "$" in arg or "`" in arg:
+        if not arg.startswith("/") or _WILDCARD.search(arg) or "$" in arg or "`" in arg:
             return None
-        logical = Path(os.path.normpath(cwd / arg))  # bash cd -L removes `..` textually before following links
-        if not any(r == logical or r in logical.parents for r in {self.worktree, self.worktree.resolve()}):
+        logical, physical = Path(os.path.normpath(arg)), Path(arg).resolve()
+        if not (self._inside_worktree(logical) and self._inside_worktree(physical)):
             return None
-        return (cwd / arg).resolve()
+        return logical, physical
 
     def _inside_worktree(self, path: Path) -> bool:
-        root = self.worktree.resolve()
-        return path.is_dir() and (path == root or root in path.parents)
+        return path.is_dir() and any(r == path or r in path.parents for r in {self.worktree, self.worktree.resolve()})
 
     def command_allowed(self, cmd: str) -> tuple[bool, str]:
         self._pending_cwds = []
         if self.role == Role.investigate:
-            cwd = self.worktree
             for seg in _split_segments(_strip_heredocs(cmd)):
-                if not _CD.match(seg) or "$" in seg or "`" in seg:
-                    continue
-                target = self._cd_target(seg, cwd)
-                if target is None or not self._inside_worktree(target):
-                    break
-                cwd = target
-                self._pending_cwds.append(target)
+                if _CD.match(seg):
+                    target = self._cd_target(seg)
+                    if target is not None:
+                        self._pending_cwds.extend(target)
         try:
             ok, reason = self._command_allowed(cmd)
             if ok:
@@ -377,16 +384,13 @@ class Policy:
                 return False, "INVESTIGATE may not use command or process substitution"
             if _PAGER.search(unquoted):
                 return False, "INVESTIGATE may not set pagers, editors or diff drivers"
-            cwd = self.worktree
             for seg in segments:
                 if _CD.match(seg):
                     if "$" in seg or "`" in seg:
                         pass  # not a plain path: falls through to the allow-list, which denies it
+                    elif self._cd_target(seg) is None:
+                        return False, _CD_WORKTREE_REASON
                     else:
-                        target = self._cd_target(seg, cwd)
-                        if target is None or not self._inside_worktree(target):
-                            return False, _CD_WORKTREE_REASON
-                        cwd = target
                         continue
                 if _ENV_PREFIX.match(seg):
                     return False, f"INVESTIGATE may not set environment variables for a command; {seg.strip()[:40]!r}"

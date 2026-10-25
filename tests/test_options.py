@@ -12,6 +12,11 @@ def test_clean_env_strips_claude(monkeypatch):
     assert e["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1" and e["PATH"] == "/usr/bin"
 
 
+def test_clean_env_strips_cdpath(monkeypatch):
+    monkeypatch.setenv("CDPATH", "/tmp:/")
+    assert "CDPATH" not in clean_env()
+
+
 def test_worker_options_clean_room(policy_build, tmp_path):
     spec = ROLE_SPECS[Role.build]
     o = worker_options(cwd=tmp_path, spec=spec, brief_text="BRIEF", policy=policy_build, tier=TierSpec("haiku", "low", 10, 0.5))
