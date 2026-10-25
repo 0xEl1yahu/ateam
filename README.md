@@ -48,9 +48,9 @@ Every command except `ateam schema` takes `--target PATH` (default: the current 
 ateam doctor --target ~/code/myrepo            # versions, repo id derivation, intent repo, target branch
 ateam intent init [--remote URL]               # create the private intent repo for this target
 ateam intent path | remote URL | push | pull   # where it is; private remote; sync with another machine
-ateam init [--max-candidates 12] [--tier standard]   # discover and propose records (read-only worker in your checkout)
+ateam init [--max-candidates 12] [--tier careful]   # discover and propose records (read-only worker in your checkout)
 ateam records review [--all]                   # approve as requirement/observation, reject with reason, skip
-ateam plan "<request>" [--tier standard]       # propose contracts and a plan; prints the review
+ateam plan "<request>" [--tier careful]       # propose contracts and a plan; prints the review
 ateam approve P-0001 [--tier C-0002=careful] [--tier C-0002:investigate=light] [--skip-records]
 ateam reject P-0001 "reason"
 ateam plans list | show P-0001

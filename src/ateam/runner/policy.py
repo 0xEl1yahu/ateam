@@ -85,6 +85,9 @@ def _split_segments(cmd: str) -> list[str]:
     while i < len(cmd):
         ch = cmd[i]
         if quote:
+            if quote == '"' and ch == "\\" and cmd[i + 1 : i + 2] == "\n":
+                i += 2   # backslash-newline is deleted inside double quotes
+                continue
             buf.append(ch)
             if quote == "'":
                 closes = ch == "'"
@@ -100,7 +103,12 @@ def _split_segments(cmd: str) -> list[str]:
             i += 1
             continue
         if ch == "\\":   # outside quotes a backslash makes the next character literal
-            buf.append(cmd[i : i + 2])
+            if cmd[i + 1 : i + 2] != "\n":   # backslash-newline is a line continuation and vanishes
+                buf.append(cmd[i : i + 2])
+            i += 2
+            continue
+        if cmd[i : i + 2] == "$$":   # the PID parameter; a following ' is an ordinary quote
+            buf.append("$$")
             i += 2
             continue
         if cmd[i : i + 2] == "$'":
@@ -131,8 +139,41 @@ def _split_segments(cmd: str) -> list[str]:
 
 
 def _strip_heredocs(cmd: str) -> str:
-    """Drop heredoc bodies so file contents are not mistaken for commands."""
-    return _HEREDOC.sub(lambda m: m.group(0)[: m.start(3) - m.start(0)], cmd)
+    """Drop heredoc bodies so file contents are not mistaken for commands.
+
+    Only a << that bash would treat as an operator counts: not quoted, not escaped, not in a # comment."""
+    out: list[str] = []
+    quote: str | None = None
+    i = 0
+    while i < len(cmd):
+        ch = cmd[i]
+        if quote:
+            if ch == "\\" and quote != "'":
+                out.append(cmd[i : i + 2]); i += 2; continue
+            if ch == quote[-1]:
+                quote = None
+            out.append(ch); i += 1; continue
+        two = cmd[i : i + 2]
+        if ch == "\\":
+            out.append(cmd[i : i + 2]); i += 2; continue
+        if two in ("$$", "$'"):
+            if two == "$'":
+                quote = "$'"
+            out.append(two); i += 2; continue
+        if ch in ("'", '"'):
+            quote = ch; out.append(ch); i += 1; continue
+        if ch == "#" and (i == 0 or cmd[i - 1].isspace()):
+            j = cmd.find("\n", i)
+            j = len(cmd) if j < 0 else j
+            out.append(cmd[i:j]); i = j; continue
+        if two == "<<" and cmd[i + 2 : i + 3] != "<":
+            m = _HEREDOC.match(cmd, i)
+            if m:
+                out.append(m.group(0)[: m.start(3) - m.start(0)]); i = m.end(); continue
+        if cmd[i : i + 3] == "<<<":
+            out.append("<<<"); i += 3; continue
+        out.append(ch); i += 1
+    return "".join(out)
 
 
 def _normalise_git(segment: str) -> str:

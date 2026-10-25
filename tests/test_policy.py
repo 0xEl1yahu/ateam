@@ -243,6 +243,7 @@ INVESTIGATE_CD_DENY = [
     r"ls \'; cd ..; ls \'",
     r'ls "a\\"; cd ..',
     r"ls $'\''; cd ..",
+    r"ls $$'\'; cd ..; ls #'",
 ]
 
 
@@ -709,3 +710,37 @@ def test_investigate_interpreter_denial_points_to_read_tool(policy_investigate, 
 def test_investigate_other_denials_do_not_mention_read_tool(policy_investigate):
     ok, reason = policy_investigate.command_allowed("lsof -i")
     assert not ok and "Read tool" not in reason
+
+
+BUILD_RM_DENY_ROUND2 = [
+    r"ls $$'\'; rm x #'",
+    "ls;\\\nrm x",
+    "\\\nrm -rf x",
+    "ls &&\\\nrm x",
+    "ls|\\\nrm x",
+    "ls &\\\nrm x",
+    "ls; \\\nrm x",
+    "r\\\nm x",
+    "cat \\<<EOF\nrm x\nEOF",
+    "cat '<<EOF'\nrm x\nEOF",
+    "cat x # <<EOF\nrm x\nEOF",
+]
+
+
+@pytest.mark.parametrize("cmd", BUILD_RM_DENY_ROUND2)
+def test_build_rm_not_hidden_by_escapes_or_fake_heredocs(policy_build, cmd):
+    ok, reason = policy_build.command_allowed(cmd)
+    assert not ok and reason == RM_REASON, (cmd, reason)
+
+
+def test_double_quoted_fake_heredoc_body_is_checked(policy_build, policy_investigate):
+    # BUILD has no cd rule, so check the body there with rm; INVESTIGATE denies the cd.
+    ok, reason = policy_build.command_allowed('cat "<<EOF"\nrm x\nEOF')
+    assert not ok and reason == RM_REASON
+    ok, reason = policy_investigate.command_allowed('cat "<<EOF"\ncd /\nEOF')
+    assert not ok, reason   # denied (here by the first segment's own rule, not the cd rule)
+
+
+def test_build_real_heredoc_body_is_data(policy_build):
+    assert policy_build.command_allowed("cat <<EOF\nrm x\nEOF")[0]
+    assert policy_build.command_allowed("cat <<-EOF\n\trm x\nEOF")[0]
