@@ -67,13 +67,16 @@ _READ_PREFIX = re.compile(
 _HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n(.*?)(?:^|\n)\2(?:\n|$)", re.S)
 _GIT_GLOBAL_OPTS = re.compile(r"^(\s*git)(?:\s+(?:-[cC]\s*\S+|--?\S+))+(\s+)")
 _WRAPPERS = {"command", "env", "exec", "nice", "nohup", "time", "builtin"}
+_READ_TOOL_HINT_WORDS = {"sed", "awk", "python", "python3", "perl", "ruby", "node"}
 _CD = re.compile(r"^\s*(?:cd|pushd)\b")
 _CD_WORKTREE_REASON = "INVESTIGATE may cd only to a directory inside the worktree"  # absolute paths only; see Policy._cd_target
 _GIT_BRANCH = re.compile(r"^\s*git\s+branch\b(?P<rest>.*)$")
 
 
 def _split_segments(cmd: str) -> list[str]:
-    """Split on &&, ||, ;, | and newlines, but never inside single or double quotes."""
+    """Split on &&, ||, ;, |, a single & (a background job) and newlines, but never inside single or double quotes.
+
+    A & that belongs to >&, <& or &> is a redirect, not a separator."""
     segments: list[str] = []
     buf: list[str] = []
     quote: str | None = None
@@ -94,7 +97,11 @@ def _split_segments(cmd: str) -> list[str]:
         two = cmd[i : i + 2]
         if two in ("&&", "||"):
             segments.append("".join(buf)); buf = []; i += 2; continue
+        if two == "|&":
+            segments.append("".join(buf)); buf = []; i += 2; continue
         if ch in (";", "|", "\n"):
+            segments.append("".join(buf)); buf = []; i += 1; continue
+        if ch == "&" and cmd[i - 1 : i] not in (">", "<") and cmd[i + 1 : i + 2] != ">":
             segments.append("".join(buf)); buf = []; i += 1; continue
         buf.append(ch)
         i += 1
@@ -398,7 +405,10 @@ class Policy:
                     return False, "INVESTIGATE may not pass git -c"
                 norm = _normalise_git(seg)
                 if not any(_starts_with_prefix(norm, p) for p in INVESTIGATE_ALLOWED_PREFIXES):
-                    return False, f"INVESTIGATE may only run read-only inspection commands; {seg.strip()[:40]!r} is not allowed"
+                    reason = f"INVESTIGATE may only run read-only inspection commands; {seg.strip()[:40]!r} is not allowed"
+                    if seg.split()[:1] and seg.split()[0] in _READ_TOOL_HINT_WORDS:
+                        reason += "; use the Read tool with offset and limit to read a line range"
+                    return False, reason
                 if (_WRITE_OPS.search(norm) or _FIND_EXEC.match(norm) or _RG_PRE.match(norm) or _GIT_GREP_PAGER.match(norm)
                         or _OUTPUT_FLAG_CMDS.match(norm) or _uniq_writes(norm) or not _git_branch_read_only(norm)):
                     return False, f"INVESTIGATE may not write, run other programs or change state; {seg.strip()[:40]!r} is not allowed"

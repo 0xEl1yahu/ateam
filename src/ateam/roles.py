@@ -52,7 +52,8 @@ INVESTIGATION_COMMON = (
     "dependencies), Request (planning only) or Discovery limits (discovery only), Checks, Tiers, Rubric, and Handoff "
     f"file. {AUTHORITY} Keep the handoff file named under the Handoff file section up to date; it lives outside the "
     "repository. It is a YAML mapping with the keys progress, unresolved, files, hypotheses and next. End by "
-    "producing the structured report you were asked for."
+    "producing the structured report you were asked for. To read part of a file use the Read tool with offset and "
+    "limit; sed, awk and interpreters are not available to you."
 )
 
 _PROPOSAL = {

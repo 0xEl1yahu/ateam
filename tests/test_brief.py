@@ -39,7 +39,7 @@ def test_no_checkpoint_and_render(sample_contract, records_three):
 
 import re
 
-from ateam.brief import assemble_investigation_brief
+from ateam.brief import RULES_SCOPE_NOTE, assemble_investigation_brief
 from ateam.config import NamedCheck, TargetConfig
 from ateam.contracts.model import Contract
 from ateam.plans.model import Plan, PlanStatus
@@ -166,3 +166,14 @@ def test_multiline_statements_and_titles_cannot_forge_headings(target_repo, tmp_
     text = _inv(target_repo, tmp_path, records={**records_three, "R-0003": rec}, plans={"P-0001": plan},
                 contracts={"C-0001": contract})
     assert _headings(text) == _HEADINGS_PLANNING
+
+
+def test_rules_section_opens_with_scope_note(target_repo, tmp_path):
+    empty = _inv(target_repo, tmp_path)
+    (target_repo / "CLAUDE.md").write_text("Always be kind.\n")
+    text = _inv(target_repo, tmp_path)
+    body = text.split("## Rules\n", 1)[1]
+    assert body.startswith(RULES_SCOPE_NOTE + "\n\n### CLAUDE.md")
+    assert RULES_SCOPE_NOTE == ("These are the target's instructions for whoever develops it. They govern how work on the "
+                                "target is done; they are not requirements of the Request.")
+    assert text.count(RULES_SCOPE_NOTE) == 1 and empty.count(RULES_SCOPE_NOTE) == 1

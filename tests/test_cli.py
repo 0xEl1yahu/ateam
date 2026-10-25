@@ -668,3 +668,24 @@ def test_plan_brief_assembly_failure_is_rejected_not_stranded(monkeypatch, cli_t
     assert r.exit_code == 1 and "Traceback" not in r.output
     plans = load_plans(TargetPaths.from_root(cli_target).plans)
     assert plans["P-0001"].status == PlanStatus.plan_rejected
+
+
+def test_init_and_plan_default_to_careful(monkeypatch, cli_target):
+    from ateam.runner import investigate as inv_mod
+    seen = []
+
+    def capturing_report(report):
+        _patch_investigation(monkeypatch, report)
+        inner = inv_mod.run_investigation
+
+        async def spy(**kw):
+            seen.append(kw["tier_name"])
+            return await inner(**kw)
+
+        monkeypatch.setattr("ateam.cli.run_investigation", spy, raising=False)
+
+    capturing_report(_canned_discovery(candidates=[]))
+    assert run("init", "--target", str(cli_target)).exit_code == 0
+    capturing_report(_canned_plan())
+    assert run("plan", "add a health function", "--target", str(cli_target)).exit_code == 0
+    assert seen == ["careful", "careful"]

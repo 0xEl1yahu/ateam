@@ -196,6 +196,8 @@ INVESTIGATE_MUST_DENY = [
     "ls; touch x",
     "git log | xargs rm",
     'cd "$PWD" && ls',
+    "ls &> out.txt",
+    "cat x 2>&1 | head",  # redirect forms stay denied, as before the & split
 ]
 
 INVESTIGATE_MUST_ALLOW = [
@@ -231,6 +233,10 @@ INVESTIGATE_CD_DENY = [
     "cd . && ls",
     "pushd tests && ls",
     "cd src && cd api && ls",
+    "ls & cd ..; cat .ateam/state.db",
+    "ls &cd ..",
+    "ls & pushd ..",
+    "ls &\ncd ..",
 ]
 
 
@@ -647,3 +653,35 @@ def test_investigate_cd_symlink_inside_allowed_and_both_bases_guard_home(lnk_fix
     for cmd in ("cat ../../.ateam/state.db", "cat ../../../../.ateam/state.db"):
         ok, reason = lnk_fixture.command_allowed(cmd)
         assert not ok and "ATeam's home" in reason, cmd
+
+
+def test_build_background_job_does_not_hide_rm(policy_build):
+    ok, reason = policy_build.command_allowed("ls & rm -rf x")
+    assert not ok and "rm" in reason
+
+
+def test_build_ampersand_forms_still_allowed(policy_build):
+    for cmd in ("cat x 2>&1 | head", "ls >&2", "cat <&0"):
+        assert policy_build.command_allowed(cmd)[0], cmd
+
+
+INVESTIGATE_INTERPRETER_DENY = [
+    "sed -n 1,5p x.py",
+    "awk '{print}' x.py",
+    "python -c 'print(1)'",
+    "python3 x.py",
+    "perl -e 1",
+    "ruby -e 1",
+    "node x.js",
+]
+
+
+@pytest.mark.parametrize("cmd", INVESTIGATE_INTERPRETER_DENY)
+def test_investigate_interpreter_denial_points_to_read_tool(policy_investigate, cmd):
+    ok, reason = policy_investigate.command_allowed(cmd)
+    assert not ok and "use the Read tool with offset and limit" in reason, (cmd, reason)
+
+
+def test_investigate_other_denials_do_not_mention_read_tool(policy_investigate):
+    ok, reason = policy_investigate.command_allowed("lsof -i")
+    assert not ok and "Read tool" not in reason

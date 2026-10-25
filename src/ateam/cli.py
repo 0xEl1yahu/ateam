@@ -177,7 +177,7 @@ def _derivation(target: Path) -> str:
 @main.command()
 @click.option("--remote", default=None, help="Private remote for the intent repo, when creating it.")
 @click.option("--max-candidates", default=DEFAULT_MAX_CANDIDATES, show_default=True, type=int)
-@click.option("--tier", default="standard", show_default=True, type=click.Choice(["light", "standard", "careful"]))
+@click.option("--tier", default="careful", show_default=True, type=click.Choice(["light", "standard", "careful"]))
 @TARGET_OPTION
 def init(remote: str | None, max_candidates: int, tier: str, target: Path) -> None:
     """Discover a small baseline of records from the target and propose them for review."""
@@ -234,7 +234,7 @@ def init(remote: str | None, max_candidates: int, tier: str, target: Path) -> No
 
 @main.command()
 @click.argument("request")
-@click.option("--tier", default="standard", show_default=True, type=click.Choice(["light", "standard", "careful"]))
+@click.option("--tier", default="careful", show_default=True, type=click.Choice(["light", "standard", "careful"]))
 @TARGET_OPTION
 def plan(request: str, tier: str, target: Path) -> None:
     """Turn a feature request into contracts and a plan for approval."""

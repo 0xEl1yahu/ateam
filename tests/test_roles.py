@@ -45,3 +45,8 @@ def test_planner_schema_new_fields_required():
     from ateam.roles import PLANNER_SCHEMA
     for name in ("depends_on_plans", "files_read", "out_of_scope", "verification_approach"):
         assert name in PLANNER_SCHEMA["required"] and name in PLANNER_SCHEMA["properties"]
+
+
+def test_investigation_common_tells_workers_to_use_read_for_line_ranges():
+    from ateam.roles import INVESTIGATION_COMMON
+    assert "Read tool with offset and limit" in INVESTIGATION_COMMON

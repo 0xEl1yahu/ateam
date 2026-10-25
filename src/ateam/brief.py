@@ -101,6 +101,12 @@ DOC_CAP = 12_000
 DEFAULT_MAX_CANDIDATES = 12
 
 
+RULES_SCOPE_NOTE = (
+    "These are the target's instructions for whoever develops it. They govern how work on the target is done; "
+    "they are not requirements of the Request."
+)
+
+
 def _rules(target_root: Path, config: TargetConfig) -> str:
     parts: list[str] = []
     missing: list[str] = []
@@ -127,7 +133,7 @@ def _rules(target_root: Path, config: TargetConfig) -> str:
     if not parts:
         parts.append("No rules files found (CLAUDE.md, AGENTS.md, config brief_docs).")
     parts.extend(f"missing: {rel}" for rel in missing)
-    return "\n\n".join(parts)
+    return RULES_SCOPE_NOTE + "\n\n" + "\n\n".join(parts)
 
 
 def _one_line(text: str) -> str:
