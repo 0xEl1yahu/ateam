@@ -44,6 +44,8 @@ Adapted from the Claude Code team's own published practices (Boris Cherny's "how
 - Test first. Every behaviour change starts with a failing test you watched fail. Table-driven tests for the policy (`tests/test_policy.py`) are the place for new deny and allow strings.
 - Worker sessions use the clean room (`setting_sources=[]`, strict MCP config, slash commands off, auto-memory off, permission mode `default`). Never `--bare`: it does not authenticate with a claude.ai login.
 - Never `str.strip()` the output of `git status --porcelain`.
+- A new worktree's `.venv` comes from the python.org interpreter (`/Library/Frameworks/Python.framework/Versions/3.14/bin/python3.14 -m venv`); the `python3.14` first on PATH here makes venvs without a standard library.
+- In tests, never `monkeypatch.undo()`: it also drops the fixture's `ATEAM_HOME` and the test then writes into the real `~/.ateam`. Scope a patch with `monkeypatch.context()`.
 - Approval commits in a target stage only `.ateam/` paths and use the `ateam:` message prefix.
 - This repo is nested inside an unrelated parent git repo at `~/Documents/GitHub`. Confirm `git rev-parse --show-toplevel` ends in `/ateam` before any git command; never stage the parent.
 - `docs/2026-10-25-product-*.md` were written by another session; leave them unless asked.
