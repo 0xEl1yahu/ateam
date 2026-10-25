@@ -276,5 +276,78 @@ def doctor(target: Path) -> None:
         click.echo(f"git: {e}")
 
 
+# ---------------------------------------------------------------- brief, worker
+
+
+@main.command()
+@click.argument("contract_id")
+@click.option("--role", type=click.Choice(["build", "investigate", "test"]), required=True)
+@TARGET_OPTION
+def brief(contract_id: str, role: str, target: Path) -> None:
+    """Print the brief a worker would receive, without running anything."""
+    from ateam.brief import assemble_brief, render_brief
+    from ateam.checkpoint import Checkpoint
+    from ateam.contracts.store import load_contracts
+    from ateam.records.store import load_records
+    from ateam.roles import Role
+
+    ctx = _context(target)
+    cs = load_contracts(ctx.paths.contracts)
+    if contract_id not in cs:
+        _fail(f"unknown contract {contract_id}")
+    recs = load_records(ctx.paths.records)
+    selected = [recs[ref.id] for ref in cs[contract_id].records if ref.id in recs]
+    prev_raw = ctx.db.latest_checkpoint(contract_id)
+    prev = Checkpoint.from_dict(prev_raw) if prev_raw else None
+    click.echo(render_brief(assemble_brief(cs[contract_id], selected, prev, Role(role))))
+
+
+@main.group()
+def worker() -> None:
+    """Run a single worker (low-level; the scheduler arrives in pass two)."""
+
+
+@worker.command("run")
+@click.argument("contract_id")
+@click.option("--role", type=click.Choice(["build", "investigate", "test"]), required=True)
+@click.option("--cwd", "worktree", type=click.Path(file_okay=False, exists=True, path_type=Path), required=True, help="Worktree to run in.")
+@click.option("--base", default=None, help="Base commit for the diff and scope check (default: worktree HEAD).")
+@click.option("--tier", default=None, help="Override the contract's tier for this role.")
+@click.option("--resume", default=None, help="Resume a previous session id.")
+@click.option("--prompt", default=None, help="Override the default prompt.")
+@TARGET_OPTION
+def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, tier: str | None, resume: str | None, prompt: str | None, target: Path) -> None:
+    import asyncio
+    import json
+
+    from ateam.contracts.store import load_contracts
+    from ateam.records.store import load_records
+    from ateam.roles import Role
+    from ateam.runner.run import run_contract_attempt
+    from ateam.tiers import load_tiers
+
+    ctx = _context(target)
+    cs = load_contracts(ctx.paths.contracts)
+    if contract_id not in cs:
+        _fail(f"unknown contract {contract_id}")
+    contract = cs[contract_id]
+    if tier:
+        contract = contract.model_copy(update={"allocation": contract.allocation.model_copy(update={"tier": {**contract.allocation.tier, role: tier}})})
+    wt_git = GitRepo(worktree)
+    res, tree, scope, cp = asyncio.run(run_contract_attempt(
+        paths=ctx.paths, config=ctx.config, git_worktree=wt_git, worktree=worktree, base=base or wt_git.head(),
+        contract=contract, records=load_records(ctx.paths.records), role=Role(role), tiers=load_tiers(ctx.config.tiers),
+        db=ctx.db, resume=resume, prompt=prompt,
+    ))
+    click.echo(f"session {res.session_id} subtype={res.subtype} turns={res.num_turns} cost=${res.cost_usd:.4f} wall={res.wall_s:.0f}s")
+    if res.denials:
+        click.echo("denials: " + "; ".join(res.denials))
+    if res.error:
+        click.echo(f"error: {res.error}")
+    click.echo(f"scope ok={scope.ok} outside={scope.outside} dirty={scope.dirty} changed={tree.changed_vs_base}")
+    click.echo(json.dumps(res.report, indent=2) if res.report else "no structured report")
+    sys.exit(0 if (res.report and scope.ok) else (3 if res.report else 1))
+
+
 if __name__ == "__main__":
     main()

@@ -1,0 +1,116 @@
+"""Run one worker session and one contract attempt end to end."""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ResultMessage, ToolUseBlock, query
+
+from ateam.brief import assemble_brief, render_brief
+from ateam.checkpoint import Checkpoint, collect
+from ateam.config import TargetConfig
+from ateam.contracts.model import Contract
+from ateam.gitops import GitRepo
+from ateam.paths import TargetPaths
+from ateam.records.model import Record
+from ateam.roles import ROLE_SPECS, Role
+from ateam.runner.options import worker_options
+from ateam.runner.policy import Policy
+from ateam.state.db import StateDB
+from ateam.tiers import TierSpec, resolve
+from ateam.treecheck import ScopeResult, TreeState, scope_check, tree_state
+
+
+@dataclass
+class WorkerResult:
+    subtype: str
+    is_error: bool
+    terminal_reason: str | None
+    session_id: str | None
+    num_turns: int
+    cost_usd: float
+    usage: dict[str, Any]
+    model_usage: dict[str, Any]
+    report: dict | None
+    tool_uses: list[dict]
+    denials: list[str]
+    error: str | None
+    wall_s: float = 0.0
+    text: str = field(default="")
+
+
+async def run_worker(prompt: str, options: ClaudeAgentOptions, policy: Policy) -> WorkerResult:
+    t0 = time.time()
+    tool_uses: list[dict] = []
+    result: ResultMessage | None = None
+    error: str | None = None
+    try:
+        async for m in query(prompt=prompt, options=options):
+            if isinstance(m, AssistantMessage):
+                for block in m.content:
+                    if isinstance(block, ToolUseBlock):
+                        tool_uses.append({"tool": block.name, "input": block.input})
+            elif isinstance(m, ResultMessage):
+                result = m
+    except Exception as e:  # noqa: BLE001  (ResultError, CLI errors, transport errors)
+        error = f"{type(e).__name__}: {e}"
+    wall = time.time() - t0
+    if result is None:
+        return WorkerResult("no_result", True, None, None, 0, 0.0, {}, {}, None, tool_uses, list(policy.denials), error, wall)
+    model_usage = {k: (v.__dict__ if hasattr(v, "__dict__") else v) for k, v in (result.model_usage or {}).items()}
+    report = result.structured_output if isinstance(result.structured_output, dict) else None
+    return WorkerResult(
+        subtype=result.subtype, is_error=bool(result.is_error), terminal_reason=result.terminal_reason,
+        session_id=result.session_id, num_turns=result.num_turns, cost_usd=float(result.total_cost_usd or 0.0),
+        usage=dict(result.usage or {}), model_usage=model_usage, report=report, tool_uses=tool_uses,
+        denials=list(policy.denials), error=error, wall_s=wall, text=result.result or "",
+    )
+
+
+def build_policy(worktree: Path, role: Role, contract: Contract, config: TargetConfig, records: dict[str, Record]) -> Policy:
+    bound: dict[str, list[Record]] = {}
+    for ref in contract.records:
+        r = records.get(ref.id)
+        if r is None:
+            continue
+        for g in r.binds.paths:
+            bound.setdefault(g, []).append(r)
+    return Policy(worktree=worktree, role=role, allowed_paths=list(contract.paths), protected=list(config.protected_paths), bound=bound)
+
+
+def default_prompt(contract: Contract, role: Role) -> str:
+    verb = {Role.build: "Implement", Role.investigate: "Investigate", Role.test: "Judge"}[role]
+    return f"{verb} contract {contract.id}: {contract.title}. Follow the brief in your system prompt and end with the structured report."
+
+
+async def run_contract_attempt(
+    *, paths: TargetPaths, config: TargetConfig, git_worktree: GitRepo, worktree: Path, base: str,
+    contract: Contract, records: dict[str, Record], role: Role, tiers: dict[str, dict[Role, TierSpec]],
+    db: StateDB, resume: str | None = None, prompt: str | None = None,
+) -> tuple[WorkerResult, TreeState, ScopeResult, Checkpoint]:
+    tier = resolve(contract, role, tiers)
+    tier_name = contract.allocation.tier[role.value]
+    policy = build_policy(worktree, role, contract, config, records)
+    selected = [records[ref.id] for ref in contract.records if ref.id in records]
+    prev_raw = db.latest_checkpoint(contract.id)
+    prev = Checkpoint.from_dict(prev_raw) if prev_raw else None
+    brief_text = render_brief(assemble_brief(contract, selected, prev, role))
+    predicted = {k: contract.allocation.model_dump()[k] for k in ("complexity", "risk", "uncertainty")}
+    attempt_id = db.start_attempt(contract.id, role.value, tier_name, tier.model, predicted)
+
+    options = worker_options(cwd=worktree, spec=ROLE_SPECS[role], brief_text=brief_text, policy=policy, tier=tier, resume=resume)
+    res = await run_worker(prompt or default_prompt(contract, role), options, policy)
+
+    tree = tree_state(git_worktree, base)
+    scope = scope_check(tree, contract.paths, contract.incidental)
+    cp = collect(git_worktree, worktree, base, contract, records, res.session_id, checks=[])
+    db.set_checkpoint(contract.id, attempt_id, cp.to_dict())
+    outcome = "completed" if res.report and scope.ok else ("scope_breach" if res.report else "failed")
+    usage = res.usage
+    tokens_in = int(usage.get("input_tokens", 0) or 0) + int(usage.get("cache_read_input_tokens", 0) or 0)
+    tokens_out = int(usage.get("output_tokens", 0) or 0)
+    db.finish_attempt(attempt_id, outcome, None, tokens_in, tokens_out, res.cost_usd, res.num_turns, res.wall_s, res.session_id)
+    return res, tree, scope, cp
