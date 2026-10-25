@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -57,7 +56,6 @@ _READ_PREFIX = re.compile(
 _HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n(.*?)(?:^|\n)\2(?:\n|$)", re.S)
 _GIT_GLOBAL_OPTS = re.compile(r"^(\s*git)(?:\s+(?:-[cC]\s*\S+|--?\S+))+(\s+)")
 _WRAPPERS = {"command", "env", "exec", "nice", "nohup", "time", "builtin"}
-_DANGEROUS_RM_TARGETS = {".", "./", "*", "./*", "/"}
 _CD = re.compile(r"^\s*(?:cd|pushd)\b")
 _GIT_BRANCH = re.compile(r"^\s*git\s+branch\b(?P<rest>.*)$")
 
@@ -102,17 +100,12 @@ def _normalise_git(segment: str) -> str:
     return _GIT_GLOBAL_OPTS.sub(r"\1\2", segment, count=1)
 
 
-def _rm_recursive(segment: str) -> tuple[bool, list[str]]:
-    """(is a recursive rm, its non-flag targets); sees through wrappers, paths and a leading backslash."""
+def _is_rm(segment: str) -> bool:
+    """True for any rm invocation, seen through wrappers, paths and a leading backslash."""
     tokens = segment.split()
     while tokens and tokens[0] in _WRAPPERS:
         tokens = tokens[1:]
-    if not tokens or tokens[0].lstrip("\\").rsplit("/", 1)[-1] != "rm":
-        return False, []
-    recursive = any(
-        t == "--recursive" or (t.startswith("-") and not t.startswith("--") and ("r" in t or "R" in t)) for t in tokens[1:]
-    )
-    return recursive, [t for t in tokens[1:] if not t.startswith("-")]
+    return bool(tokens) and tokens[0].lstrip("\\").rsplit("/", 1)[-1] == "rm"
 
 
 def _starts_with_prefix(segment: str, prefix: str) -> bool:
@@ -174,35 +167,14 @@ class Policy:
 
     # -- commands -----------------------------------------------------------
 
-    def _rm_wipes_tracked(self, targets: list[str]) -> tuple[bool, str]:
-        """A recursive rm may clear caches and build output, never tracked trees or anything outside the worktree."""
-        for t in targets:
-            if t in _DANGEROUS_RM_TARGETS or t.startswith(("/", "~")) or ".." in PurePosixPath(t).parts:
-                return True, f"recursive rm of {t!r} is not allowed"
-        if not targets:
-            return False, ""
-        try:
-            out = subprocess.run(
-                ["git", "ls-files", "-z", "--", *targets], cwd=self.worktree, text=True, capture_output=True, check=True
-            ).stdout
-        except (OSError, subprocess.CalledProcessError):
-            return True, "recursive rm refused: could not confirm the targets are untracked"
-        tracked = [x for x in out.split("\0") if x]
-        if tracked:
-            return True, f"recursive rm would delete tracked files ({tracked[0]}{', ...' if len(tracked) > 1 else ''})"
-        return False, ""
-
     def command_allowed(self, cmd: str) -> tuple[bool, str]:
         for pattern in DESTRUCTIVE_PATTERNS:
             if re.search(pattern, cmd):
                 return False, f"destructive command matched {pattern!r}"
         segments = _split_segments(_strip_heredocs(cmd))
         for seg in segments:
-            recursive, targets = _rm_recursive(seg)
-            if recursive:
-                bad, why = self._rm_wipes_tracked(targets)
-                if bad:
-                    return False, why
+            if _is_rm(seg):
+                return False, "rm is not allowed for workers; use `git rm` for tracked files, cleanup happens at integration"
             if _PROTECTED_MENTION.search(seg):
                 if _CD.match(seg):
                     return False, "changing directory into .ateam/ or .claude/ is not allowed"

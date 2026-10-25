@@ -90,11 +90,21 @@ def default_base(git_worktree: GitRepo, target_branch: str) -> str:
         return git_worktree.head()
 
 
+class WorktreeNotPrepared(Exception):
+    """The worktree cannot host a worker yet."""
+
+
 def prepare_worktree(worktree: Path) -> None:
-    """Create the worker's scratch directory and keep it out of git status (idempotent)."""
-    git = GitRepo(worktree)
+    """Create the worker's scratch directory. Requires the target to ignore it through its tracked .gitignore.
+
+    Only git's own mechanism is used: no clone-local exclude files, so a fresh clone on another
+    machine behaves the same. Pass-two `ateam init` adds the line; until then it is a manual step.
+    """
+    if not GitRepo(worktree).is_ignored(".ateam-scratch/handoff.yaml"):
+        raise WorktreeNotPrepared(
+            "the target does not ignore .ateam-scratch/; add the line `.ateam-scratch/` to its tracked .gitignore and commit it"
+        )
     (worktree / ".ateam-scratch").mkdir(exist_ok=True)
-    git.exclude_in_worktree(worktree, [".ateam-scratch/"])
 
 
 def default_prompt(contract: Contract, role: Role) -> str:

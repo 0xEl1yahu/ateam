@@ -29,6 +29,7 @@ def target_repo(tmp_path: Path) -> Path:
     (root / ".ateam" / "contracts").mkdir()
     (root / ".ateam" / "records" / ".gitkeep").write_text("")
     (root / ".ateam" / "contracts" / ".gitkeep").write_text("")
+    (root / ".gitignore").write_text(".ateam-scratch/\n__pycache__/\n")
     _git(root, "add", "-A")
     _git(root, "commit", "-q", "-m", "initial")
     return root

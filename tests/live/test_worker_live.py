@@ -40,8 +40,6 @@ def live_target(cli_target, sample_contract, tmp_path):
     db.upsert_contract(frozen.id, frozen.plan, frozen.status, frozen.content_hash())
     wt = tmp_path / "wt-C-0001"
     git.worktree_add(wt, "ateam/C-0001", "main")
-    git.exclude_in_worktree(wt, [".ateam-scratch/"])
-    (wt / ".ateam-scratch").mkdir()
     return dict(paths=paths, config=TargetConfig(), git=git, wt=wt, contract=load_contracts(paths.contracts)["C-0001"], records=records, db=db)
 
 

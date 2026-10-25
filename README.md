@@ -47,6 +47,7 @@ There is no `ateam init` or `ateam plan` yet (pass two), so the first record and
 ```bash
 cd ~/code/myrepo                                   # a throwaway clone is the safest first target
 mkdir -p .ateam/records .ateam/contracts
+echo '.ateam-scratch/' >> .gitignore                # the worker's handoff dir; tracked, so every clone agrees
 cp ~/code/ateam/examples/record.example.yaml   .ateam/records/R-0001-reading-state.yaml
 cp ~/code/ateam/examples/contract.example.yaml .ateam/contracts/C-0001-reading-state-api.yaml
 # edit both: statement, evidence, binds.paths, contract paths and acceptance criteria for your repo
@@ -64,7 +65,7 @@ ateam status
 
 A worker refuses to start (exit code 4) unless the contract is frozen, unchanged since the freeze, in a runnable state, and none of its frozen records have changed. `ateam contracts validate` reports hand edits and record drift; `ateam contracts freeze --force` re-freezes deliberately. Workers also refuse to run in the target checkout itself: `--cwd` must be a linked worktree.
 
-`ateam worker run` creates `.ateam-scratch/` in the worktree and adds one line, `.ateam-scratch/`, to the target's `.git/info/exclude` (git shares that file across worktrees), so the worker's handoff file never shows up as untracked.
+`ateam worker run` creates `.ateam-scratch/` in the worktree for the worker's handoff notes and refuses to start (exit code 4) unless the target's tracked `.gitignore` already ignores it. ATeam never uses clone-local files such as `.git/info/exclude`, so a fresh clone on another machine behaves identically. Workers may not run `rm` at all; a tracked file is removed with `git rm`, which shows in the diff, and cleanup belongs to integration.
 
 ## Target repo layout
 

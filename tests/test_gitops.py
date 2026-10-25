@@ -41,16 +41,19 @@ def test_diff_names(target_repo):
     assert g.diff_names(base) == ["src/app.py"]
 
 
-def test_worktree_add_remove_and_exclude(target_repo, tmp_path):
+def test_worktree_add_remove(target_repo, tmp_path):
     g = GitRepo(target_repo)
     wt = tmp_path / "wt"
     g.worktree_add(wt, "wt-test", "main")
     assert (wt / "src/app.py").is_file() and GitRepo(wt).current_branch() == "wt-test"
-    g.exclude_in_worktree(wt, [".ateam-scratch/"])
-    (wt / ".ateam-scratch").mkdir(); (wt / ".ateam-scratch/handoff.yaml").write_text("x: 1\n")
-    assert GitRepo(wt).is_clean()
+    assert GitRepo(wt).is_linked_worktree() and not g.is_linked_worktree()
     g.worktree_remove(wt, force=True)
     assert not wt.exists()
+
+
+def test_is_ignored(target_repo):
+    g = GitRepo(target_repo)
+    assert g.is_ignored(".ateam-scratch/handoff.yaml") and not g.is_ignored("src/app.py")
 
 
 def test_is_clean_prefix_does_not_match_sibling_names(target_repo):

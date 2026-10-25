@@ -290,7 +290,7 @@ Every transition is a row in SQLite with timestamp, actor and reason. `ateam sta
 | Role | May | May not | Ends with |
 |---|---|---|---|
 | INVESTIGATE | read, search, run read-only commands | edit, write, run tests that mutate state | findings report with evidence and proposed records |
-| BUILD | read, edit, write, run checks, commit in its worktree | edit `.ateam/**` or `.claude/**`, touch files outside `paths` plus `incidental`, push, merge | build report: commits, files, checks run, risks, record proposals |
+| BUILD | read, edit, write, run checks, commit in its worktree | edit `.ateam/**` or `.claude/**`, touch files outside `paths` plus `incidental`, push, merge, run `rm` in any form (tracked files go through `git rm`; cleanup is an integration step) | build report: commits, files, checks run, risks, record proposals |
 | TEST | read, run checks and tests, write only under a scratch directory | edit source, edit tests that the contract names, see the builder's transcript | verdict per acceptance criterion with evidence |
 
 Enforcement, in layers:
@@ -352,7 +352,7 @@ Four kinds of context, treated differently:
 Checkpoint per attempt, two layers:
 
 1. **Coordinator-derived facts**, always available even after a crash: worktree base commit and HEAD, list of commits, diff summary, deterministic check results so far, contract hash, record hashes, Claude session ID, tokens and cost. Written to SQLite at every state transition and at attempt end.
-2. **Worker-authored notes**: a small typed `handoff.yaml` in the worktree's untracked scratch directory (`.ateam-scratch/`, excluded in the worktree) that the brief instructs the worker to update at milestones: progress, unresolved issues, files of interest, hypotheses, next actions. The schema is short. The coordinator reads it after the session ends, whatever the reason.
+2. **Worker-authored notes**: a small typed `handoff.yaml` in the worktree's scratch directory (`.ateam-scratch/`, ignored through the target's tracked `.gitignore`, never through clone-local exclude files, so every clone behaves the same; `ateam init` adds the line) that the brief instructs the worker to update at milestones: progress, unresolved issues, files of interest, hypotheses, next actions. The schema is short. The coordinator reads it after the session ends, whatever the reason.
 
 Brief assembly labels its sections by authority. The TEST role receives Binding, Task and Verified prior work only; it never sees a previous worker's notes or report.
 

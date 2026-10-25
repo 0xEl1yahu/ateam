@@ -78,23 +78,10 @@ class GitRepo:
         args = ["worktree", "remove", *(["--force"] if force else []), str(path)]
         self.run(*args)
 
-    def exclude_in_worktree(self, path: Path, patterns: list[str]) -> None:
-        """Add ignore patterns that apply inside `path`.
-
-        Git reads info/exclude from the common dir, shared by every worktree,
-        so the patterns are written there once (idempotently).
-        """
-        common = Path(_run(["git", "rev-parse", "--git-common-dir"], cwd=path).strip())
-        if not common.is_absolute():
-            common = (path / common).resolve()
-        info = common / "info"
-        info.mkdir(parents=True, exist_ok=True)
-        exclude = info / "exclude"
-        existing = exclude.read_text().splitlines() if exclude.is_file() else []
-        missing = [p for p in patterns if p not in existing]
-        if missing:
-            with exclude.open("a") as fh:
-                fh.write("".join(f"{p}\n" for p in missing))
+    def is_ignored(self, path: str) -> bool:
+        """True when git would ignore `path` (tracked .gitignore rules, so the same on every clone)."""
+        r = subprocess.run(["git", "check-ignore", "-q", "--", path], cwd=self.root, text=True, capture_output=True)
+        return r.returncode == 0
 
 def _run(cmd: list[str], cwd: Path) -> str:
     r = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True)

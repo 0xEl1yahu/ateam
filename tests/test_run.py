@@ -107,15 +107,24 @@ async def test_tier_override_is_recorded_without_touching_contract(monkeypatch, 
     assert cp.contract_hash == contract.content_hash() == db.contract_hash("C-0001")
 
 
-def test_prepare_worktree_creates_scratch_and_exclude(target_repo, tmp_path):
+def test_prepare_worktree_requires_tracked_gitignore(target_repo, tmp_path):
     from ateam.gitops import GitRepo
-    from ateam.runner.run import prepare_worktree
+    from ateam.runner.run import WorktreeNotPrepared, prepare_worktree
 
     wt = tmp_path / "wt"
-    GitRepo(target_repo).worktree_add(wt, "wt-prep", "main")
+    g = GitRepo(target_repo)
+    g.worktree_add(wt, "wt-prep", "main")
     prepare_worktree(wt)
     prepare_worktree(wt)  # idempotent
     (wt / ".ateam-scratch/handoff.yaml").write_text("progress: x\n")
     assert (wt / ".ateam-scratch").is_dir() and GitRepo(wt).is_clean()
-    common = GitRepo(wt).run("rev-parse", "--git-common-dir").strip()
-    assert (wt / common / "info/exclude").read_text().count(".ateam-scratch/") == 1
+    common = (wt / GitRepo(wt).run("rev-parse", "--git-common-dir").strip()).resolve()
+    exclude = common / "info/exclude"
+    assert not exclude.exists() or ".ateam-scratch" not in exclude.read_text()
+
+    (target_repo / ".gitignore").write_text("__pycache__/\n")
+    g.run("add", ".gitignore"); g.run("commit", "-q", "-m", "drop ignore")
+    wt2 = tmp_path / "wt2"; g.worktree_add(wt2, "wt-prep2", "main")
+    with pytest.raises(WorktreeNotPrepared, match=".gitignore"):
+        prepare_worktree(wt2)
+    assert not (wt2 / ".ateam-scratch").exists()

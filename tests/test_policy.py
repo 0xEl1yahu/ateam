@@ -22,6 +22,7 @@ def test_path_rules_per_role(policy_build, policy_test, policy_investigate):
 
 
 def test_command_rules(policy_build, policy_investigate):
+    assert "rm" in policy_build.command_allowed("rm src/api/old.py")[1]
     assert not policy_build.command_allowed("echo ok; git push origin main")[0]
     assert not policy_build.command_allowed("echo ok\nrm -rf /tmp/x")[0]
     assert not policy_build.command_allowed("true && git reset --hard HEAD~1")[0]
@@ -130,6 +131,15 @@ BUILD_MUST_DENY = [
     "rm -rf *",
     "rm -rf .",
     "rm -rf /tmp/x",
+    # workers never rm; deletion happens at merge-back
+    "rm src/api/old.py",
+    "rm -rf .pytest_cache",
+    "rm -r build",
+    "rm -rf dist *.egg-info",
+    "\\rm src/api/old.py",
+    "/bin/rm src/api/old.py",
+    "command rm src/api/old.py",
+    "rm -- src/api/old.py",
 ]
 
 BUILD_MUST_ALLOW = [
@@ -143,13 +153,11 @@ BUILD_MUST_ALLOW = [
     "git stash list",
     "git branch --show-current",
     "ls -la src/api",
-    "rm src/api/old.py",
+    "git rm src/api/old.py",
+    "git rm -q --cached src/api/old.py",
     "find src -name '*.py' | wc -l",
     "echo 'progress: half' > .ateam-scratch/handoff.yaml",
     # second review: false positives that must stay allowed
-    "rm -rf .pytest_cache",
-    "rm -r build",
-    "rm -rf dist *.egg-info",
     "cat > src/api/x.py <<'EOF'\nRECORDS = '.ateam/records'\nEOF",
     "find .ateam/records -name '*.yaml'",
     "tree .ateam",
