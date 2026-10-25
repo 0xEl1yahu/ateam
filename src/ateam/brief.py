@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import yaml
 
+from ateam.allocation import rubric_text
 from ateam.checkpoint import Checkpoint
+from ateam.config import TargetConfig
 from ateam.contracts.model import Contract
+from ateam.plans.model import Plan
 from ateam.records.model import Record
 from ateam.roles import Role
 
@@ -91,3 +95,88 @@ def render_brief(b: Brief) -> str:
     if b.notes:
         parts.append("## Previous worker's notes (unverified)\n" + b.notes)
     return "\n\n".join(parts) + "\n"
+
+
+DOC_CAP = 12_000
+DEFAULT_MAX_CANDIDATES = 12
+
+
+def _rules(target_root: Path, config: TargetConfig) -> str:
+    parts: list[str] = []
+    missing: list[str] = []
+    for rel in ["CLAUDE.md", "AGENTS.md", *config.brief_docs]:
+        f = target_root / rel
+        if not f.is_file():
+            if rel in config.brief_docs:
+                missing.append(rel)
+            continue
+        text = f.read_text(errors="replace")
+        if len(text) > DOC_CAP:
+            text = text[:DOC_CAP] + f"\n[truncated at {DOC_CAP} characters]"
+        parts.append(f"### {rel}\n{text.rstrip()}")
+    if not parts:
+        parts.append("No rules files found (CLAUDE.md, AGENTS.md, config brief_docs).")
+    parts.extend(f"missing: {rel}" for rel in missing)
+    return "\n\n".join(parts)
+
+
+def _record_lines(records: dict[str, Record], status: str) -> str:
+    rs = sorted((r for r in records.values() if r.status == status), key=lambda r: r.id)
+    if not rs:
+        return "none"
+    return "\n".join(f"- {r.id} {r.kind} [{', '.join(r.binds.paths) or 'global'}] {r.statement.strip()}" for r in rs)
+
+
+def _plans(plans: dict[str, Plan], contracts: dict[str, Contract]) -> str:
+    if not plans:
+        return "none"
+    lines: list[str] = []
+    for p in sorted(plans.values(), key=lambda p: p.id):
+        lines.append(f"{p.id} {p.status}  {p.title}")
+        for cid in p.contracts:
+            c = contracts.get(cid)
+            if c is not None:
+                lines.append(f"  {c.id} {c.status}  {c.title}  [{', '.join(c.paths)}]")
+    return "\n".join(lines)
+
+
+def _demote_headings(text: str) -> str:
+    """Push a document's own headings down two levels so they cannot be read as top-level brief sections."""
+    return "\n".join("##" + line if line.startswith("#") else line for line in text.splitlines())
+
+
+def assemble_investigation_brief(
+    *,
+    kind: Literal["discovery", "planning"],
+    target_root: Path,
+    config: TargetConfig,
+    records: dict[str, Record],
+    plans: dict[str, Plan],
+    contracts: dict[str, Contract],
+    scratch_dir: Path,
+    request: str | None = None,
+    max_candidates: int | None = None,
+) -> str:
+    """The brief an INVESTIGATE session starts with: the target's rules, records, plan index, checks and handoff path."""
+    sections = [
+        ("Rules", _rules(target_root, config)),
+        (
+            "Records",
+            _record_lines(records, "approved")
+            + "\n\nProposed, not yet approved (not binding; do not re-propose):\n"
+            + _record_lines(records, "proposed"),
+        ),
+        ("Existing plans and contracts", _plans(plans, contracts)),
+    ]
+    if kind == "planning":
+        sections.append(("Request", (request or "").strip()))
+    else:
+        n = DEFAULT_MAX_CANDIDATES if max_candidates is None else max_candidates
+        sections.append(("Discovery limits", f"Propose at most {n} candidates; at most {config.global_record_cap} may be global."))
+    sections += [
+        ("Checks", "\n".join(f"{c.name}: {c.cmd}" for c in config.checks) or "none configured"),
+        ("Tiers", "light, standard, careful; investigate may also be none."),
+        ("Rubric", _demote_headings(rubric_text().strip())),
+        ("Handoff file", str(scratch_dir / "handoff.yaml")),
+    ]
+    return "\n\n".join(f"## {h}\n{body}" for h, body in sections) + "\n"

@@ -28,3 +28,10 @@ def test_roundtrip(target_repo):
     assert cfg.checks[0].cmd == "pytest"
     assert cfg.serialize_checks is True
     assert cfg.env == {"X": "1"}
+
+
+def test_brief_docs_default_empty_and_roundtrip(target_repo):
+    p = TargetPaths.from_root(target_repo)
+    assert TargetConfig().brief_docs == []
+    save_config(p, TargetConfig(brief_docs=["docs/design.md"]))
+    assert load_config(p).brief_docs == ["docs/design.md"]
