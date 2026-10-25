@@ -71,7 +71,7 @@ async def test_pre_tool_use_injects_once(policy_build):
 
 def test_hook_matchers(policy_build):
     hm = policy_build.hook_matchers()
-    assert set(hm) == {"PreToolUse"} and hm["PreToolUse"][0].matcher == "Edit|Write|MultiEdit|NotebookEdit|Bash|Read"
+    assert set(hm) == {"PreToolUse"} and hm["PreToolUse"][0].matcher == "Edit|Write|MultiEdit|NotebookEdit|Bash|Read|Glob|Grep"
 
 
 BUILD_MUST_DENY = [
@@ -463,3 +463,65 @@ async def test_reads_of_ateam_home_denied_for_read_tools_and_bash(policy_inplace
     for cmd in (f"cat {cfg}", f"cat {rel}", f"git -C {target_paths.intent} log", f"cat {home}/*/intent/config.yaml",
                 f"cat {str(home).replace('.ateam', '.ate*')}/*/intent/config.yaml"):
         assert not policy_inplace.command_allowed(cmd)[0], cmd
+
+
+
+# ---- round 3: remaining siblings
+
+INPLACE_DENY_3 = [
+    "find . -name x -fprint0 y",
+    "sort -no out f",
+    "sort -uo out f",
+    "git --git-dir=../.ateam/x/intent/.git log -p",
+    "git -C../.ateam/x/intent log -p",
+]
+
+INPLACE_ALLOW_3 = [
+    "grep -n '```' README.md",
+    "rg 'core.pager' .",
+    "uniq -f 1 f",
+    "uniq -s 2 f",
+    "sort -n f",
+    "sort -u f",
+]
+
+
+@pytest.mark.parametrize("cmd", INPLACE_DENY_3)
+def test_inplace_denied_round3(policy_inplace, cmd):
+    assert not policy_inplace.command_allowed(cmd)[0], f"should deny: {cmd!r}"
+
+
+@pytest.mark.parametrize("cmd", INPLACE_ALLOW_3)
+def test_inplace_allowed_round3(policy_inplace, cmd):
+    ok, reason = policy_inplace.command_allowed(cmd)
+    assert ok, f"should allow: {cmd!r} ({reason})"
+
+
+def test_home_glob_spellings_denied_and_build_regex_allowed(policy_inplace, policy_build, target_paths):
+    home = target_paths.intent.parent.parent
+    parent, name = home.parent, home.name
+    rid = target_paths.intent.parent.name
+    for tok in (f"{parent}/.a*team", f"{parent}/.?team", f"{parent}/.at[e]am", f"{parent}/.*team", f"{parent}/{name[:3]}*/{rid}/intent/config.yaml",
+                f"{parent}/.ate{{am,x}}/{rid}"):
+        assert not policy_inplace.command_allowed(f"ls -R {tok}")[0], tok
+        assert not policy_inplace.command_allowed(f"cat {tok}/*/intent/config.yaml")[0], tok
+    assert not policy_inplace.command_allowed(f"git --git-dir={target_paths.intent}/.git log")[0]
+    assert not policy_inplace.command_allowed(f"git --work-tree={target_paths.intent} --git-dir={target_paths.intent}/.git status")[0]
+    # a regex that merely looks like a glob is fine for BUILD (and for the worktree-side investigate)
+    assert policy_build.command_allowed("grep -rn 'x=.ate*' src")[0]
+    assert policy_inplace.command_allowed("grep -rn 'x=.ate*' src")[0]
+
+
+@pytest.mark.asyncio
+async def test_hook_matcher_covers_glob_and_grep_and_glob_pattern_into_home(policy_inplace, target_paths):
+    hm = policy_inplace.hook_matchers()
+    assert "Glob" in hm["PreToolUse"][0].matcher and "Grep" in hm["PreToolUse"][0].matcher
+    out = await policy_inplace.pre_tool_use({"tool_name": "Grep", "tool_input": {"pattern": ".", "path": str(target_paths.intent.parent)}}, None, None)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    rel = __import__("os").path.relpath(target_paths.intent, policy_inplace.worktree)
+    out = await policy_inplace.pre_tool_use({"tool_name": "Glob", "tool_input": {"pattern": f"{rel}/**/*.yaml"}}, None, None)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    out = await policy_inplace.pre_tool_use({"tool_name": "Glob", "tool_input": {"pattern": f"{target_paths.intent}/**"}}, None, None)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    out = await policy_inplace.pre_tool_use({"tool_name": "Glob", "tool_input": {"pattern": "src/**/*.py"}}, None, None)
+    assert out == {} or out.get("hookSpecificOutput", {}).get("permissionDecision") != "deny"

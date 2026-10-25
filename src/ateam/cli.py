@@ -255,6 +255,7 @@ def plan(request: str, tier: str, target: Path) -> None:
 
     from datetime import UTC, datetime
 
+    from ateam.gitops import GitError
     from ateam.plans.model import Plan, PlanHistoryEntry, PlanStatus
 
     ctx = _context(target)
@@ -280,7 +281,7 @@ def plan(request: str, tier: str, target: Path) -> None:
         save_plan(ctx.paths.plans, rejected)
         try:
             commit_intent(ctx.paths, f"ateam: reject plan {pid} ({reason})", ["plans"])
-        except IntentError:
+        except (IntentError, GitError):
             pass
         current = ctx.db.feature_status(pid)
         if current == "investigating":
@@ -365,7 +366,7 @@ def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, targe
     """Approve a plan: review its proposed records, apply tier overrides, freeze its contracts."""
     from datetime import UTC, datetime
 
-    from ateam.allocation import investigate_tier_for
+    from ateam.allocation import investigate_tier_for, tier_for_complexity, tier_for_test
     from ateam.contracts.model import Level
     from ateam.contracts.select import freeze, select_records
     from ateam.contracts.store import load_contracts, save_contract
@@ -417,6 +418,13 @@ def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, targe
         if tier.get("investigate", "none") == "none" and Level(c.allocation.uncertainty) in (Level.medium, Level.high):
             tier["investigate"] = investigate_tier_for(c.allocation.uncertainty)
             notes.append(f"{cid}: investigate tier set to {tier['investigate']!r} for {c.allocation.uncertainty} uncertainty")
+        if cid in overrides:
+            build_floor = tier_for_complexity(c.allocation.complexity)
+            if ORDER.index(tier["build"]) < ORDER.index(build_floor):
+                notes.append(f"{cid}: build tier {tier['build']!r} is below the rubric floor {build_floor!r} ({c.allocation.complexity} complexity); owner override kept")
+            test_floor = tier_for_test(c.allocation.risk, tier["build"])
+            if ORDER.index(tier["test"]) < ORDER.index(test_floor):
+                notes.append(f"{cid}: test tier {tier['test']!r} is below the rubric floor {test_floor!r} ({c.allocation.risk} risk); owner override kept")
         c = c.model_copy(update={"allocation": c.allocation.model_copy(update={"tier": tier})})
         selected = select_records(c.paths, graph, ctx.paths.root)
         frozen = freeze(c, selected)
@@ -434,7 +442,7 @@ def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, targe
         commit_intent(ctx.paths, f"ateam: approve plan {plan_id}", ["plans", "contracts"])
     except (IntentError, GitError) as e:
         click.echo(f"error: could not commit the approval in the intent repo: {e}")
-        click.echo(f"Nothing was recorded in the state store. Restore the intent repo and re-run:")
+        click.echo("Nothing was recorded in the state store. Restore the intent repo and re-run:")
         click.echo(f"  git -C \"{ctx.paths.intent}\" checkout -- . && git -C \"{ctx.paths.intent}\" clean -fd plans contracts")
         sys.exit(1)
     # The intent repo is the truth; only now does the state store follow it.

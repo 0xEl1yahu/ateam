@@ -48,16 +48,17 @@ _MUTATORS = re.compile(
     r"""(?:\btee\b|\bsed\b[^\n]*\s(?:-[a-zA-Z]*i\b|--in-place\b)|\bcp\b|\bmv\b|\btouch\b|\brm\b|\bmkdir\b|\brmdir\b|\bchmod\b|\bchown\b|\bln\b|\binstall\b|\btruncate\b|\bdd\b|\bpatch\b|\bgit\s+(?:add|commit|checkout|restore|rm|mv|apply)\b)"""
 )
 # Anything that writes at all, for roles that may not write (INVESTIGATE). `-o` is handled per command below.
-_WRITE_OPS = re.compile(r"(?:>>?|<<|\s--output\b|\s-fprintf?\b|\s-fls\b)|" + _MUTATORS.pattern)
+_WRITE_OPS = re.compile(r"(?:>>?|<<|\s--output\b|\s-fprint(?:0|f)?\b|\s-fls\b)|" + _MUTATORS.pattern)
 _SUBSTITUTION = re.compile(r"\$\(|`|<\(|>\(")
 _ENV_PREFIX = re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_]*=\S*\s+\S")
 _FIND_EXEC = re.compile(r"^\s*find\b.*\s-(?:exec|execdir|ok|okdir|delete)\b")
 _RG_PRE = re.compile(r"^\s*rg\b.*\s--pre(?:-glob)?\b")
 _GIT_GREP_PAGER = re.compile(r"^\s*git\s+grep\b.*\s(?:-O\S*|--open-files-in-pager\b)")
 _GIT_DASH_C = re.compile(r"^\s*git\s+(?:(?:-C\s*\S+|--no-pager|--git-dir=\S+|--work-tree=\S+)\s+)*-c\b")
-_OUTPUT_FLAG_CMDS = re.compile(r"^\s*(?:sort|tree|du)\b.*(?:\s-o\S*|\s--output\b)")
+_OUTPUT_FLAG_CMDS = re.compile(r"^\s*(?:tree|du)\b.*(?:\s-o\S*|\s--output\b)|^\s*sort\b.*(?:\s-[A-Za-z]*o(?:\S*)?(?:\s|$)|\s--output\b)")
 _PAGER = re.compile(r"(?i)core\.pager|\bpager\.|GIT_PAGER|GIT_EXTERNAL_DIFF|GIT_EDITOR|\bLESSOPEN\b")
-_GLOBBY_ATEAM = re.compile(r"\.ate[a-z]*[*?\[]")
+_SINGLE_QUOTED = re.compile(r"'[^']*'")
+_WILDCARD = re.compile(r"[*?\[{]")
 _REDIRECT_TARGET = re.compile(r">>?\s*(\S+)")
 _READ_PREFIX = re.compile(
     r"^\s*(?:cat|head|tail|less|more|wc|grep|rg|ls|stat|file|diff|sort|uniq|cut|awk|find|tree|du|sed\s+-n|git\s+(?:diff|show|log|blame|status|ls-files|grep|branch|stash\s+(?:list|show)))\b"
@@ -130,7 +131,17 @@ def _uniq_writes(segment: str) -> bool:
     tokens = segment.split()
     if not tokens or tokens[0] != "uniq":
         return False
-    positional = [t for t in tokens[1:] if not t.startswith("-") or t == "-"]
+    positional: list[str] = []
+    skip = False
+    for t in tokens[1:]:
+        if skip:
+            skip = False
+            continue
+        if t in ("-f", "-s", "-w"):
+            skip = True
+            continue
+        if not t.startswith("-") or t == "-":
+            positional.append(t)
     return len(positional) >= 2
 
 
@@ -210,6 +221,43 @@ class Policy:
             return False
         return not self._in_scratch(str(resolved))
 
+    def _wildcard_reaches_home(self, token: str) -> bool:
+        """A wildcard token whose literal directory part is ATeam's home or one of its ancestors could expand into it."""
+        m = _WILDCARD.search(token)
+        if not m:
+            return False
+        literal = token[: m.start()]
+        directory = literal.rsplit("/", 1)[0] if "/" in literal else "."
+        home = (self.ateam_home or Path(os.environ.get("ATEAM_HOME") or (Path.home() / ".ateam"))).resolve()
+        raw = directory.strip().strip("'\"")
+        if raw.startswith("~"):
+            raw = os.path.expanduser(raw)
+        raw = raw.replace("$HOME", str(Path.home())).replace("${HOME}", str(Path.home()))
+        raw = raw.replace("$ATEAM_HOME", str(home)).replace("${ATEAM_HOME}", str(home))
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = self.worktree / candidate
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return False
+        if resolved == home or resolved in home.parents:
+            return True
+        return self._under_home_not_scratch(str(resolved))
+
+    def _token_paths(self, token: str) -> list[str]:
+        """Path-like pieces of a shell token, including the value side of --flag=value and -Cpath forms."""
+        tok = token.strip().strip("'\"")
+        pieces: list[str] = []
+        if tok.startswith("-"):
+            if "=" in tok:
+                pieces.append(tok.split("=", 1)[1])
+            elif len(tok) > 2 and tok[1] in "CI" and tok[2] not in "-":
+                pieces.append(tok[2:])
+        else:
+            pieces.append(tok)
+        return [p for p in pieces if "/" in p or p.startswith((".", "~", "$"))]
+
     def _home_spellings(self) -> list[str]:
         home = self.ateam_home or Path(os.environ.get("ATEAM_HOME") or (Path.home() / ".ateam"))
         out = set(self._spellings(home)) | {"$ATEAM_HOME", "${ATEAM_HOME}", "~/.ateam", "$HOME/.ateam", "${HOME}/.ateam"}
@@ -251,11 +299,13 @@ class Policy:
             if any(sp in seg for sp in home_spellings) and not mentions_scratch:
                 return False, "ATeam's home (intent repo, state store, logs) is off limits to workers; only your scratch directory is writable"
             if home_spellings:
-                if _GLOBBY_ATEAM.search(seg.replace('"', "").replace("'", "")):
-                    return False, "wildcard paths into ATeam's home are not allowed"
                 for tok in seg.replace('"', "").replace("'", "").split():
-                    if ("/" in tok or tok.startswith(("~", "$", "."))) and not tok.startswith("-") and self._under_home_not_scratch(tok):
-                        return False, "ATeam's home (intent repo, state store, logs) is off limits to workers; only your scratch directory is writable"
+                    for piece in self._token_paths(tok):
+                        if _WILDCARD.search(piece):
+                            if self._wildcard_reaches_home(piece):
+                                return False, "wildcard paths that could reach ATeam's home are not allowed"
+                        elif self._under_home_not_scratch(piece):
+                            return False, "ATeam's home (intent repo, state store, logs) is off limits to workers; only your scratch directory is writable"
             rest = seg
             for sp in [*scratch_spellings, *home_spellings]:
                 rest = rest.replace(sp, " ")
@@ -272,9 +322,10 @@ class Policy:
                 if not _READ_PREFIX.match(_normalise_git(seg)):
                     return False, "shell access to .ateam/ or .claude/ is limited to reading"
         if self.role == Role.investigate:
-            if _SUBSTITUTION.search(cmd):
+            unquoted = _SINGLE_QUOTED.sub("''", cmd)
+            if _SUBSTITUTION.search(unquoted):
                 return False, "INVESTIGATE may not use command or process substitution"
-            if _PAGER.search(cmd):
+            if _PAGER.search(unquoted):
                 return False, "INVESTIGATE may not set pagers, editors or diff drivers"
             for seg in segments:
                 if _ENV_PREFIX.match(seg):
@@ -300,6 +351,15 @@ class Policy:
             target = str(tool_input.get("file_path") or tool_input.get("path") or "")
             if target and self._under_home_not_scratch(target):
                 return False, "ATeam's home (intent repo, state store, logs) is not readable by workers; only your scratch directory is"
+            if tool_name == "Glob":
+                pattern = str(tool_input.get("pattern") or "")
+                base = Path(target) if target else self.worktree
+                m = _WILDCARD.search(pattern)
+                literal = pattern[: m.start()] if m else pattern
+                literal_dir = literal.rsplit("/", 1)[0] if "/" in literal else ""
+                probe = (Path(literal_dir) if Path(literal_dir).is_absolute() else base / literal_dir) if literal_dir else base
+                if self._under_home_not_scratch(str(probe)) or (m and self._wildcard_reaches_home(str(probe / "x*"))):
+                    return False, "ATeam's home (intent repo, state store, logs) is not readable by workers; only your scratch directory is"
         return True, ""
 
     async def can_use_tool(self, tool_name: str, input_data: dict[str, Any], context: Any) -> Any:
@@ -332,4 +392,4 @@ class Policy:
         return {}
 
     def hook_matchers(self) -> dict[str, list[HookMatcher]]:
-        return {"PreToolUse": [HookMatcher(matcher="Edit|Write|MultiEdit|NotebookEdit|Bash|Read", hooks=[self.pre_tool_use])]}
+        return {"PreToolUse": [HookMatcher(matcher="Edit|Write|MultiEdit|NotebookEdit|Bash|Read|Glob|Grep", hooks=[self.pre_tool_use])]}

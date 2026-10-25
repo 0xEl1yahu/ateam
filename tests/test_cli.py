@@ -526,13 +526,17 @@ def test_approve_commit_failure_prints_recovery_and_leaves_store_untouched(monke
     def fail_commit(paths, message, subpaths):
         raise IntentError("simulated commit failure")
 
-    monkeypatch.setattr("ateam.cli.commit_intent", fail_commit, raising=False)
-    import ateam.cli as cli_mod
-    monkeypatch.setattr(cli_mod, "_commit_intent", fail_commit, raising=False)
+    # `commit_intent` must stay a module-level name in ateam.cli for this patch to bite; approve calls it through the module global.
+    monkeypatch.setattr("ateam.cli.commit_intent", fail_commit)
     r = run("approve", "P-0001", "--skip-records", "--target", str(cli_target))
     assert r.exit_code == 1 and "git -C" in r.output and "checkout" in r.output
     db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
     assert db.feature_status("P-0001") == "plan_proposed" and db.contract_hash("C-0002") is None
+    # the printed recovery really restores a clean intent repo
+    import re, subprocess
+    cmd = re.search(r"^\s*(git -C .*)$", r.output, re.M).group(1)
+    subprocess.run(cmd, shell=True, check=True)
+    assert GitRepo(p.intent).is_clean()
 
 
 def test_records_review_all_shows_non_proposed_without_prompting(cli_target):
@@ -541,3 +545,25 @@ def test_records_review_all_shows_non_proposed_without_prompting(cli_target):
     assert r.exit_code == 0 and "R-0001" in r.output and "approved" in r.output and "nothing to decide" in r.output.lower()
     r2 = run("records", "review", "--target", str(cli_target), input="")
     assert "nothing proposed" in r2.output.lower()
+
+
+
+def test_plan_id_allocation_uses_state_store_when_plan_file_is_missing(monkeypatch, cli_target):
+    from ateam.plans.store import load_plans
+    bad = _canned_plan(); bad["contracts"][0]["depends_on"] = [0]
+    _patch_investigation(monkeypatch, bad)
+    assert run("plan", "x", "--target", str(cli_target)).exit_code == 1
+    p = TargetPaths.from_root(cli_target)
+    for f in p.plans.glob("P-0001-*.yaml"):
+        f.unlink()
+    commit_intent(p, "owner deleted the rejected plan file", ["plans"])
+    _patch_investigation(monkeypatch, _canned_plan())
+    assert run("plan", "x", "--target", str(cli_target)).exit_code == 0
+    assert "P-0002" in load_plans(p.plans) and "P-0001" not in load_plans(p.plans)
+
+
+def test_approve_notes_overrides_below_rubric_floor(monkeypatch, cli_target):
+    _proposed_plan(monkeypatch, cli_target, two=True)   # C-0003 has complexity high -> floor careful
+    r = run("approve", "P-0001", "--skip-records", "--tier", "C-0003=light", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert "below the rubric" in r.output and "C-0003" in r.output
