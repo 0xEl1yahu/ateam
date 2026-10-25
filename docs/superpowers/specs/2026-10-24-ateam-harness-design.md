@@ -385,6 +385,21 @@ Owner decision, 2026-10-25: every worker attempt leaves an event log that is the
 - **Viewer.** `ateam watch [P-0001]` opens a tmux session with one window per running attempt tailing its log, a status window, and a window for pauses awaiting the owner. Closing it changes nothing. `ateam log A-0042 [--type policy_denial] [--since seq]` prints events without tmux, for SSH or after the fact.
 - **Retention and privacy.** Logs live in ATeam's home next to the state store, not in the intent repo, because tool results contain code and secrets may pass through them. They are never pushed. Retention is a config value with a default measured in days; events referenced by a record are kept regardless.
 
+## Doctor and medic (pass two)
+
+Owner decision, 2026-10-25. `ateam doctor` is the harness's INVESTIGATE role turned on itself; the medic is its BUILD role. The thing that diagnoses never applies its own fix without a gate, and the split is in authority, not in commands: one `doctor` command with modes, two modules underneath.
+
+- **Findings registry.** Each check is registered once with its severity, the evidence it produces (a path, an event reference `A-<attempt>#<seq>`, a hash pair), its class and, for the auto class, its fix function. A check with no fix registered is propose-only by construction. Neither doctor nor medic uses a model in v1; both are deterministic, which is what lets the medic be trusted with the auto class.
+- **Classes.**
+  - *auto*: ATeam's own operational state, which the design already declares a rebuildable cache. A run lock held by a dead process, an attempt left open by a crash or Ctrl-C, a worktree registration whose directory is gone, a schema one version behind, a missing scratch or log directory. Every one has a correct value recomputable from the intent repo and the worktrees. The medic may apply these without asking.
+  - *propose*: durable intent. Record drift, a hand-edited contract, a superseded record still bound, an intent repo behind or diverged from its remote, a derivation change (`targets.json` disagrees). The fixes are approvals and go through the gates the owner already holds: re-freeze, supersede, pull, `intent init --adopt`. The medic writes proposals, never approves.
+  - *human*: environment and credentials. Claude Code version drift from the spiked version, not logged in, missing Python or git. The doctor instructs; nothing acts.
+  - The target repository is in no class: ATeam never writes there.
+- **Modes.** `ateam doctor` diagnoses and prints the classified list (exit 1 when any finding is not auto-fixable). `ateam doctor --fix` applies the auto class only, re-running each check immediately before its fix so it never acts on a stale diagnosis, and reports what it changed. `ateam doctor --propose` writes the propose-class findings as proposed records or pending actions. `ateam doctor --rebuild` reconstructs the state store from the intent repo and the worktrees.
+- **Documentation and lessons.** Every medic action is an event in the doctor's own log (`A-doctor-<n>#<seq>`) and a line in a doctor report under ATeam's home. A finding that recurs is input for `ateam lessons`: evidence-based, tagged to events, surfaced as a proposed record or policy change for the owner. A repair becomes a lesson, not a habit.
+- **Human in the loop** is everything irreversible, everything that changes truth beyond closing orphaned operational rows, everything in the target, and everything with cost. Not in the loop: idempotent repairs of ATeam's own state whose correct value can be recomputed.
+- **Why one command.** Two commands would cost a two-step flow and two code paths that must agree on every finding type, where a fix drifting from its check is the classic failure. One command with modes keeps the separation where it matters.
+
 ## Discovery
 
 `ateam init <target>`:
