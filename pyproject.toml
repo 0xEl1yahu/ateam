@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ateam"
+version = "0.1.0"
+description = "Engineering harness that drives headless Claude Code against a target repo with durable intent, role-separated workers and human approval gates."
+requires-python = ">=3.14"
+dependencies = [
+    "click>=8.1",
+    "pydantic>=2",
+    "pyyaml>=6",
+    "claude-agent-sdk>=0.2.174,<0.3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+
+[project.scripts]
+ateam = "ateam.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ateam = ["data/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
