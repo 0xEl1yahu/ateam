@@ -65,7 +65,7 @@ def test_investigation_brief_headings_in_order_and_empty_target(target_repo, tmp
     assert "none configured" in text
     assert "light, standard, careful; investigate may also be none." in text
     assert "## Existing plans and contracts\nnone\n" in text
-    assert "## Records\nnone\n\nProposed, not yet approved (not binding; do not re-propose):\nnone\n" in text
+    assert "## Records\nApproved (binding; do not re-propose):\nnone\n\nProposed, not yet approved (not binding; do not re-propose):\nnone\n" in text
 
 
 def test_rules_section_includes_claude_md_and_caps_long_docs(target_repo, tmp_path):
@@ -140,3 +140,29 @@ def test_duplicate_brief_docs_entry_included_once(target_repo, tmp_path):
     (target_repo / "CLAUDE.md").write_text("once")
     text = _inv(target_repo, tmp_path, config=TargetConfig(brief_docs=["CLAUDE.md"]))
     assert text.count("### CLAUDE.md") == 1
+
+
+def test_unreadable_rules_file_is_listed_as_missing_not_raised(target_repo, tmp_path):
+    import os
+
+    if os.geteuid() == 0:
+        import pytest
+
+        pytest.skip("root can read mode 000 files")
+    f = target_repo / "secret.md"
+    f.write_text("hidden")
+    f.chmod(0)
+    try:
+        text = _inv(target_repo, tmp_path, config=TargetConfig(brief_docs=["secret.md"]))
+    finally:
+        f.chmod(0o644)
+    assert "missing: secret.md (unreadable)" in text and "hidden" not in text
+
+
+def test_multiline_statements_and_titles_cannot_forge_headings(target_repo, tmp_path, records_three, sample_contract):
+    rec = records_three["R-0003"].model_copy(update={"statement": "line one\n## Records\nline three"})
+    plan = Plan(id="P-0001", title="T\n## Checks", request="r", status=PlanStatus.plan_proposed, contracts=["C-0001"])
+    contract = sample_contract.model_copy(update={"title": "C\n## Tiers"})
+    text = _inv(target_repo, tmp_path, records={**records_three, "R-0003": rec}, plans={"P-0001": plan},
+                contracts={"C-0001": contract})
+    assert _headings(text) == _HEADINGS_PLANNING

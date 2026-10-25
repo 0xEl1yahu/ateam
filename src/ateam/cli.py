@@ -261,14 +261,6 @@ def plan(request: str, tier: str, target: Path) -> None:
     pid = f"P-{max(disk_next, db_next):04d}"
     ctx.db.transition("feature", pid, "requested", by="owner", reason=request[:200])
     ctx.db.transition("feature", pid, "investigating", by="ateam")
-    records = load_records(ctx.paths.records)
-    tiers = load_tiers(ctx.config.tiers)
-    existing_plans = load_plans(ctx.paths.plans)
-    brief = assemble_investigation_brief(
-        kind="planning", target_root=ctx.paths.root, config=ctx.config, records=records,
-        plans=existing_plans, contracts=load_contracts(ctx.paths.contracts),
-        scratch_dir=ctx.paths.scratch_root / pid, request=request,
-    )
     def _rejected(reason: str) -> None:
         """Leave a visible, terminal trace: a rejected plan file (committed) and the feature state."""
         rejected = Plan(id=pid, title=request[:80], request=request, status=PlanStatus.plan_rejected,
@@ -283,6 +275,19 @@ def plan(request: str, tier: str, target: Path) -> None:
             ctx.db.transition("feature", pid, "plan_proposed", by="ateam")
         if ctx.db.feature_status(pid) == "plan_proposed":
             ctx.db.transition("feature", pid, "plan_rejected", by="ateam", reason=reason)
+
+    try:
+        records = load_records(ctx.paths.records)
+        tiers = load_tiers(ctx.config.tiers)
+        existing_plans = load_plans(ctx.paths.plans)
+        brief = assemble_investigation_brief(
+            kind="planning", target_root=ctx.paths.root, config=ctx.config, records=records,
+            plans=existing_plans, contracts=load_contracts(ctx.paths.contracts),
+            scratch_dir=ctx.paths.scratch_root / pid, request=request,
+        )
+    except Exception as e:  # noqa: BLE001  the feature is already investigating; never strand it
+        _rejected(f"brief assembly failed: {type(e).__name__}")
+        _fail(f"could not assemble the planning brief: {e}. Re-run: ateam plan \"{request}\"")
 
     try:
         result = asyncio.run(run_investigation(

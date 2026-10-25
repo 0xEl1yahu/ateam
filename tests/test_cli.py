@@ -591,8 +591,8 @@ def _capture_investigation(monkeypatch, report):
 
 
 def _section(brief: str, heading: str) -> str:
-    after = brief.split(f"## {heading}\n", 1)[1]
-    return after.split("\n## ", 1)[0]
+    sections = ("\n" + brief).split("\n## ")[1:]
+    return next(sec.split("\n", 1)[1] for sec in sections if sec.split("\n", 1)[0] == heading)
 
 
 def test_plan_brief_contains_rules_records_and_plan_index(monkeypatch, cli_target):
@@ -652,3 +652,19 @@ def test_plan_missing_budget_uses_tier(monkeypatch, cli_target):
     assert r.exit_code == 0, r.output
     c = load_contracts(TargetPaths.from_root(cli_target).contracts)["C-0002"]
     assert c.budget == budget_for("light", load_tiers())
+
+
+def test_plan_brief_assembly_failure_is_rejected_not_stranded(monkeypatch, cli_target):
+    from ateam.plans.model import PlanStatus
+    from ateam.plans.store import load_plans
+
+    _capture_investigation(monkeypatch, _canned_plan())
+
+    def boom(**kw):
+        raise OSError("disk on fire")
+
+    monkeypatch.setattr("ateam.cli.assemble_investigation_brief", boom, raising=False)
+    r = run("plan", "x", "--target", str(cli_target))
+    assert r.exit_code == 1 and "Traceback" not in r.output
+    plans = load_plans(TargetPaths.from_root(cli_target).plans)
+    assert plans["P-0001"].status == PlanStatus.plan_rejected

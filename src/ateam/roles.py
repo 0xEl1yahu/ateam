@@ -50,7 +50,7 @@ INVESTIGATION_COMMON = (
     "Rules (the target's own instructions; authoritative), Records (approved records are binding; proposed ones are "
     "not and must not be re-proposed), Existing plans and contracts (what is already planned; avoid overlap and name "
     "dependencies), Request (planning only) or Discovery limits (discovery only), Checks, Tiers, Rubric, and Handoff "
-    f"file. {AUTHORITY} Keep the handoff file named under 'Handoff file:' up to date; it lives outside the "
+    f"file. {AUTHORITY} Keep the handoff file named under the Handoff file section up to date; it lives outside the "
     "repository. It is a YAML mapping with the keys progress, unresolved, files, hypotheses and next. End by "
     "producing the structured report you were asked for."
 )
@@ -308,8 +308,7 @@ DISCOVERY_SPEC = RoleSpec(
         "does today), requirement only when a document states the intent. Cite evidence as path[:line], path::test, or "
         "commit <sha>. Bind the narrowest glob the evidence supports; never bind the whole repository unless the rule is "
         "truly global. Separate what the code does from what it is meant to do, and never promote a bug or a workaround "
-        "into a rule. List what you could not determine as unknowns instead of guessing. You never modify files or state; "
-        "shell commands are limited to read-only inspection. " + INVESTIGATION_COMMON
+        "into a rule. List what you could not determine as unknowns instead of guessing. " + INVESTIGATION_COMMON
     ),
     report_schema=DISCOVERY_SCHEMA,
 )
@@ -318,8 +317,8 @@ PLANNER_SPEC = RoleSpec(
     role=Role.investigate,
     tools=_INVESTIGATE_TOOLS,
     system_prompt=(
-        "ROLE: INVESTIGATE, task: planning. Given the feature request, the index of approved records, the configured "
-        "checks and the allocation rubric in your brief, produce a plan: a list of contracts, each independently "
+        "ROLE: INVESTIGATE, task: planning. Given the Request, Records, Checks and Rubric sections of your "
+        "brief, produce a plan: a list of contracts, each independently "
         "verifiable. For every contract: declared paths must include every file a BUILD worker will change, including the "
         "test files it must write; acceptance criteria use a test check naming path::test inside the contract's paths, or a "
         "judgment check that cites the record it protects; depends_on lists indices into this same list, no cycles; checks "

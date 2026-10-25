@@ -115,21 +115,30 @@ def _rules(target_root: Path, config: TargetConfig) -> str:
             if rel in config.brief_docs:
                 missing.append(rel)
             continue
-        text = _demote_headings(f.read_text(errors="replace"), 3)
+        try:
+            text = f.read_text(errors="replace")
+        except OSError:
+            missing.append(f"{rel} (unreadable)")
+            continue
+        marker = ""
         if len(text) > DOC_CAP:
-            text = text[:DOC_CAP] + f"\n[truncated at {DOC_CAP} characters]"
-        parts.append(f"### {rel}\n{text.rstrip()}")
+            text, marker = text[:DOC_CAP], f"\n[truncated at {DOC_CAP} characters]"
+        parts.append(f"### {rel}\n{_demote_headings(text, 3).rstrip()}{marker}")
     if not parts:
         parts.append("No rules files found (CLAUDE.md, AGENTS.md, config brief_docs).")
     parts.extend(f"missing: {rel}" for rel in missing)
     return "\n\n".join(parts)
 
 
+def _one_line(text: str) -> str:
+    return " ".join(text.split())
+
+
 def _record_lines(records: dict[str, Record], status: str) -> str:
     rs = sorted((r for r in records.values() if r.status == status), key=lambda r: r.id)
     if not rs:
         return "none"
-    return "\n".join(f"- {r.id} {r.kind} [{', '.join(r.binds.paths) or 'global'}] {r.statement.strip()}" for r in rs)
+    return "\n".join(f"- {r.id} {r.kind} [{', '.join(r.binds.paths) or 'global'}] {_one_line(r.statement)}" for r in rs)
 
 
 def _plans(plans: dict[str, Plan], contracts: dict[str, Contract]) -> str:
@@ -137,11 +146,11 @@ def _plans(plans: dict[str, Plan], contracts: dict[str, Contract]) -> str:
         return "none"
     lines: list[str] = []
     for p in sorted(plans.values(), key=lambda p: p.id):
-        lines.append(f"{p.id} {p.status}  {p.title}")
+        lines.append(f"{p.id} {p.status}  {_one_line(p.title)}")
         for cid in p.contracts:
             c = contracts.get(cid)
             if c is not None:
-                lines.append(f"  {c.id} {c.status}  {c.title}  [{', '.join(c.paths)}]")
+                lines.append(f"  {c.id} {c.status}  {_one_line(c.title)}  [{', '.join(c.paths)}]")
     return "\n".join(lines)
 
 
@@ -167,7 +176,8 @@ def assemble_investigation_brief(
         ("Rules", _rules(target_root, config)),
         (
             "Records",
-            _record_lines(records, "approved")
+            "Approved (binding; do not re-propose):\n"
+            + _record_lines(records, "approved")
             + "\n\nProposed, not yet approved (not binding; do not re-propose):\n"
             + _record_lines(records, "proposed"),
         ),
