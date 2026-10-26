@@ -1435,6 +1435,7 @@ def test_investigate_git_config_from_decoded_words(policy_investigate, cmd, reas
 
 
 @pytest.mark.parametrize("cmd", [
+    "rg --pretty x",   # --pre is the pre-processor; --pretty is output formatting
     "find src -name '*.py' -o -name '*.md'",   # find's -o is OR, not an output flag
     "grep -o greet src/app.py",                 # grep's -o prints only the match
     "ls -o src",

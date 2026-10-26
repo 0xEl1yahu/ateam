@@ -942,7 +942,7 @@ def _option_writes(words: list[str]) -> bool:
     if name == "find":
         return any(a in _FIND_RUNS or a in _FIND_WRITES for a in args)
     if name == "rg":
-        return any(a.startswith("--pre") for a in args)
+        return any(a == "--pre" or a.startswith(("--pre=", "--pre-glob")) for a in args)   # not --pretty
     if name in ("tree", "du"):
         return any(re.match(r"-[A-Za-z]*o", a) for a in args if not a.startswith("--"))
     if name == "sort":

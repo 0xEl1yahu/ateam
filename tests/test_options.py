@@ -11,6 +11,10 @@ def test_clean_env_keeps_login_state_and_sets_its_own(monkeypatch):
     monkeypatch.setenv("PATH", "/usr/bin")
     e = clean_env()
     assert e["CLAUDE_CONFIG_DIR"] == "/tmp/elsewhere" and e["PATH"] == "/usr/bin"
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "cli")
+    e = clean_env()
+    assert "CLAUDECODE" not in e and "CLAUDE_CODE_ENTRYPOINT" not in e   # nested-session markers are not passed on
     assert e["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1" and e["SHELL"] == e["CLAUDE_CODE_SHELL"] == "/bin/bash"
 
 
