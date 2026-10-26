@@ -838,6 +838,8 @@ def test_approve_does_not_claim_supersede_when_old_feature_moved_on(monkeypatch,
     db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
     db.transition("feature", "P-0001", "plan_rejected", by="owner")
     r = run("approve", "P-0002", "--skip-records", "--target", str(cli_target))
+    assert r.exit_code == 1 and "would leave two live plans" in r.output
+    r = run("approve", "P-0002", "--skip-records", "--force", "--target", str(cli_target))
     assert r.exit_code == 0, r.output
     assert "P-0001 -> superseded" not in r.output
 
@@ -1031,7 +1033,7 @@ def test_review_intent_tamper_writes_plan_but_commits_nothing(monkeypatch, cli_t
     assert r.exit_code == 0, r.output
     intent = TargetPaths.from_root(cli_target).intent
     assert "warning: the review session changed the intent repo; nothing was committed." in r.output
-    assert (f'git -C "{intent}" add contracts/C-0002-add-health.yaml plans/P-0001-health-endpoint.yaml && '
+    assert (f'git -C "{intent}" add -- contracts/C-0002-add-health.yaml plans/P-0001-health-endpoint.yaml && '
             f'git -C "{intent}" commit -m "ateam: propose plan P-0001"') in r.output
     assert _intent_subject(cli_target) == before and _untracked_plan_file(cli_target)
     stored = _stored_plan(cli_target)
@@ -1059,7 +1061,7 @@ def test_planner_intent_tamper_writes_rejected_plan_but_commits_nothing(monkeypa
     assert r.exit_code == 1
     intent = TargetPaths.from_root(cli_target).intent
     assert "warning: the planner session changed the intent repo; nothing was committed." in r.output
-    assert f'git -C "{intent}" add plans/P-0001-add-a-health-function.yaml && git -C "{intent}" commit -m "ateam: reject plan P-0001' in r.output
+    assert f'git -C "{intent}" add -- plans/P-0001-add-a-health-function.yaml && git -C "{intent}" commit -m "ateam: reject plan P-0001' in r.output
     assert _intent_subject(cli_target) == before and _untracked_plan_file(cli_target)
     assert _stored_plan(cli_target).status == "plan_rejected"
     db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
@@ -1506,3 +1508,225 @@ def test_verify_leaves_the_owner_checkout_untouched(cli_target, tmp_path):
     _do_work(wt)
     assert _verify(cli_target, wt).exit_code == 0
     assert (GitRepo(cli_target).head(), GitRepo(cli_target).status_porcelain()) == before
+
+
+# ---- final review fix wave (2026-10-26)
+
+def _db(cli_target):
+    db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
+    return db
+
+
+def _manual_command(output: str) -> str:
+    import re
+    return re.search(r"(git -C \"[^\"]+\" add -- .*? -- [^\n]*)", output).group(1)
+
+
+# Items 5 and 16: a failing proposal commit warns with the exact command, still records plan_proposed, and exits 1.
+def test_plan_proposal_commit_failure_warns_transitions_and_exits_1(monkeypatch, cli_target):
+    import subprocess
+    import ateam.cli as cli_mod
+    from ateam.intent import IntentError
+
+    real = cli_mod.commit_intent_files
+
+    def fail_proposal(paths, message, files):
+        if message.startswith("ateam: propose plan"):
+            raise IntentError("simulated hook failure")
+        return real(paths, message, files)
+
+    _review_investigation(monkeypatch, [_canned_plan()], _DEFENSIBLE)
+    monkeypatch.setattr("ateam.cli.commit_intent_files", fail_proposal)
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 1 and "Traceback" not in r.output, r.output
+    intent = TargetPaths.from_root(cli_target).intent
+    names = "contracts/C-0002-add-health.yaml plans/P-0001-health-endpoint.yaml"
+    assert "warning: could not commit the plan in the intent repo: simulated hook failure; nothing was committed." in r.output
+    assert (f'git -C "{intent}" add -- {names} && git -C "{intent}" commit -m "ateam: propose plan P-0001" -- {names}') in r.output
+    assert "ateam approve P-0001" in r.output   # the review is still printed
+    assert _stored_plan(cli_target).status == "plan_proposed" and _db(cli_target).feature_status("P-0001") == "plan_proposed"
+    subprocess.run(_manual_command(r.output), shell=True, check=True)
+    g = GitRepo(intent)
+    assert g.is_clean() and g.run("log", "-1", "--format=%s").strip() == "ateam: propose plan P-0001"
+
+
+# Items 8 and 18: the printed command commits exactly the named files, even when something else is staged.
+def test_tamper_recovery_command_commits_only_the_named_files(monkeypatch, cli_target):
+    import subprocess
+    _review_investigation(monkeypatch, [_canned_plan()], "intent_tamper")
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    intent = TargetPaths.from_root(cli_target).intent
+    assert f'Inspect: git -C "{intent}" status' in r.output
+    (intent / "records" / "R-0099-planted.yaml").write_text("id: R-0099\n")
+    GitRepo(intent).run("add", "records/R-0099-planted.yaml")   # staged by the session, say
+    subprocess.run(_manual_command(r.output), shell=True, check=True)
+    g = GitRepo(intent)
+    assert sorted(g.run("show", "--name-only", "--format=", "HEAD").split()) == [
+        "contracts/C-0002-add-health.yaml", "plans/P-0001-health-endpoint.yaml"]
+    assert "A  records/R-0099-planted.yaml" in g.run("status", "--porcelain").splitlines()
+
+
+def test_rejected_plan_commit_failure_prints_the_command(monkeypatch, cli_target):
+    import ateam.cli as cli_mod
+    from ateam.intent import IntentError
+
+    real = cli_mod.commit_intent_files
+
+    def fail_reject(paths, message, files):
+        if message.startswith("ateam: reject plan"):
+            raise IntentError("simulated index lock")
+        return real(paths, message, files)
+
+    _review_investigation(monkeypatch, [{"title": "x", "contracts": [], "unknowns": [], "notes": ""}], _DEFENSIBLE)
+    monkeypatch.setattr("ateam.cli.commit_intent_files", fail_reject)
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 1 and "Traceback" not in r.output
+    intent = TargetPaths.from_root(cli_target).intent
+    assert "warning: could not commit the rejected plan in the intent repo: simulated index lock" in r.output
+    assert f'git -C "{intent}" add -- plans/P-0001-' in r.output and '-- plans/P-0001-' in r.output.split("commit -m")[1]
+    assert _db(cli_target).feature_status("P-0001") == "plan_rejected"
+
+
+def test_covered_commit_failure_prints_the_pathspec_command(monkeypatch, cli_target):
+    from ateam.intent import IntentError
+    _proposed_plan(monkeypatch, cli_target)
+    _patch_investigation(monkeypatch, {"title": "Health again", "contracts": [], "depends_on_plans": ["P-0001"], "unknowns": [], "notes": "n"})
+
+    def fail_commit(paths, message, subpaths):
+        raise IntentError("simulated commit failure")
+
+    monkeypatch.setattr("ateam.cli.commit_intent_files", fail_commit)
+    r = run("plan", "health check again", "--target", str(cli_target))
+    intent = TargetPaths.from_root(cli_target).intent
+    f = "plans/P-0002-health-again.yaml"
+    assert f'git -C "{intent}" add -- {f} && git -C "{intent}" commit -m "ateam: plan P-0002 covered by P-0001" -- {f}' in r.output
+
+
+# Items 7 and 17: approving either side of a --replaces pair never leaves two live plans.
+def _replacement_pair(monkeypatch, cli_target):
+    p = _proposed_plan(monkeypatch, cli_target)
+    _patch_investigation(monkeypatch, _canned_plan())
+    assert run("plan", "a better health function", "--replaces", "P-0001", "--target", str(cli_target)).exit_code == 0
+    return p
+
+
+def test_approve_refuses_a_plan_a_proposed_plan_replaces(monkeypatch, cli_target):
+    from ateam.plans.store import load_plans
+    p = _replacement_pair(monkeypatch, cli_target)
+    r = run("approve", "P-0001", "--skip-records", "--target", str(cli_target))
+    assert r.exit_code == 1 and "P-0001 is replaced by proposed plan P-0002; approve or reject P-0002 first" in r.output
+    plans = load_plans(p.plans)
+    assert plans["P-0001"].status == "plan_proposed" and plans["P-0002"].status == "plan_proposed"
+    db = _db(cli_target)
+    assert db.feature_status("P-0001") == "plan_proposed" and db.contract_hash("C-0002") is None
+    assert GitRepo(p.intent).is_clean()
+    # rejecting the replacement frees the old plan
+    assert run("reject", "P-0002", "kept the first", "--target", str(cli_target)).exit_code == 0
+    assert run("approve", "P-0001", "--skip-records", "--target", str(cli_target)).exit_code == 0
+
+
+@pytest.mark.parametrize("where", ["store", "file"])
+def test_approve_replacement_refuses_when_the_old_plan_is_not_proposed_in_file_and_store(where, monkeypatch, cli_target):
+    from ateam.plans.model import PlanStatus
+    from ateam.plans.store import load_plans, save_plan
+    p = _replacement_pair(monkeypatch, cli_target)
+    db = _db(cli_target)
+    if where == "store":
+        db.transition("feature", "P-0001", "plan_rejected", by="owner")
+    else:
+        save_plan(p.plans, load_plans(p.plans)["P-0001"].model_copy(update={"status": PlanStatus.plan_rejected}))
+        commit_intent(p, "hand edit", ["plans"])
+    head = GitRepo(p.intent).head()
+    r = run("approve", "P-0002", "--skip-records", "--target", str(cli_target))
+    assert r.exit_code == 1, r.output
+    assert "P-0001 is plan_rejected; approving P-0002 would leave two live plans for the same request" in r.output
+    assert "--force" in r.output
+    plans = load_plans(p.plans)
+    assert plans["P-0002"].status == "plan_proposed"
+    assert plans["P-0001"].status == ("plan_proposed" if where == "store" else "plan_rejected")
+    assert db.feature_status("P-0002") == "plan_proposed" and db.contract_hash("C-0003") is None
+    assert GitRepo(p.intent).head() == head and GitRepo(p.intent).is_clean()
+
+
+def test_approve_replacement_with_force_approves_without_superseding(monkeypatch, cli_target):
+    from ateam.plans.store import load_plans
+    p = _replacement_pair(monkeypatch, cli_target)
+    db = _db(cli_target)
+    db.transition("feature", "P-0001", "plan_rejected", by="owner")
+    r = run("approve", "P-0002", "--skip-records", "--force", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert "P-0001 -> superseded" not in r.output
+    plans = load_plans(p.plans)
+    assert plans["P-0002"].status == "plan_approved" and plans["P-0001"].status == "plan_proposed"
+    assert db.feature_status("P-0002") == "plan_approved" and db.feature_status("P-0001") == "plan_rejected"
+
+
+# Item 6 (owner, 2026-10-26): worker run exits 5 when a TEST attempt is classified failed.
+def _fake_attempt(monkeypatch, report, scope_ok=True):
+    from types import SimpleNamespace
+    from ateam.runner.run import WorkerResult
+
+    async def fake(**kw):
+        res = WorkerResult("success", False, "completed", "s", 1, 0.001, {}, {}, report, [], [], None, 0.1)
+        tree = SimpleNamespace(changed_vs_base=[])
+        scope = SimpleNamespace(ok=scope_ok, outside=[] if scope_ok else ["x"], dirty=[])
+        return res, tree, scope, None
+
+    monkeypatch.setattr("ateam.runner.run.run_contract_attempt", fake)
+
+
+_MET = {"verdicts": [{"id": "A1", "verdict": "met"}], "requirements_unclear": False}
+_NOT_MET = {"verdicts": [{"id": "A1", "verdict": "not_met"}], "requirements_unclear": False}
+
+
+@pytest.mark.parametrize("role,report,scope_ok,code", [
+    ("test", _NOT_MET, True, 5),
+    ("test", _MET, True, 0),
+    ("build", _NOT_MET, True, 0),   # only a TEST attempt is classified
+    ("test", _NOT_MET, False, 3),
+    ("test", None, True, 1),
+])
+def test_worker_run_exit_codes(role, report, scope_ok, code, monkeypatch, cli_target, tmp_path):
+    _frozen_target(cli_target)
+    wt = tmp_path / "wt-exit"; GitRepo(cli_target).worktree_add(wt, "wt-exit", "main")
+    _fake_attempt(monkeypatch, report, scope_ok)
+    r = run("worker", "run", "C-0001", "--role", role, "--cwd", str(wt), "--target", str(cli_target))
+    assert r.exit_code == code, r.output
+    if code == 5:
+        assert "classification: failed/implementation" in r.output
+
+
+# Item 20: a contract that does not bind never triggers setup.
+def test_worker_run_checks_binding_before_setup(cli_target, tmp_path):
+    from ateam.config import load_config, save_config
+    from ateam.runner.run import setup_key
+
+    paths = TargetPaths.from_root(cli_target)
+    cfg = load_config(paths); cfg.setup = ["touch setup-ran"]; save_config(paths, cfg)
+    wt = tmp_path / "wt-unbound"; GitRepo(cli_target).worktree_add(wt, "wt-unbound", "main")
+    r = run("worker", "run", "C-0001", "--role", "build", "--cwd", str(wt), "--target", str(cli_target))
+    assert r.exit_code == 4 and "not frozen" in r.output
+    assert not (wt / "setup-ran").exists() and _db(cli_target).get_meta(setup_key(wt)) is None
+
+
+
+# Item 29: a covered outcome does not supersede the plan named by --replaces.
+def test_covered_outcome_with_replaces_says_nothing_was_superseded(monkeypatch, cli_target):
+    from ateam.plans.store import load_plans
+    p = _proposed_plan(monkeypatch, cli_target)
+    _patch_investigation(monkeypatch, _canned_plan())
+    assert run("plan", "another health function", "--target", str(cli_target)).exit_code == 0   # P-0002, live
+    _patch_investigation(monkeypatch, {"title": "Health again", "contracts": [], "depends_on_plans": ["P-0002"], "unknowns": [], "notes": "n"})
+    r = run("plan", "health check again", "--replaces", "P-0001", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert "P-0001 is not superseded; only approval supersedes" in r.output
+    assert load_plans(p.plans)["P-0001"].status == "plan_proposed"
+
+
+# Item 10: the planner-output message says what was not written.
+def test_invalid_planner_output_says_no_contracts_were_written(monkeypatch, cli_target):
+    bad = _canned_plan(); bad["contracts"][0]["depends_on"] = [0]
+    _patch_investigation(monkeypatch, bad)
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert "The planner's output is not usable; no contracts were written. Problems:" in r.output

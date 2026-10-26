@@ -272,12 +272,16 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
     pid = f"P-{max(disk_next, db_next):04d}"
     ctx.db.transition("feature", pid, "requested", by="owner", reason=request[:200])
     ctx.db.transition("feature", pid, "investigating", by="ateam")
-    def _uncommitted(session: str, files: list[Path], message: str) -> None:
-        """A session changed the intent repo: the files stay written for the owner to inspect, but no ateam: commit may carry a planted file."""
+    def _manual(files: list[Path], message: str) -> str:
+        """The command that commits exactly `files` by hand; the pathspec on `commit` keeps anything else staged out."""
         intent = ctx.paths.intent
         names = " ".join(intent_relpath(ctx.paths, f) for f in files)
-        click.echo(f"warning: the {session} session changed the intent repo; nothing was committed. Inspect: git -C \"{intent}\" status, "
-                   f"then commit the plan by hand: git -C \"{intent}\" add {names} && git -C \"{intent}\" commit -m \"{message}\"")
+        return f"git -C \"{intent}\" add -- {names} && git -C \"{intent}\" commit -m \"{message}\" -- {names}"
+
+    def _uncommitted(session: str, files: list[Path], message: str) -> None:
+        """A session changed the intent repo: the files stay written for the owner to inspect, but no ateam: commit may carry a planted file."""
+        click.echo(f"warning: the {session} session changed the intent repo; nothing was committed. Inspect: git -C \"{ctx.paths.intent}\" status, "
+                   f"then commit the plan by hand: {_manual(files, message)}")
 
     def _rejected(reason: str, tampered: list[str] | None = None) -> None:
         """Leave a visible, terminal trace: a rejected plan file (committed unless the intent repo was changed) and the feature state."""
@@ -290,8 +294,8 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
         else:
             try:
                 commit_intent_files(ctx.paths, message, [written])
-            except (IntentError, GitError):
-                pass
+            except (IntentError, GitError) as e:
+                click.echo(f"warning: could not commit the rejected plan in the intent repo: {e}; commit it by hand: {_manual([written], message)}")
         current = ctx.db.feature_status(pid)
         if current == "investigating":
             ctx.db.transition("feature", pid, "plan_proposed", by="ateam")
@@ -336,13 +340,14 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
                             tiers=tiers, existing_plans=existing_plans, replaces=replaces)
     except PlanError as e:
         _rejected("planner output invalid")
-        click.echo("The planner's output is not usable; nothing was written. Problems:")
+        click.echo("The planner's output is not usable; no contracts were written. Problems:")
         for problem in e.problems:
             click.echo(f"  - {problem}")
         click.echo(f"Re-run: ateam plan \"{request}\"")
         sys.exit(1)
     sessions = [result.res]
     intent_tampered_by: str | None = None   # the first later session that changed the intent repo
+    proposal = {"committed": True}          # False when the proposal commit failed: the plan is written, the run exits 1
 
     def _propose(pr, tampered_by: str | None) -> None:
         """Write the plan, its contracts and records; commit exactly those files unless a session changed the intent repo."""
@@ -353,7 +358,12 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
         if tampered_by:
             _uncommitted(tampered_by, written, message)
         else:
-            commit_intent_files(ctx.paths, message, written)
+            try:
+                commit_intent_files(ctx.paths, message, written)
+            except (IntentError, GitError) as e:
+                click.echo(f"warning: could not commit the plan in the intent repo: {e}; nothing was committed. "
+                           f"Commit it by hand: {_manual(written, message)}")
+                proposal["committed"] = False
         ctx.db.transition("feature", pid, "plan_proposed", by="ateam")
 
     def _with_note(notes: str, note: str) -> str:
@@ -478,16 +488,18 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
         try:
             commit_intent_files(ctx.paths, covered_msg, [covered_file])
         except (IntentError, GitError) as e:
-            click.echo(f"warning: could not commit the covered plan in the intent repo: {e}; commit it by hand: "
-                       f"git -C \"{ctx.paths.intent}\" add {intent_relpath(ctx.paths, covered_file)} && "
-                       f"git -C \"{ctx.paths.intent}\" commit -m \"{covered_msg}\"")
+            click.echo(f"warning: could not commit the covered plan in the intent repo: {e}; commit it by hand: {_manual([covered_file], covered_msg)}")
         ctx.db.transition("feature", pid, "plan_covered", by="ateam", reason=f"covered by {', '.join(pr.plan.covered_by)}")
+        if replaces:
+            click.echo(f"{replaces} is not superseded; only approval supersedes")
         click.echo(render_plan_review(pr, tiers))
         _session_lines()
         return
     _propose(pr, intent_tampered_by)
     click.echo(render_plan_review(pr, tiers))
     _session_lines()
+    if not proposal["committed"]:
+        sys.exit(1)
 
 
 def _dependency_order(contracts: dict) -> list[str]:
@@ -526,8 +538,9 @@ def _parse_tier_overrides(specs: tuple[str, ...], plan_contracts: list[str], tie
 @click.argument("plan_id")
 @click.option("--tier", "tier_specs", multiple=True, help="Override tiers: C-0002=careful (build and test) or C-0002:investigate=light (one role); repeatable.")
 @click.option("--skip-records", is_flag=True, help="Do not walk the plan's proposed records now.")
+@click.option("--force", is_flag=True, help="Approve a replacement whose replaced plan is no longer plan_proposed; nothing is superseded.")
 @TARGET_OPTION
-def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, target: Path) -> None:
+def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, force: bool, target: Path) -> None:
     """Approve a plan: review its proposed records, apply tier overrides, freeze its contracts."""
     from datetime import UTC, datetime
 
@@ -549,6 +562,20 @@ def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, targe
     plan_ = plans_[plan_id]
     if plan_.status != PlanStatus.plan_proposed:
         _fail(f"{plan_id} is {plan_.status}; only plan_proposed plans can be approved")
+    replacer = next((p for p in plans_.values() if p.replaces == plan_id and p.status == PlanStatus.plan_proposed), None)
+    if replacer is not None:
+        _fail(f"{plan_id} is replaced by proposed plan {replacer.id}; approve or reject {replacer.id} first")
+    supersede = False   # the replaced plan is superseded only when it is still plan_proposed in both the file and the state store
+    if plan_.replaces:
+        old = plans_.get(plan_.replaces)
+        file_status = str(old.status) if old is not None else "missing"
+        store_status = ctx.db.feature_status(plan_.replaces) or "missing"
+        if file_status == "plan_proposed" and store_status == "plan_proposed":
+            supersede = True
+        elif not force:
+            shown = store_status if store_status != "plan_proposed" else file_status
+            _fail(f"{plan_.replaces} is {shown}; approving {plan_id} would leave two live plans for the same request; "
+                  f"pass --force to approve without superseding")
     tiers = load_tiers(ctx.config.tiers)
     overrides = _parse_tier_overrides(tier_specs, plan_.contracts, list(tiers))
 
@@ -606,7 +633,7 @@ def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, targe
     approval_files.append(save_plan(ctx.paths.plans, plan_))
     superseded_id = None
     old_plan = plans_.get(plan_.replaces) if plan_.replaces else None
-    if old_plan is not None and old_plan.status == PlanStatus.plan_proposed:
+    if old_plan is not None and supersede:
         superseded_id = old_plan.id
         approval_files.append(save_plan(ctx.paths.plans, old_plan.model_copy(update={
             "status": PlanStatus.superseded,
@@ -1132,13 +1159,18 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
     from ateam.runner.run import SetupError, default_base, ensure_setup, run_contract_attempt
     from ateam.tiers import load_tiers
 
-    from ateam.runner.binding import ContractNotBinding
+    from ateam.runner.binding import ContractNotBinding, require_binding
 
     ctx = _context(target)
     cs = load_contracts(ctx.paths.contracts)
     if contract_id not in cs:
         _fail(f"unknown contract {contract_id}")
     contract = cs[contract_id]
+    records = load_records(ctx.paths.records)
+    try:
+        require_binding(contract, records, ctx.db)   # before setup: a contract that does not bind never provisions a worktree
+    except ContractNotBinding as e:
+        _fail(str(e), code=4)
     wt_git = _require_isolated_worktree(ctx, worktree)
     worktree = wt_git.root
     tiers = load_tiers(ctx.config.tiers)
@@ -1152,7 +1184,7 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
         res, tree, scope, cp = asyncio.run(run_contract_attempt(
             paths=ctx.paths, config=ctx.config, git_worktree=wt_git, worktree=worktree,
             base=base or default_base(wt_git, ctx.config.target_branch),
-            contract=contract, records=load_records(ctx.paths.records), role=Role(role), tiers=tiers,
+            contract=contract, records=records, role=Role(role), tiers=tiers,
             db=ctx.db, resume=resume, prompt=prompt, tier_override=tier,
         ))
     except ContractNotBinding as e:
@@ -1165,13 +1197,16 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
     if res.error:
         click.echo(f"error: {res.error}")
     click.echo(f"scope ok={scope.ok} outside={scope.outside} dirty={scope.dirty} changed={tree.changed_vs_base}")
+    code = 0 if (res.report and scope.ok) else (3 if res.report else 1)
     if Role(role) is Role.test and res.report and scope.ok:
         from ateam.runner.run import classify_test_report
 
         test_outcome, test_class = classify_test_report(res.report)
         click.echo(f"classification: {test_outcome}/{test_class or '-'}")
+        if test_outcome == "failed":
+            code = 5   # a failed verdict (owner, 2026-10-26); 0 met, 3 scope breach, 1 no report, 4 refused
     click.echo(json.dumps(res.report, indent=2) if res.report else "no structured report")
-    sys.exit(0 if (res.report and scope.ok) else (3 if res.report else 1))
+    sys.exit(code)
 
 
 # ---------------------------------------------------------------- verify (minimal)
