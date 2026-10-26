@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import itertools
+import logging
 import os
 import re
-import shlex
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -14,6 +15,8 @@ from claude_agent_sdk import HookMatcher, PermissionResultAllow, PermissionResul
 from ateam.globs import matches
 from ateam.records.model import Record
 from ateam.roles import Role
+
+log = logging.getLogger(__name__)
 
 WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 READ_OR_WRITE_TOOLS = WRITE_TOOLS | {"Read"}
@@ -63,10 +66,29 @@ _READ_PREFIX = re.compile(
     r"^\s*(?:cat|head|tail|less|more|wc|grep|rg|ls|stat|file|diff|sort|uniq|cut|awk|find|tree|du|sed\s+-n|git\s+(?:diff|show|log|blame|status|ls-files|grep|branch|stash\s+(?:list|show)))\b"
 )
 _GIT_GLOBAL_OPTS = re.compile(r"^(\s*git)(?:\s+(?:-[cC]\s*\S+|--?\S+))+(\s+)")
-_WRAPPERS = {"command", "env", "exec", "nice", "nohup", "time", "builtin"}
+_WRAPPERS = {"command", "env", "exec", "nice", "nohup", "time", "builtin", "timeout", "stdbuf"}
+# Wrapper options whose argument is the next word (`nice -n 5 rm`), and positional arguments before the command.
+_WRAPPER_ARG_OPTS = {
+    "nice": {"-n", "--adjustment"},
+    "env": {"-u", "--unset", "-C", "--chdir", "-P"},
+    "time": {"-f", "--format", "-o", "--output"},
+    "exec": {"-a"},
+    "timeout": {"-s", "--signal", "-k", "--kill-after"},
+    "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
+}
+_WRAPPER_POSITIONAL = {"timeout": 1}
+_SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "mksh"}
+_NESTING_LIMIT = 8   # nested $( ` ${ <( and eval / shell -c bodies are followed this deep; deeper is denied
+_COMPOUND_START = {"{", "if", "while", "until", "for", "case", "select", "[[", "(("}
 _READ_TOOL_HINT_WORDS = {"sed", "awk", "python", "python3", "perl", "ruby", "node"}
 _CD = re.compile(r"^\s*(?:cd|pushd)\b")
-_CD_WORKTREE_REASON = "INVESTIGATE may cd only to a directory inside the worktree"  # absolute paths only; see Policy._cd_target
+CD_WORKTREE_REASON = "workers may cd only to an absolute path inside the worktree or its scratch directory"  # every role; see Policy._cd_target
+NESTING_REASON = "command nests substitutions, brace expansions, eval or shell -c too deeply to check"
+ANALYSE_REASON = "command could not be analysed; simplify it"
+
+
+class _TooComplex(Exception):
+    """Nesting or brace expansion beyond what the policy follows: the command is denied with NESTING_REASON."""
 _GIT_BRANCH = re.compile(r"^\s*git\s+branch\b(?P<rest>.*)$")
 
 
@@ -83,6 +105,23 @@ _ANSI_C_SIMPLE = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n"
                   "\\": "\\", "'": "'", '"': '"', "?": "?"}
 _LIST_OPS = (";;&", ";;", ";&", ";", "&&", "&", "||", "|&", "|")
 _REDIRECT_OPS = (">>", ">|", ">&", "<&", "<>", ">", "<")
+
+
+def _skip_prefix(words: list[str]) -> int:
+    """Index of the first word that is not a leading reserved word, assignment, `function NAME` or `coproc NAME`
+    (NAME only when a compound command follows)."""
+    i = 0
+    while i < len(words):
+        w = words[i]
+        if w == "function" and i + 1 < len(words):
+            i += 2
+        elif w == "coproc" and i + 2 < len(words) and words[i + 2] in _COMPOUND_START and words[i + 1] not in _RESERVED_LEADING:
+            i += 2
+        elif w in _RESERVED_LEADING or _ASSIGNMENT.match(w):
+            i += 1
+        else:
+            break
+    return i
 
 
 def _ansi_c(body: str) -> str:
@@ -126,11 +165,17 @@ class _Lexed:
     masked: str               # joined with every '...' and $'...' replaced by ''
     segments: list[_Segment]  # simple commands in order, including those inside substitutions
     substitution: bool        # $( ), $(( )), ` `, <( ) or >( ) that bash would expand (not in '...', comments or quoted bodies)
+    legacy: "_Lexed | None" = None   # the bash 3.2-5.2 reading, when this is the union of both (see _lex)
 
 
 class _Lexer:
-    def __init__(self, s: str) -> None:
+    """legacy: bash 3.2 to 5.2, where ${ closes at its first } (no ${ cmd; }) and a case label's ) closes a $(.
+    Otherwise bash 5.3. _lex reads every command both ways."""
+
+    def __init__(self, s: str, legacy: bool = False, level: int = 0) -> None:
         self.s, self.n = s, len(s)
+        self.legacy = legacy
+        self.level = level                              # nested $( ` ${ <( being read; deeper than the limit raises
         self.removed: set[int] = set()                  # index of the backslash of each removed backslash-newline
         self.comments: list[tuple[int, int]] = []
         self.bodies: list[tuple[int, int]] = []         # heredoc body plus terminator line
@@ -140,6 +185,11 @@ class _Lexer:
         self.newlines = 0                               # newline tokens read at any depth
 
     # -- characters ---------------------------------------------------------------------------------------------
+
+    def _enter(self) -> None:
+        self.level += 1
+        if self.level > _NESTING_LIMIT:
+            raise _TooComplex
 
     def _skip(self, i: int) -> int:
         """The next index at or after i once line continuations are removed (bash removes them as it reads)."""
@@ -199,7 +249,14 @@ class _Lexer:
         return n
 
     def _dollar(self, i: int, in_dquote: bool = False) -> int | None:
-        """End index of the $-expansion at i that can hold commands ($( ), $(( )), ${ }, $[ ]), else None."""
+        """End index of the $-expansion at i that can hold commands ($( ), $(( )), ${ }, ${ cmd; }, $[ ]), else None."""
+        self._enter()
+        try:
+            return self._dollar_at(i, in_dquote)
+        finally:
+            self.level -= 1
+
+    def _dollar_at(self, i: int, in_dquote: bool) -> int | None:
         j = self._match(i, "$((")
         if j is not None:
             end = self._arith(j, "))")
@@ -209,9 +266,13 @@ class _Lexer:
         j = self._match(i, "$(")
         if j is not None:
             self.substitution = True
-            return self._list(j, stop=True)
+            return self._list(j, stop=")")
         j = self._match(i, "${")
         if j is not None:
+            k = self._skip(j)
+            if not self.legacy and self.s[k : k + 1] in (" ", "\t", "\n", "|"):   # bash 5.3 ${ cmd; }, ${| cmd; }
+                self.substitution = True
+                return self._list(k + 1 if self.s[k] == "|" else k, stop="}")
             return self._braced(j, in_dquote)
         j = self._match(i, "$[")
         if j is not None:
@@ -296,7 +357,9 @@ class _Lexer:
             buf.append(c); i += 1
         self.substitution = True
         self.newlines += any("\n" in b for b in buf)   # a heredoc pending outside does not start its body in here
-        inner = _Lexer("".join(buf))
+        inner = _Lexer("".join(buf), self.legacy, self.level + 1)
+        if inner.level > _NESTING_LIMIT:
+            raise _TooComplex
         inner._list(0)
         self.items.extend(inner._segments())
         return min(i + 1, n)
@@ -381,10 +444,16 @@ class _Lexer:
             else:
                 i += 1
 
+    def _closes_word(self, i: int) -> bool:
+        """True when the character at i (continuations skipped) ends a word: the end, a blank or an operator."""
+        i = self._skip(i)
+        return i >= self.n or self.s[i] in " \t\n;&|<>()"
+
     # -- command lists ------------------------------------------------------------------------------------------
 
-    def _list(self, i: int, stop: bool = False) -> int:
-        """Lex a command list from i to the end, or (stop) to the ) that closes a $( or <( ; return the index after."""
+    def _list(self, i: int, stop: str = "") -> int:
+        """Lex a command list from i to the end, or to the stop that closes it: the ) of a $( or <( (stop=")"), or
+        the } of a ${ cmd; } (stop="}"). Returns the index after."""
         s, n = self.s, self.n
         seg_start = i
         words: list[str] = []
@@ -393,15 +462,43 @@ class _Lexer:
         target = False       # the next word is a redirection target, not a command word
         depth = 0            # open ( subshells inside this list
         pending: list[tuple[str, bool, bool, int]] = []
+        cases: list[list] = []   # open `case`s: [state, depth]; state is subject, in, pattern or body
+        fresh = False        # the next word is the first of a case pattern, where esac ends the case
+        groups = 0           # open { } brace groups, whose } is not the close of a ${ cmd; }
+
+        def command_position(w: str = "") -> bool:
+            """w (the word being added) is where a command or reserved word may start."""
+            return _skip_prefix([*words, w]) >= len(words)
 
         def end_word() -> None:
-            nonlocal val, started, target
+            nonlocal val, started, target, fresh, groups
             if started:
                 if target:
                     target = False
                 else:
-                    words.append("".join(val))
+                    w = "".join(val)
+                    first = command_position(w)
+                    words.append(w)
+                    state = cases[-1][0] if cases else None
+                    if state == "subject":
+                        cases[-1][0] = "in"
+                    elif state == "in":
+                        if w == "in":
+                            cases[-1][0], fresh = "pattern", True
+                    elif state == "pattern":
+                        if fresh and w == "esac":
+                            cases.pop()
+                        fresh = False
+                    elif first and w == "esac" and state == "body":
+                        cases.pop()
+                    elif first and w == "case" and not self.legacy:
+                        cases.append(["subject", depth])
+                    elif first and w == "{":
+                        groups += 1
             val, started = [], False
+
+        def in_pattern() -> bool:
+            return bool(cases) and cases[-1][0] == "pattern" and cases[-1][1] == depth
 
         def end_segment(end: int, next_start: int) -> None:
             nonlocal words, seg_start
@@ -433,11 +530,18 @@ class _Lexer:
                 j = n if j < 0 else j
                 self.comments.append((i, j)); i = j
             elif c == ")":
-                if stop and depth == 0:
+                end_word()
+                if in_pattern():                  # the ) that ends a case pattern, not a subshell or $( close
+                    cases[-1][0] = "body"
+                    end_segment(i + 1, i + 1); i += 1
+                    continue
+                if stop == ")" and depth == 0:
                     end_segment(i, i + 1)
                     return i + 1
                 depth = max(depth - 1, 0)
                 end_segment(i + 1, i + 1); i += 1
+            elif c == "(" and not started and fresh and in_pattern():
+                fresh = False; i += 1             # the optional ( before a case pattern
             elif c == "(":
                 j = self._match(i, "((")
                 if j is not None and not started and all(w in _RESERVED_LEADING for w in words):
@@ -453,11 +557,17 @@ class _Lexer:
                 for op in _LIST_OPS:
                     if (j := self._match(i, op)) is not None:
                         end_segment(i, j); i = j
+                        if op in (";;", ";&", ";;&") and cases and cases[-1][0] == "body":
+                            cases[-1][0], fresh = "pattern", True
                         break
             elif c in "<>":
                 if (j := self._match(i, c + "(")) is not None:
                     self.substitution = True
-                    end = self._list(j, stop=True)
+                    self._enter()
+                    try:
+                        end = self._list(j, stop=")")
+                    finally:
+                        self.level -= 1
                     val.append(s[i:end]); started = True; i = end
                     continue
                 if started and not target and _FD_WORD.match("".join(val)):
@@ -480,6 +590,13 @@ class _Lexer:
                         if (j := self._match(i, op)) is not None:
                             target = True; i = j
                             break
+            elif c == "}" and not started and groups and command_position("}") and (stop == "}" or self._closes_word(i + 1)):
+                groups -= 1                       # the } of a brace group: a word, as before. Inside ${ cmd; } a
+                                                  # joined }x is taken as the group's too, so a later } closes
+                val.append(c); started = True; i += 1
+            elif c == "}" and stop == "}" and not started and not groups and all(w in _RESERVED_LEADING for w in words):
+                end_segment(i, i + 1)             # the } that closes a ${ cmd; }: where a reserved word may appear,
+                return i + 1                      # and (bash manual) it may be joined to the rest of the word
             elif c == "'":
                 j = s.find("'", i + 1)
                 j = n if j < 0 else j
@@ -550,9 +667,23 @@ class _Lexer:
 
 
 def _lex(cmd: str) -> _Lexed:
-    lexer = _Lexer(cmd)
-    lexer._list(0)
-    return lexer.result()
+    """The command read as bash 5.3 and as bash 3.2-5.2 (the worker may run either): joined, stripped and masked text
+    of the 5.3 reading, the other reading in .legacy, and the segments of both (5.3's first, duplicates dropped), so a
+    forbidden command found under either reading is denied. May raise _TooComplex."""
+    readings = []
+    for legacy in (False, True):
+        lexer = _Lexer(cmd, legacy)
+        lexer._list(0)
+        readings.append(lexer.result())
+    modern, old = readings
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    segments = []
+    for seg in modern.segments + old.segments:
+        key = (seg.text, tuple(seg.words))
+        if key not in seen:
+            seen.add(key)
+            segments.append(seg)
+    return _Lexed(modern.joined, modern.stripped, modern.masked, segments, modern.substitution or old.substitution, old)
 
 
 def _split_segments(cmd: str) -> list[str]:
@@ -570,20 +701,148 @@ def _normalise_git(segment: str) -> str:
     return _GIT_GLOBAL_OPTS.sub(r"\1\2", segment, count=1)
 
 
-def _is_rm(words: list[str]) -> bool:
-    """True for any rm invocation: the command word after quote removal (the lexer's words), seen through reserved
-    words such as ! { if then do, assignments, wrappers and their options, and paths."""
+_SEQUENCE = re.compile(r"^(?:(-?\d+)\.\.(-?\d+)|([A-Za-z])\.\.([A-Za-z]))(?:\.\.(-?\d+))?$")
+
+
+def _brace_once(word: str, limit: int) -> list[str] | None:
+    """The words from expanding the first expandable brace group of word, else None."""
+    i = word.find("{")
+    while i >= 0:
+        if word[i - 1 : i] != "$":
+            depth, commas, j = 0, [], i
+            for j in range(i, len(word)):
+                if word[j] == "{":
+                    depth += 1
+                elif word[j] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                elif word[j] == "," and depth == 1:
+                    commas.append(j)
+            if depth == 0:
+                parts: list[str] = []
+                if commas:
+                    edges = [i, *commas, j]
+                    parts = [word[a + 1 : b] for a, b in zip(edges, edges[1:])]
+                elif m := _SEQUENCE.match(word[i + 1 : j]):
+                    step = abs(int(m.group(5) or 1)) or 1
+                    num = m.group(1) is not None
+                    a, b = (int(m.group(1)), int(m.group(2))) if num else (ord(m.group(3)), ord(m.group(4)))
+                    seq = itertools.islice(range(a, b + (1 if b >= a else -1), step if b >= a else -step), limit)
+                    parts = [str(k) if num else chr(k) for k in seq]
+                if parts:
+                    return [word[:i] + p + word[j + 1 :] for p in parts]
+        i = word.find("{", i + 1)
+    return None
+
+
+def _brace_expand(word: str, limit: int = 256) -> list[str]:
+    """Bash brace expansion of one word: {a,b} and {x..y[..step]}, nested, preamble and postscript kept; a ${ is
+    not a brace. Quotes are already removed from the lexer's words, so a quoted brace is expanded too (fail closed).
+    Iterative, at most `limit` words; a word with more braces or work than that raises _TooComplex."""
+    if "{" not in word:
+        return [word]
+    if word.count("{") > 2 * limit:
+        raise _TooComplex
+    out: list[str] = []
+    stack, steps = [word], 0
+    while stack and len(out) < limit:
+        steps += 1
+        if steps > 4 * limit:
+            raise _TooComplex
+        w = stack.pop()
+        expanded = _brace_once(w, limit)
+        if expanded is None:
+            if w:
+                out.append(w)
+        else:
+            stack.extend(reversed(expanded))
+    return out or [""]
+
+
+def _command_words(words: list[str]) -> list[str]:
+    """The words from the command word on: brace expansion applied, then reserved words such as ! { if then do,
+    assignments, `function NAME`, `coproc NAME`, wrappers with their options (and the options' arguments) skipped;
+    `env -S STRING` splits STRING."""
+    words = [e for w in words for e in _brace_expand(w)]
     i = 0
     while i < len(words):
-        if words[i] in _WRAPPERS:   # before reserved words: `time -p` is both
+        name = words[i].rsplit("/", 1)[-1]
+        if name in _WRAPPERS:   # before reserved words: `time -p` is both
             i += 1
             while i < len(words) and words[i].startswith("-"):
-                i += 1
-        elif words[i] in _RESERVED_LEADING or _ASSIGNMENT.match(words[i]):
-            i += 1
+                opt = words[i]; i += 1
+                if opt == "--":
+                    break
+                split = None
+                if name == "env" and opt in ("-S", "--split-string") and i < len(words):
+                    split = words[i]; i += 1
+                elif name == "env" and opt.startswith("--split-string="):
+                    split = opt.split("=", 1)[1]
+                elif name == "env" and opt.startswith("-S"):
+                    split = opt[2:]
+                if split is not None:
+                    segs = _lex(split).segments
+                    return _command_words((segs[0].words if segs else []) + words[i:])
+                if opt in _WRAPPER_ARG_OPTS.get(name, ()):
+                    i += 1
+            i += _WRAPPER_POSITIONAL.get(name, 0)
+        elif (k := _skip_prefix(words[i:])) > 0:
+            i += k
         else:
             break
-    return i < len(words) and words[i].rsplit("/", 1)[-1] == "rm"
+    return words[i:]
+
+
+def _is_rm(words: list[str]) -> bool:
+    """True for any rm invocation: the command word after quote removal (the lexer's words) and brace expansion,
+    seen through reserved words, assignments, wrappers and their options, and paths."""
+    cw = _command_words(words)
+    return bool(cw) and cw[0].rsplit("/", 1)[-1] == "rm"
+
+
+def _inner_command(words: list[str]) -> str | None:
+    """The literal text an `eval` or a `bash -c` / `sh -c` ... would run as shell code, else None. A non-literal
+    argument ($x, $(...)) is re-lexed as written; what it expands to at run time is a residual."""
+    cw = _command_words(words)
+    if not cw:
+        return None
+    name = cw[0].rsplit("/", 1)[-1]
+    if name == "eval":
+        return " ".join(cw[1:])
+    if name not in _SHELLS:
+        return None
+    dash_c, j = False, 1
+    while j < len(cw):
+        a = cw[j]
+        if a == "--":
+            j += 1
+            break
+        if a in ("-o", "+o", "-O", "+O", "--rcfile", "--init-file"):
+            j += 2
+            continue
+        if len(a) > 1 and a[0] in "-+":
+            dash_c = dash_c or (a[0] == "-" and not a.startswith("--") and "c" in a[1:])
+            j += 1
+            continue
+        break
+    return cw[j] if dash_c and j < len(cw) else None
+
+
+def _cd_args(words: list[str]) -> list[str] | None:
+    """The arguments of a cd or pushd that this simple command runs, else None (not a cd)."""
+    cw = _command_words(words)
+    return cw[1:] if cw and cw[0] in ("cd", "pushd") else None
+
+
+def _allow_listed(words: list[str]) -> bool:
+    """The lexed words (quotes removed, git's global options skipped) start with an allow-listed command."""
+    if words[:1] == ["git"]:
+        rest, k = words[1:], 0
+        while k < len(rest) and rest[k].startswith("-"):
+            k += 2 if rest[k] in ("-c", "-C") else 1
+        words = ["git", *rest[k:]]
+    return any(words[: len(p.split())] == p.split() for p in INVESTIGATE_ALLOWED_PREFIXES)
 
 
 def _starts_with_prefix(segment: str, prefix: str) -> bool:
@@ -634,7 +893,7 @@ class Policy:
     ateam_home: Path | None = None    # the ATeam home base ($ATEAM_HOME or ~/.ateam); everything in it except scratch_dir is off limits
     denials: list[str] = field(default_factory=list)
     injected: set[str] = field(default_factory=set)
-    cwds: set[Path] = field(default_factory=set)  # directories INVESTIGATE has cd'd into (the Bash tool keeps its cwd between calls)
+    cwds: set[Path] = field(default_factory=set)  # directories the worker has cd'd into, any role (the Bash tool keeps its cwd between calls)
     _pending_cwds: list[Path] = field(default_factory=list, repr=False)  # cd targets of the command being checked
 
     # -- paths --------------------------------------------------------------
@@ -768,55 +1027,78 @@ class Policy:
 
     # -- commands -----------------------------------------------------------
 
-    def _cd_target(self, segment: str) -> tuple[Path, Path] | None:
-        """(logical, physical) forms of the directory a plain `cd <abs path>` / `pushd <abs path>` segment names, else None.
+    def _cd_target(self, seg: _Segment) -> tuple[Path, Path] | None:
+        """(logical, physical) forms of the directory a plain `cd <abs path>` / `pushd <abs path>` names, else None.
 
-        Absolute paths only: the Bash tool keeps its working directory between calls and the policy never knows it,
-        so a relative target (or a `..` after a symlinked cd) cannot be judged. Both the textual (bash `cd -L`) and
-        the resolved form must be an existing directory inside the worktree.
+        Every role (owner, 2026-10-26). Absolute paths only: the Bash tool keeps its working directory between
+        calls and the policy never knows it, so a relative target (or a `..` after a symlinked cd) cannot be judged.
+        Exactly one argument, no redirection, no expansion; both the textual (bash `cd -L`) and the resolved form
+        must be an existing directory inside the worktree, or both inside the worker's scratch dir (controller
+        ruling, 2026-10-26: the one writable place outside the worktree).
         """
-        try:
-            words = shlex.split(segment)
-        except ValueError:
+        args = _cd_args(seg.words)
+        if args is None or len(args) != 1 or re.search(r"[<>]", seg.text):
             return None
-        if len(words) != 2 or words[0] not in ("cd", "pushd"):
-            return None
-        arg = words[1]
+        arg = args[0]
         if not arg.startswith("/") or _WILDCARD.search(arg) or "$" in arg or "`" in arg:
             return None
         logical, physical = Path(os.path.normpath(arg)), Path(arg).resolve()
-        if not (self._inside_worktree(logical) and self._inside_worktree(physical)):
+        roots = [self.worktree] + ([self.scratch_dir] if self.scratch_dir is not None else [])
+        if not any(self._inside(logical, root) and self._inside(physical, root) for root in roots):
             return None
         return logical, physical
 
-    def _inside_worktree(self, path: Path) -> bool:
-        return path.is_dir() and any(r == path or r in path.parents for r in {self.worktree, self.worktree.resolve()})
+    def _inside(self, path: Path, root: Path) -> bool:
+        """path is an existing directory at or under root (either spelling of root)."""
+        return path.is_dir() and any(r == path or r in path.parents for r in {root, root.resolve()})
+
+    def _all_segments(self, segments: list[_Segment], depth: int = 0) -> list[_Segment]:
+        """The segments plus, after each, the segments of the literal shell code it runs through eval or a shell's
+        -c (re-lexed, recursively). Raises _TooComplex beyond _NESTING_LIMIT."""
+        out: list[_Segment] = []
+        for seg in segments:
+            out.append(seg)
+            inner = _inner_command(seg.words)
+            if inner is not None:
+                if depth >= _NESTING_LIMIT:
+                    raise _TooComplex
+                out.extend(self._all_segments(_lex(inner).segments, depth + 1))
+        return out
 
     def command_allowed(self, cmd: str) -> tuple[bool, str]:
-        lexed = _lex(cmd)
-        self._pending_cwds = []
-        if self.role == Role.investigate:
-            for seg in lexed.segments:
-                if _CD.match(seg.text):
-                    target = self._cd_target(seg.text)
-                    if target is not None:
-                        self._pending_cwds.extend(target)
+        """(allowed, reason). Never raises: input too deep to follow, or any failure to analyse it, is a denial."""
         try:
-            ok, reason = self._command_allowed(lexed)
-            if ok:
-                self.cwds.update(self._pending_cwds)
-            return ok, reason
+            return self._command_allowed_or_raise(cmd)
+        except _TooComplex:
+            return False, NESTING_REASON
+        except Exception:  # noqa: BLE001  (a guard that raises might fail open in the SDK)
+            log.exception("policy could not analyse a command: %r", cmd[:200])
+            return False, ANALYSE_REASON
         finally:
             self._pending_cwds = []
 
-    def _command_allowed(self, lexed: _Lexed) -> tuple[bool, str]:
+    def _command_allowed_or_raise(self, cmd: str) -> tuple[bool, str]:
+        lexed = _lex(cmd)
+        segments = self._all_segments(lexed.segments)
+        self._pending_cwds = []
+        for seg in segments:
+            if _cd_args(seg.words) is not None and (target := self._cd_target(seg)) is not None:
+                self._pending_cwds.extend(target)
+        ok, reason = self._command_allowed(lexed, segments)
+        if ok:
+            self.cwds.update(self._pending_cwds)
+        return ok, reason
+
+    def _command_allowed(self, lexed: _Lexed, all_segments: list[_Segment]) -> tuple[bool, str]:
+        readings = [lexed, *([lexed.legacy] if lexed.legacy is not None else [])]
         for pattern in DESTRUCTIVE_PATTERNS:
-            if re.search(pattern, lexed.joined):
+            if any(re.search(pattern, r.joined) for r in readings):
                 return False, f"destructive command matched {pattern!r}"
-        segments = [seg.text for seg in lexed.segments]
+        if self.role == Role.investigate and lexed.substitution:
+            return False, "INVESTIGATE may not use command or process substitution"
         scratch_spellings = self._spellings(self.scratch_dir)
         home_spellings = self._home_spellings() if self.scratch_dir is not None or self.ateam_home is not None else []
-        for seg, words in ((s.text, s.words) for s in lexed.segments):
+        for seg, words in ((s.text, s.words) for s in all_segments):
             mentions_scratch = any(sp in seg for sp in scratch_spellings)
             if mentions_scratch and ".." in seg:
                 return False, "paths that leave your scratch directory are not allowed"
@@ -845,25 +1127,22 @@ class Policy:
                     return False, "redirecting output into .ateam/ or .claude/ is not allowed"
                 if not _READ_PREFIX.match(_normalise_git(seg)):
                     return False, "shell access to .ateam/ or .claude/ is limited to reading"
+        for s in all_segments:   # every role (owner, 2026-10-26)
+            if _cd_args(s.words) is not None and self._cd_target(s) is None:
+                return False, CD_WORKTREE_REASON
         if self.role == Role.investigate:
-            if lexed.substitution:
-                return False, "INVESTIGATE may not use command or process substitution"
-            if _PAGER.search(lexed.masked):
+            if any(_PAGER.search(r.masked) for r in readings):
                 return False, "INVESTIGATE may not set pagers, editors or diff drivers"
-            for seg in segments:
-                if _CD.match(seg):
-                    if "$" in seg or "`" in seg:
-                        pass  # not a plain path: falls through to the allow-list, which denies it
-                    elif self._cd_target(seg) is None:
-                        return False, _CD_WORKTREE_REASON
-                    else:
-                        continue
+            for s in lexed.segments:
+                seg = s.text
+                if _CD.match(seg) and s.words[:1] in (["cd"], ["pushd"]):
+                    continue   # a plain cd, judged above; any other spelling still meets the allow-list
                 if _ENV_PREFIX.match(seg):
                     return False, f"INVESTIGATE may not set environment variables for a command; {seg.strip()[:40]!r}"
                 if _GIT_DASH_C.match(seg):
                     return False, "INVESTIGATE may not pass git -c"
                 norm = _normalise_git(seg)
-                if not any(_starts_with_prefix(norm, p) for p in INVESTIGATE_ALLOWED_PREFIXES):
+                if not (any(_starts_with_prefix(norm, p) for p in INVESTIGATE_ALLOWED_PREFIXES) and _allow_listed(s.words)):
                     reason = f"INVESTIGATE may only run read-only inspection commands; {seg.strip()[:40]!r} is not allowed"
                     if seg.split()[:1] and seg.split()[0] in _READ_TOOL_HINT_WORDS:
                         reason += "; use the Read tool with offset and limit to read a line range"
@@ -876,6 +1155,14 @@ class Policy:
     # -- SDK hooks ----------------------------------------------------------
 
     def _decide(self, tool_name: str, tool_input: dict[str, Any]) -> tuple[bool, str]:
+        """The decision for one tool call. Never raises: a failure to decide is a denial (logged)."""
+        try:
+            return self._decide_or_raise(tool_name, tool_input)
+        except Exception:  # noqa: BLE001  (a hook that raises might fail open in the SDK)
+            log.exception("policy could not decide on %s", tool_name)
+            return False, ANALYSE_REASON
+
+    def _decide_or_raise(self, tool_name: str, tool_input: dict[str, Any]) -> tuple[bool, str]:
         if tool_name in WRITE_TOOLS:
             return self.path_writable_abs(str(tool_input.get("file_path", "")))
         if tool_name == "Bash":

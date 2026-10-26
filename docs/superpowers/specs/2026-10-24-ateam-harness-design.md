@@ -93,7 +93,7 @@ Three failure classes, each with its own mechanism:
 - **Workers never run `rm`.** Deletion is an integration-time action. A tracked file a worker must remove goes through `git rm`, so the deletion is in the reviewed diff. (Owner, 2026-10-25.)
 - **Approval commits land on the target branch in the owner's checkout.** `ateam approve`, `ateam reject` and `ateam supersede` stage only `.ateam/` paths and commit on the configured target branch. They refuse to act if the checkout is on another branch or `.ateam/` already has uncommitted changes.
 - **Investigations default to the careful tier.** `ateam init` and `ateam plan` run at `careful` unless `--tier` says otherwise; depth of reading is worth more than the dollar at planning time. (Owner, 2026-10-25.)
-- **INVESTIGATE may `cd` inside the worktree.** The target must resolve to an existing directory under the worktree (the owner's checkout for in-place investigations); anything else, including `cd` alone and `cd -`, is denied. (Owner, 2026-10-25.)
+- **INVESTIGATE may `cd` inside the worktree.** The target must resolve to an existing directory under the worktree (the owner's checkout for in-place investigations); anything else, including `cd` alone and `cd -`, is denied. (Owner, 2026-10-25.) Extended on 2026-10-26 to BUILD and TEST, to absolute paths only, and to the worker's scratch directory: see the 2026-10-26 bullets below.
 - **Plan, review, hand back.** Every `ateam plan` runs the planner, then a staff-engineer review of the draft by a fresh INVESTIGATE session; blocking findings earn the planner one revision round; the review travels with the plan to the owner. `--no-review` skips it. (Owner, 2026-10-25.)
 - **Records for files that do not exist yet** are accepted when a contract in the same plan declares the path; they stay proposed like any other record. (Owner, 2026-10-25.)
 - **Setup runs once per worktree.** `config.setup` commands run in a worktree before its first attempt, never again for that worktree; a failing setup stops the run. (Owner, 2026-10-25.)
@@ -102,6 +102,10 @@ Three failure classes, each with its own mechanism:
 - **Rebuild derives only from the intent repo.** Doctor's rebuild recreates state that the intent repo determines and nothing else. (Constrains a future feature; implemented with it.) (Owner, 2026-10-25.)
 - **Merge is fast-forward only by default, in the owner's checkout.** (Constrains a future feature; implemented with it.) (Owner, 2026-10-25.)
 - **A request already covered by an existing plan is a `plan_covered` outcome, not a rejection.** `ateam plan --replaces P-xxxx` hides that plan from the planner and marks it `superseded` when the new plan is approved. (Owner, 2026-10-25.)
+- **BUILD and TEST `cd` only to an absolute path inside the worktree**, like INVESTIGATE, so the home check can resolve relative paths from every directory a worker enters. A relative `cd`, `cd` alone, `cd -` and any target outside the worktree are denied for every role with one reason: "workers may cd only to an absolute path inside the worktree or its scratch directory". (Owner, 2026-10-26.) The worker's scratch directory, the one writable place outside the worktree, is also a `cd` target for every role, by absolute path (controller ruling, 2026-10-26).
+- **Three INVESTIGATE allow rows from the lexer round stand**: an escaped `"\$(x)"`, an escaped `` "\`" `` inside double quotes, and a `$(...)` inside a comment are text, not substitutions. (Owner, 2026-10-26.)
+- **Workers run under `/bin/bash`.** The policy's shell model is bash 3.2 to 5.3: the lexer reads every command both as bash 3.2-5.2 and as 5.3 and checks the commands found under either reading; the worker environment sets `SHELL` and `CLAUDE_CODE_SHELL` to `/bin/bash` so the Bash tool does not run the login shell (zsh on macOS). (Owner, 2026-10-26.)
+- **`c=rm; $c x` and `$(echo rm) x` stay BUILD residuals**, backed by the post-run tree check: the command word is made at run time, which no pre-run lexer can see. They are pinned as strict expected failures in the policy tests. (Owner, 2026-10-26.)
 
 ## Calls made by the assistant (owner to check)
 
@@ -318,8 +322,8 @@ Every transition is a row in SQLite with timestamp, actor and reason. `ateam sta
 | Role | May | May not | Ends with |
 |---|---|---|---|
 | INVESTIGATE | read, search, run read-only commands from a strict allow-list (git log/show/diff/blame/status/ls-files/grep/branch --list, ls, cat, head, tail, wc, grep, rg, find, tree, du, stat, file, pwd, sort, uniq, cut; no interpreters, no sed, no awk) | edit, write, run anything that can write, run tests | findings report with evidence and proposed records |
-| BUILD | read, edit, write, run checks, commit in its worktree | edit `.ateam/**` or `.claude/**`, touch files outside `paths` plus `incidental`, push, merge, run `rm` in any form (tracked files go through `git rm`; cleanup is an integration step) | build report: commits, files, checks run, risks, record proposals |
-| TEST | read, run checks and tests, write only under a scratch directory | edit source, edit tests that the contract names, see the builder's transcript | verdict per acceptance criterion with evidence |
+| BUILD | read, edit, write, run checks, commit in its worktree | edit `.ateam/**` or `.claude/**`, touch files outside `paths` plus `incidental`, push, merge, run `rm` in any form (tracked files go through `git rm`; cleanup is an integration step), cd outside the worktree and its scratch directory, or by a relative path | build report: commits, files, checks run, risks, record proposals |
+| TEST | read, run checks and tests, write only under a scratch directory | edit source, edit tests that the contract names, see the builder's transcript, cd outside the worktree and its scratch directory, or by a relative path | verdict per acceptance criterion with evidence |
 
 Enforcement, in layers. Layers 1 to 3 run before a tool executes (pre-guards); layer 4 verifies afterwards. The system prompt is not a layer.
 
