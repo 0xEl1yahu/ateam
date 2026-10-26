@@ -162,6 +162,21 @@ def _interface_notes(raw: list[dict], ids: list[str], interfaces: list[list[Inte
     return notes
 
 
+_CONTRACT_REF = re.compile(r"\bcontract (\d+)\b", re.IGNORECASE)
+
+
+def resolve_contract_refs(value, ids: list[str]):
+    """`contract N` (zero-based, as the planner writes it before ids exist) becomes the contract's id in every string
+    of a report; an index outside the plan, and prose that merely mentions a contract, are left as written."""
+    if isinstance(value, str):
+        return _CONTRACT_REF.sub(lambda m: ids[int(m.group(1))] if int(m.group(1)) < len(ids) else m.group(0), value)
+    if isinstance(value, list):
+        return [resolve_contract_refs(v, ids) for v in value]
+    if isinstance(value, dict):
+        return {k: resolve_contract_refs(v, ids) for k, v in value.items()}
+    return value
+
+
 def report_to_plan(
     report: dict, request: str, plan_id: str, contracts_dir: Path, records: dict[str, Record], config: TargetConfig,
     repo_root: Path, records_dir: Path, by: str = "ateam-plan",
@@ -224,6 +239,8 @@ def report_to_plan(
 
     start = int(next_contract_id(contracts_dir).split("-")[1])
     ids = [f"C-{start + i:04d}" for i in range(len(raw))]
+    report = resolve_contract_refs(report, ids)
+    raw = list(report.get("contracts") or [])
     contracts: list[Contract] = []
     all_interfaces: list[list[Interface]] = []
     for i, c in enumerate(raw):

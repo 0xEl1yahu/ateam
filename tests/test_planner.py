@@ -353,3 +353,33 @@ def test_interface_search_cap_and_invalid_python_are_inconclusive(tmp_path, monk
     monkeypatch.setattr(planner, "_TEXT_SEARCH_CAP", 10)
     notes = planner._interface_notes([{"paths": ["*.py"]}], ["C-1"], [[iface]], tmp_path, [])
     assert len(notes) == 1 and "could not verify" in notes[0]
+
+
+# ---- contract N references become ids (plan 2026-10-26-planner-fixes, task 4)
+
+def test_contract_refs_are_rewritten_to_ids(target_repo, target_paths, records_three):
+    first = contract("First")
+    second = contract("Second", deps=[0])
+    second["acceptance"][0]["statement"] = "uses the helper contract 0 adds"
+    second["interfaces"] = [{"kind": "consumes", "name": "helper", "signature": "def helper() -> str",
+                             "note": "Produced by contract 0 (see Contract 0)."}]
+    first["interfaces"] = [{"kind": "produces", "name": "helper", "signature": "def helper() -> str", "note": ""}]
+    rep = report(first, second, unknowns=["contract 1 may need a migration"])
+    r = report_to_plan(rep, "add health", "P-0001", target_paths.contracts, records_three, CFG, target_repo, target_paths.records)
+    c2 = r.contracts[1]
+    assert c2.acceptance[0].statement == "uses the helper C-0001 adds"
+    assert c2.interfaces[0].note == "Produced by C-0001 (see C-0001)."
+    assert r.plan.unknowns == ["C-0002 may need a migration"]
+
+
+def test_out_of_range_and_prose_are_left_alone():
+    from ateam.planner import resolve_contract_refs
+    ids = ["C-0007", "C-0008", "C-0009"]
+    value = {"a": ["contract 12 is not in this plan", "the contract's checks", "contracts 0 and 1"], "n": 3, "b": "contract 2."}
+    assert resolve_contract_refs(value, ids) == {
+        "a": ["contract 12 is not in this plan", "the contract's checks", "contracts 0 and 1"], "n": 3, "b": "C-0009."}
+
+
+def test_planner_prompt_explains_contract_n():
+    from ateam.roles import PLANNER_SPEC
+    assert "contract N" in PLANNER_SPEC.system_prompt and "zero-based" in PLANNER_SPEC.system_prompt

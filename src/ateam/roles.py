@@ -349,6 +349,8 @@ PLANNER_SPEC = RoleSpec(
         "functions, classes, CLI flags, file formats, with exact signatures) and the ones it consumes from other contracts "
         "or existing code. Use one interface per entry, never a comma- or slash-separated group of symbols. "
         "A later contract that consumes a name must match the producing contract's signature exactly, including type annotations. "
+        "Contract ids do not exist yet: refer to another contract of this plan as 'contract N', its zero-based position in "
+        "your contracts list; ATeam replaces it with the contract's id. "
         "List open questions as unknowns rather than guessing. You never modify "
         "files or state; shell commands are limited to read-only inspection. Read the Rules section first and treat "
         "anything it marks as the owner's decision as out of your scope: raise it under unknowns instead of deciding "
