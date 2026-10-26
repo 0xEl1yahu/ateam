@@ -805,3 +805,33 @@ def test_worker_run_runs_setup_before_the_attempt_and_stops_on_failure(monkeypat
     db = StateDB(home_dir(cli_target) / "state.db")
     assert db.latest_attempt("C-0001") is None
     assert db.get_meta(f"setup:{wt.resolve()}") is None
+
+
+def test_plan_covered_commit_failure_warns_and_still_transitions(monkeypatch, cli_target):
+    from ateam.intent import IntentError
+    from ateam.plans.store import load_plans
+    p = _proposed_plan(monkeypatch, cli_target)
+    _patch_investigation(monkeypatch, {"title": "Health again", "contracts": [], "depends_on_plans": ["P-0001"], "unknowns": [], "notes": "n"})
+
+    def fail_commit(paths, message, subpaths):
+        raise IntentError("simulated commit failure")
+
+    monkeypatch.setattr("ateam.cli.commit_intent", fail_commit)
+    r = run("plan", "health check again", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert "warning: could not commit the covered plan in the intent repo: simulated commit failure" in r.output
+    assert "ateam: plan P-0002 covered by P-0001" in r.output
+    assert load_plans(p.plans)["P-0002"].status == "plan_covered"
+    db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
+    assert db.feature_status("P-0002") == "plan_covered"
+
+
+def test_approve_does_not_claim_supersede_when_old_feature_moved_on(monkeypatch, cli_target):
+    p = _proposed_plan(monkeypatch, cli_target)
+    _patch_investigation(monkeypatch, _canned_plan())
+    assert run("plan", "a better health function", "--replaces", "P-0001", "--target", str(cli_target)).exit_code == 0
+    db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
+    db.transition("feature", "P-0001", "plan_rejected", by="owner")
+    r = run("approve", "P-0002", "--skip-records", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert "P-0001 -> superseded" not in r.output

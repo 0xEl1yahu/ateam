@@ -328,7 +328,12 @@ def plan(request: str, tier: str, replaces: str | None, target: Path) -> None:
         sys.exit(1)
     if pr.covered:
         save_plan(ctx.paths.plans, pr.plan)
-        commit_intent(ctx.paths, f"ateam: plan {pid} covered by {', '.join(pr.plan.covered_by)}", ["plans"])
+        covered_msg = f"ateam: plan {pid} covered by {', '.join(pr.plan.covered_by)}"
+        try:
+            commit_intent(ctx.paths, covered_msg, ["plans"])
+        except (IntentError, GitError) as e:
+            click.echo(f"warning: could not commit the covered plan in the intent repo: {e}; commit it by hand: "
+                       f"git -C \"{ctx.paths.intent}\" add plans && git -C \"{ctx.paths.intent}\" commit -m \"{covered_msg}\"")
         ctx.db.transition("feature", pid, "plan_covered", by="ateam", reason=f"covered by {', '.join(pr.plan.covered_by)}")
         click.echo(render_plan_review(pr, tiers))
         click.echo(f"\nsession {result.res.session_id}: {result.res.num_turns} turns, ${result.res.cost_usd:.4f}")
@@ -482,7 +487,7 @@ def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, targe
     if superseded_id is not None:
         if ctx.db.feature_status(superseded_id) == "plan_proposed":
             ctx.db.transition("feature", superseded_id, "superseded", by="owner", reason=f"replaced by {plan_id}")
-        click.echo(f"{superseded_id} -> superseded")
+            click.echo(f"{superseded_id} -> superseded")
 
 
 @main.command()
