@@ -259,7 +259,7 @@ def test_interface_matching_producer_is_quiet(target_repo, target_paths, records
 def test_consume_without_producer_or_text_match_is_a_note(target_repo, target_paths, records_three):
     rep = report(contract("First"), _with(contract("Second", deps=[0]), _ifc("consumes", "bar", "bar()")))
     r = report_to_plan(rep, "x", "P-0001", target_paths.contracts, records_three, CFG, target_repo, target_paths.records)
-    assert "C-0002 consumes `bar` which no contract produces and the code does not define" in r.problems
+    assert any("bar" in n and "could not verify" in n for n in r.problems)
 
 
 def test_consume_found_in_code_text_is_quiet(target_repo, target_paths, records_three):
@@ -290,3 +290,66 @@ def test_planner_schema_requires_interfaces_and_spec_sentences():
     assert i["properties"]["kind"]["enum"] == ["produces", "consumes"]
     assert "must match the producing contract's signature exactly" in PLANNER_SPEC.system_prompt
     assert "every consumed interface is produced by an earlier contract" in REVIEWER_SPEC.system_prompt
+
+
+@pytest.mark.parametrize("name", ["StateDB.transition", "store.StateDB.transition", "store.helper"])
+def test_qualified_interface_definitions_are_found(tmp_path, name):
+    from ateam.planner import _interface_notes
+    from ateam.contracts.model import Interface
+    (tmp_path / "store.py").write_text("class StateDB:\n    async def transition(self): pass\ndef helper(): pass\n")
+    notes = _interface_notes([{"paths": ["*.py"]}], ["C-1"],
+                             [[Interface(kind="consumes", name=name, signature="existing")]], tmp_path, [])
+    assert notes == []
+
+
+@pytest.mark.parametrize("name", ["WrongClass.transition", "absent"])
+def test_unresolved_interface_does_not_claim_nonexistence(tmp_path, name):
+    from ateam.planner import _interface_notes
+    from ateam.contracts.model import Interface
+    (tmp_path / "store.py").write_text("class StateDB:\n    def transition(self): pass\n")
+    notes = _interface_notes([{"paths": ["*.py"]}], ["C-1"],
+                             [[Interface(kind="consumes", name=name, signature="existing")]], tmp_path, [])
+    assert len(notes) == 1 and "could not verify" in notes[0]
+    assert "does not define" not in notes[0]
+
+
+@pytest.mark.parametrize("name", ["GitRepo.run / _run", "preflight, reconcile, IntegrationEnv"])
+def test_grouped_interfaces_request_separate_entries(tmp_path, name):
+    from ateam.planner import _interface_notes
+    from ateam.contracts.model import Interface
+    notes = _interface_notes([{}], ["C-1"],
+                             [[Interface(kind="consumes", name=name, signature="see earlier contract")]], tmp_path, [])
+    assert len(notes) == 1 and "one interface per entry" in notes[0]
+
+
+@pytest.mark.parametrize("name", ["reports/plan.yaml", "ateam integrate", "--target"])
+def test_non_python_interfaces_remain_searchable(tmp_path, name):
+    from ateam.planner import _interface_notes
+    from ateam.contracts.model import Interface
+    (tmp_path / "README.md").write_text(name)
+    assert _interface_notes([{"paths": ["*.md"]}], ["C-1"],
+                            [[Interface(kind="consumes", name=name, signature="existing")]], tmp_path, []) == []
+
+
+def test_interface_search_does_not_follow_external_file_symlink(tmp_path):
+    from ateam.planner import _interface_notes
+    from ateam.contracts.model import Interface
+    repo = tmp_path / "repo"; repo.mkdir()
+    outside = tmp_path / "outside.py"; outside.write_text("def external_only(): pass\n")
+    (repo / "linked.py").symlink_to(outside)
+    notes = _interface_notes([{"paths": ["*.py"]}], ["C-1"],
+                             [[Interface(kind="consumes", name="external_only", signature="existing")]], repo, [])
+    assert len(notes) == 1 and "could not verify" in notes[0]
+
+
+def test_interface_search_cap_and_invalid_python_are_inconclusive(tmp_path, monkeypatch):
+    import ateam.planner as planner
+    from ateam.contracts.model import Interface
+    (tmp_path / "bad.py").write_text("class StateDB: ???")
+    iface = Interface(kind="consumes", name="StateDB.transition", signature="existing")
+    notes = planner._interface_notes([{"paths": ["*.py"]}], ["C-1"], [[iface]], tmp_path, [])
+    assert len(notes) == 1 and "could not verify" in notes[0]
+    (tmp_path / "bad.py").write_text("class StateDB:\n    def transition(self): pass\n")
+    monkeypatch.setattr(planner, "_TEXT_SEARCH_CAP", 10)
+    notes = planner._interface_notes([{"paths": ["*.py"]}], ["C-1"], [[iface]], tmp_path, [])
+    assert len(notes) == 1 and "could not verify" in notes[0]

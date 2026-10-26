@@ -6,6 +6,7 @@ Allocation corrections the rubric requires are applied and recorded as notes, ne
 
 from __future__ import annotations
 
+import ast
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -68,16 +69,41 @@ def _has_cycle(raw: list[dict]) -> bool:
 _TEXT_SEARCH_CAP = 2_000_000
 
 
-def _search_text(repo_root: Path, globs: list[str], files: list[str]) -> str:
-    """Plain text of the files a name could live in: the contract's paths plus the files the planner read."""
+def _python_definitions(text: str, path: Path) -> set[str]:
+    """Names defined in one Python file, with class and module qualification."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return set()
+    names: set[str] = set()
+    modules = list(path.with_suffix("").parts)
+    if modules[-1] == "__init__":
+        modules.pop()
+    prefixes = ["", *(".".join(modules[i:]) + "." for i in range(len(modules)))]
+
+    def visit(body: list[ast.stmt], scope: str = "") -> None:
+        for node in body:
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                name = scope + node.name
+                names.update(prefix + name for prefix in prefixes)
+                if isinstance(node, ast.ClassDef):
+                    visit(node.body, name + ".")
+
+    visit(tree.body)
+    return names
+
+
+def _search_interfaces(repo_root: Path, globs: list[str], files: list[str]) -> tuple[str, set[str]]:
+    """Bounded text and Python definitions in declared/read files; not an exhaustive code index."""
     seen: dict[Path, None] = {}
     root = repo_root.resolve()
     for g in globs:
-        pattern = g[:-2] + "**/*" if g.endswith("**") else g   # pathlib's trailing ** matches directories only
+        pattern = g[:-2] + "**/*" if g.endswith("**") else g
         try:
             for f in root.glob(pattern):
-                if f.is_file():
-                    seen[f] = None
+                resolved = f.resolve()
+                if resolved.is_relative_to(root) and resolved.is_file():
+                    seen[resolved] = None
         except (ValueError, NotImplementedError, OSError):
             continue
     for rel in files:
@@ -85,17 +111,26 @@ def _search_text(repo_root: Path, globs: list[str], files: list[str]) -> str:
         if f.is_relative_to(root) and f.is_file():
             seen[f] = None
     parts: list[str] = []
-    total = 0
+    definitions: set[str] = set()
+    remaining = _TEXT_SEARCH_CAP
     for f in seen:
         try:
-            text = f.read_text(errors="replace")
+            with f.open("rb") as stream:
+                data = stream.read(remaining + 1)
         except OSError:
             continue
-        total += len(text)
-        if total > _TEXT_SEARCH_CAP:
+        if len(data) > remaining:
             break
+        remaining -= len(data)
+        text = data.decode(errors="replace")
         parts.append(text)
-    return "\n".join(parts)
+        if f.suffix == ".py":
+            definitions.update(_python_definitions(text, f.relative_to(root)))
+    return "\n".join(parts), definitions
+
+
+_SYMBOL = r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*"
+_GROUPED_SYMBOLS = re.compile(rf"{_SYMBOL}(?:(?:\s*,\s*|\s+/\s+){_SYMBOL})+")
 
 
 def _interface_notes(raw: list[dict], ids: list[str], interfaces: list[list[Interface]], repo_root: Path, files_read: list[str]) -> list[str]:
@@ -103,8 +138,12 @@ def _interface_notes(raw: list[dict], ids: list[str], interfaces: list[list[Inte
     produced: dict[str, tuple[str, str]] = {}   # name -> (contract id, signature), from earlier contracts only
     for i, ifs in enumerate(interfaces):
         text: str | None = None
+        definitions: set[str] = set()
         for itf in ifs:
             if itf.kind != "consumes":
+                continue
+            if _GROUPED_SYMBOLS.fullmatch(itf.name.strip()):
+                notes.append(f"{ids[i]} consumes `{itf.name}`: declare one interface per entry with its exact signature")
                 continue
             prior = produced.get(itf.name)
             if prior is not None:
@@ -113,9 +152,10 @@ def _interface_notes(raw: list[dict], ids: list[str], interfaces: list[list[Inte
                 continue
             if text is None:
                 scope = [*raw[i].get("paths", []), *raw[i].get("incidental", [])]
-                text = _search_text(repo_root, scope, files_read)
-            if itf.name not in text:
-                notes.append(f"{ids[i]} consumes `{itf.name}` which no contract produces and the code does not define")
+                text, definitions = _search_interfaces(repo_root, scope, files_read)
+            if itf.name not in definitions and itf.name not in text:
+                notes.append(f"{ids[i]} consumes `{itf.name}`: could not verify it in earlier contracts or the searched files; "
+                             "check the name and include its defining file in files_read")
         for itf in ifs:
             if itf.kind == "produces":
                 produced[itf.name] = (ids[i], itf.signature)
