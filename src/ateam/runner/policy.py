@@ -931,6 +931,33 @@ def _git_config_option(words: list[str]) -> bool:
     return any(o.startswith("-c") or o.startswith("--config-env") for o in opts)
 
 
+FOLLOW_LINKS_REASON = ("searches that follow symbolic links are not allowed: a link can lead into ATeam's home; "
+                       "drop -R/-L/--follow (grep -r, rg and find do not follow links)")
+
+
+def _follows_symlinks(words: list[str]) -> bool:
+    """A decoded command that follows symbolic links while walking directories (owner, 2026-10-26)."""
+    cw = _command_words(words)
+    if not cw:
+        return False
+    name, args = cw[0].rsplit("/", 1)[-1], cw[1:]
+
+    def short(letter: str) -> bool:
+        return any(a.startswith("-") and not a.startswith("--") and letter in a[1:] for a in args)
+
+    if name == "grep":
+        return short("R") or "--dereference-recursive" in args
+    if name == "rg":
+        return short("L") or "--follow" in args
+    if name == "find":
+        return any(a in ("-L", "-H", "-follow") for a in args)
+    if name == "tree":
+        return short("l")
+    if name in ("ls", "du"):
+        return short("L") or "--dereference" in args
+    return False
+
+
 def _option_writes(words: list[str]) -> bool:
     """The per-program option rules on decoded words (quotes and escapes removed, boundaries kept): output files,
     pre-processors, pagers, -exec forms and compilers that write or run other programs."""
@@ -1219,6 +1246,8 @@ class Policy:
                 rest = rest.replace(sp, " ")
             if _is_rm(words):
                 return False, "rm is not allowed for workers; use `git rm` for tracked files, cleanup happens at integration"
+            if _follows_symlinks(words):
+                return False, FOLLOW_LINKS_REASON
             cw = _command_words(words)
             if cw and cw[0].rsplit("/", 1)[-1] == "find" and "-delete" in cw:
                 return False, FIND_DELETE_REASON

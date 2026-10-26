@@ -1560,3 +1560,30 @@ def test_decoded_home_path_meets_the_home_rule(tmp_path):
     ok, reason = p.command_allowed(f"cat $'{encoded}/intent/config.yaml'")
     assert not ok and "ATeam's home" in reason
     assert p.command_allowed(f"cat $'{home}/scratch/C-1/handoff.yaml'")[0]
+
+
+# ---- symlink-following searches (owner, 2026-10-26): a link inside the checkout can lead into ATeam's home
+
+FOLLOWS_LINKS = [
+    "grep -R secret .", "grep -rRn secret src", "grep --dereference-recursive secret .",
+    "rg -L secret", "rg -iL secret src", "rg --follow secret",
+    "find -L . -name '*.yaml'", "find -H . -name x", "find . -follow -name x",
+    "tree -l", "tree -al src", "ls -LR", "ls -lL src", "ls --dereference src",
+    "du -L .", "du -shL src", "du --dereference src",
+]
+DOES_NOT_FOLLOW = [
+    "grep -r secret .", "grep -rn secret src", "rg secret", "rg -l secret", "find . -name '*.yaml'",
+    "tree -L 2 src", "ls -la src", "ls -R src", "du -sh src", "git grep secret",
+]
+
+
+@pytest.mark.parametrize("cmd", FOLLOWS_LINKS)
+@pytest.mark.parametrize("role", ["policy_build", "policy_test", "policy_investigate"])
+def test_symlink_following_searches_denied(role, cmd, request):
+    ok, why = request.getfixturevalue(role).command_allowed(cmd)
+    assert not ok and "follow symbolic links" in why
+
+
+@pytest.mark.parametrize("cmd", DOES_NOT_FOLLOW)
+def test_searches_that_do_not_follow_links_stay_allowed(cmd, policy_investigate):
+    assert policy_investigate.command_allowed(cmd) == (True, "")

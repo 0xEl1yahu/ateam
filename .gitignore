@@ -5,3 +5,6 @@ spikes/*/out/
 .superpowers/
 *.egg-info/
 *.sw?
+
+# A local symlink to ATeam's own private intent repo (owner, 2026-10-26); never tracked, never pushed
+/intent
