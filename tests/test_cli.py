@@ -2105,3 +2105,77 @@ def test_brief_uses_role_scratch(cli_target):
     assert r.exit_code == 0, r.output
     assert "C-0001-test" in r.output
     assert "C-0001-test" not in run("brief", "C-0001", "--role", "build", "--target", str(cli_target)).output
+
+
+# ---- result files and verify --base (plan 2026-10-26-scheduler, task 3)
+
+def _read(path):
+    import json
+    return json.loads(path.read_text())
+
+
+def test_worker_run_result_file(monkeypatch, cli_target, tmp_path):
+    from ateam.config import load_config, save_config
+    out = tmp_path / "r.json"
+    # not binding: exit 4
+    wt = tmp_path / "wt-r"; GitRepo(cli_target).worktree_add(wt, "wt-r", "main")
+    r = run("worker", "run", "C-0001", "--role", "build", "--cwd", str(wt), "--result-file", str(out), "--target", str(cli_target))
+    assert r.exit_code == 4 and _read(out)["outcome"] == "not_binding" and _read(out)["code"] == 4
+    # completed
+    _frozen_target(cli_target)
+    _fake_attempt(monkeypatch, _MET)
+    r = run("worker", "run", "C-0001", "--role", "test", "--cwd", str(wt), "--result-file", str(out), "--target", str(cli_target))
+    d = _read(out)
+    assert r.exit_code == 0 and d["outcome"] == "completed" and d["test_outcome"] == "completed" and d["subtype"] == "success"
+    # TEST failed verdict: exit 5
+    _fake_attempt(monkeypatch, _NOT_MET)
+    r = run("worker", "run", "C-0001", "--role", "test", "--cwd", str(wt), "--result-file", str(out), "--target", str(cli_target))
+    assert r.exit_code == 5 and _read(out)["test_outcome"] == "failed" and _read(out)["test_class"] == "implementation"
+    # setup failure
+    paths = TargetPaths.from_root(cli_target)
+    cfg = load_config(paths); cfg.setup = ["false"]; save_config(paths, cfg)
+    wt2 = tmp_path / "wt-r2"; GitRepo(cli_target).worktree_add(wt2, "wt-r2", "main")
+    r = run("worker", "run", "C-0001", "--role", "build", "--cwd", str(wt2), "--result-file", str(out), "--target", str(cli_target))
+    assert r.exit_code == 1 and _read(out)["outcome"] == "setup_failed" and "setup failed" in _read(out)["error"]
+
+
+def test_verify_base_scopes_against_the_given_commit(cli_target, tmp_path):
+    wt = _verify_setup(cli_target, tmp_path, [("unit", "true")])
+    g = GitRepo(wt)
+    (wt / "docs").mkdir(); (wt / "docs" / "dep.md").write_text("from a merged dependency\n")   # outside C-0001's paths
+    g.run("add", "-A"); g.run("commit", "-q", "-m", "dependency merged into the integration tip")
+    base = g.head()
+    _do_work(wt)
+    r = run("verify", "C-0001", "--cwd", str(wt), "--base", base, "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+
+
+def test_verify_without_base_counts_the_dependency_as_out_of_scope(cli_target, tmp_path):
+    wt = _verify_setup(cli_target, tmp_path, [("unit", "true")])
+    g = GitRepo(wt)
+    (wt / "docs").mkdir(); (wt / "docs" / "dep.md").write_text("from a merged dependency\n")
+    g.run("add", "-A"); g.run("commit", "-q", "-m", "dependency")
+    _do_work(wt)
+    r = run("verify", "C-0001", "--cwd", str(wt), "--target", str(cli_target))
+    assert r.exit_code == 1 and "docs/dep.md" in r.output
+
+
+def test_verify_result_file_marks_refusals_and_verdicts(cli_target, tmp_path):
+    out = tmp_path / "v.json"
+    wt = _verify_setup(cli_target, tmp_path, [("unit", "true")])
+    (wt / "src" / "api" / "x.py").write_text("DIRTY = 1\n")      # uncommitted work: a refusal, not a failure
+    r = run("verify", "C-0001", "--cwd", str(wt), "--result-file", str(out), "--target", str(cli_target))
+    d = _read(out)
+    assert r.exit_code == 1 and d["status"] == "refused" and d["failure_class"] is None and "uncommitted" in d["reasons"][0]
+    GitRepo(wt).run("checkout", "--", "src/api/x.py")
+    _do_work(wt)
+    r = run("verify", "C-0001", "--cwd", str(wt), "--result-file", str(out), "--target", str(cli_target))
+    assert r.exit_code == 0 and _read(out) == {"code": 0, "status": "verified", "failure_class": None, "reasons": []}
+
+
+def test_refresh_result_file(monkeypatch, cli_target, tmp_path):
+    out = tmp_path / "f.json"
+    p = _approved_predecessor(monkeypatch, cli_target)
+    _mark_verified(p, cli_target, "C-0002")
+    r = run("contracts", "refresh", "--result-file", str(out), "--target", str(cli_target))
+    assert r.exit_code == 0 and _read(out) == {"code": 0, "promoted": ["C-0003"], "drifted": []}

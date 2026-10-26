@@ -54,9 +54,44 @@ def _context(target: Path, require_ateam: bool = True) -> Context:
     return Context(target)
 
 
+_LAST_FAIL: list[str] = []   # the message of the last _fail, for --result-file
+
+
 def _fail(message: str, code: int = 1) -> None:
+    _LAST_FAIL[:] = [message]
     click.echo(f"error: {message}")
     sys.exit(code)
+
+
+RESULT_FILE_OPTION = click.option(
+    "--result-file", "result_file", type=click.Path(dir_okay=False, path_type=Path), default=None,
+    help="Also write the outcome as JSON to this file (read by `ateam run`).",
+)
+
+
+class _Result:
+    """Collects a command's outcome fields and, when a path is given, writes them with the exit code as JSON on any
+    exit. A refusal's message (from _fail) fills `reasons` or `error` when the command set neither."""
+
+    def __init__(self, path: Path | None, defaults: dict) -> None:
+        self.path, self.data = path, dict(defaults)
+
+    def __enter__(self) -> dict:
+        _LAST_FAIL.clear()
+        return self.data
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if self.path is not None:
+            import json
+
+            code = (exc.code if exc.code is not None else 0) if isinstance(exc, SystemExit) else (0 if exc is None else 1)
+            data = {"code": code, **self.data}
+            if _LAST_FAIL and "reasons" in data and not data["reasons"]:
+                data["reasons"] = list(_LAST_FAIL)
+            if _LAST_FAIL and "error" in data and data["error"] is None:
+                data["error"] = _LAST_FAIL[0]
+            Path(self.path).write_text(json.dumps(data, default=str))
+        return False
 
 
 class _Group(click.Group):
@@ -1154,8 +1189,9 @@ def contracts_freeze(contract_id: str, force: bool, target: Path) -> None:
 
 @contracts.command("refresh")
 @click.argument("plan_id", required=False)
+@RESULT_FILE_OPTION
 @TARGET_OPTION
-def contracts_refresh(plan_id: str | None, target: Path) -> None:
+def contracts_refresh(plan_id: str | None, result_file: Path | None, target: Path) -> None:
     """Promote frozen draft contracts whose dependencies are all verified or integrated. Stops on drift: a drifted
     draft is left as it is and reported (owner, 2026-10-25). Only the status changes; the frozen hash does not."""
     from ateam.contracts.model import ContractStatus
@@ -1164,49 +1200,53 @@ def contracts_refresh(plan_id: str | None, target: Path) -> None:
     from ateam.plans.store import load_plans
     from ateam.records.store import load_records
 
-    ctx = _context(target)
-    plans_ = load_plans(ctx.paths.plans)
-    if plan_id is not None and plan_id not in plans_:
-        _fail(f"unknown plan {plan_id}")
-    cs = load_contracts(ctx.paths.contracts)
-    recs = load_records(ctx.paths.records)
-    live = ("plan_approved", "executing", "integrating")
-    promote, problems = [], 0
-    for cid, c in sorted(cs.items()):
-        if plan_id is not None and c.plan != plan_id:
-            continue
-        frozen = ctx.db.contract_hash(cid)
-        if c.status != ContractStatus.draft or frozen is None or ctx.db.contract_status(cid) != "draft":
-            continue
-        if ctx.db.feature_status(c.plan) not in live:
-            continue
-        waiting = [d for d in c.depends_on if ctx.db.contract_status(d) not in ("verified", "integrated")]
-        if waiting:
-            click.echo(f"{cid}: waiting on " + ", ".join(f"{d} ({ctx.db.contract_status(d) or 'missing'})" for d in waiting))
-            continue
-        if c.content_hash() != frozen:
-            click.echo(f"{cid}: differs from its frozen hash (hand edit); left draft")
-            problems += 1
-            continue
-        drifted = drift(c, recs)
-        if drifted:
-            click.echo(f"{cid}: record drift ({', '.join(drifted)}); left draft")
-            problems += 1
-            continue
-        promote.append(c)
-    if not promote:
-        click.echo("nothing to refresh")
+    with _Result(result_file, {"promoted": [], "drifted": []}) as out:
+        ctx = _context(target)
+        plans_ = load_plans(ctx.paths.plans)
+        if plan_id is not None and plan_id not in plans_:
+            _fail(f"unknown plan {plan_id}")
+        cs = load_contracts(ctx.paths.contracts)
+        recs = load_records(ctx.paths.records)
+        live = ("plan_approved", "executing", "integrating")
+        promote, problems = [], 0
+        for cid, c in sorted(cs.items()):
+            if plan_id is not None and c.plan != plan_id:
+                continue
+            frozen = ctx.db.contract_hash(cid)
+            if c.status != ContractStatus.draft or frozen is None or ctx.db.contract_status(cid) != "draft":
+                continue
+            if ctx.db.feature_status(c.plan) not in live:
+                continue
+            waiting = [d for d in c.depends_on if ctx.db.contract_status(d) not in ("verified", "integrated")]
+            if waiting:
+                click.echo(f"{cid}: waiting on " + ", ".join(f"{d} ({ctx.db.contract_status(d) or 'missing'})" for d in waiting))
+                continue
+            if c.content_hash() != frozen:
+                click.echo(f"{cid}: differs from its frozen hash (hand edit); left draft")
+                out["drifted"].append(cid)
+                problems += 1
+                continue
+            drifted = drift(c, recs)
+            if drifted:
+                click.echo(f"{cid}: record drift ({', '.join(drifted)}); left draft")
+                out["drifted"].append(cid)
+                problems += 1
+                continue
+            promote.append(c)
+        if not promote:
+            click.echo("nothing to refresh")
+            sys.exit(1 if problems else 0)
+        try:
+            require_clean(ctx.paths)
+        except IntentError as e:
+            _fail(str(e))
+        files = [save_contract(ctx.paths.contracts, c.model_copy(update={"status": ContractStatus.ready})) for c in promote]
+        commit_intent_files(ctx.paths, f"ateam: refresh {', '.join(c.id for c in promote)}", files)
+        for c in promote:
+            ctx.db.transition("contract", c.id, "ready", by="refresh")
+            click.echo(f"{c.id} -> ready")
+            out["promoted"].append(c.id)
         sys.exit(1 if problems else 0)
-    try:
-        require_clean(ctx.paths)
-    except IntentError as e:
-        _fail(str(e))
-    files = [save_contract(ctx.paths.contracts, c.model_copy(update={"status": ContractStatus.ready})) for c in promote]
-    commit_intent_files(ctx.paths, f"ateam: refresh {', '.join(c.id for c in promote)}", files)
-    for c in promote:
-        ctx.db.transition("contract", c.id, "ready", by="refresh")
-        click.echo(f"{c.id} -> ready")
-    sys.exit(1 if problems else 0)
 
 
 @contracts.command("validate")
@@ -1378,8 +1418,10 @@ def worker() -> None:
 @click.option("--tier", default=None, help="Override the contract's tier for this role.")
 @click.option("--resume", default=None, help="Resume a previous session id.")
 @click.option("--prompt", default=None, help="Override the default prompt.")
+@RESULT_FILE_OPTION
 @TARGET_OPTION
-def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, tier: str | None, resume: str | None, prompt: str | None, target: Path) -> None:
+def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, tier: str | None, resume: str | None, prompt: str | None,
+               result_file: Path | None, target: Path) -> None:
     import asyncio
     import json
 
@@ -1391,52 +1433,60 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
 
     from ateam.runner.binding import ContractNotBinding, require_binding
 
-    ctx = _context(target)
-    cs = load_contracts(ctx.paths.contracts)
-    if contract_id not in cs:
-        _fail(f"unknown contract {contract_id}")
-    contract = cs[contract_id]
-    records = load_records(ctx.paths.records)
-    try:
-        require_binding(contract, records, ctx.db)   # before setup: a contract that does not bind never provisions a worktree
-    except ContractNotBinding as e:
-        _fail(str(e), code=4)
-    wt_git = _require_isolated_worktree(ctx, worktree)
-    worktree = wt_git.root
-    tiers = load_tiers(ctx.config.tiers)
-    if tier and tier not in tiers:
-        _fail(f"unknown tier {tier!r}; known: {', '.join(tiers)}")
-    try:
-        ensure_setup(worktree, ctx.config, ctx.db, on_command=lambda c: click.echo(f"setup: {c}"))
-    except SetupError as e:
-        _fail(f"setup failed: {e.cmd} (exit {e.returncode})\n{e.output}")
-    try:
-        res, tree, scope, cp = asyncio.run(run_contract_attempt(
-            paths=ctx.paths, config=ctx.config, git_worktree=wt_git, worktree=worktree,
-            base=base or default_base(wt_git, ctx.config.target_branch),
-            contract=contract, records=records, role=Role(role), tiers=tiers,
-            db=ctx.db, resume=resume, prompt=prompt, tier_override=tier,
-        ))
-    except ContractNotBinding as e:
-        _fail(str(e), code=4)
-    except ValueError as e:
-        _fail(str(e))
-    click.echo(f"session {res.session_id} subtype={res.subtype} turns={res.num_turns} cost=${res.cost_usd:.4f} wall={res.wall_s:.0f}s")
-    if res.denials:
-        click.echo("denials: " + "; ".join(res.denials))
-    if res.error:
-        click.echo(f"error: {res.error}")
-    click.echo(f"scope ok={scope.ok} outside={scope.outside} dirty={scope.dirty} changed={tree.changed_vs_base}")
-    code = 0 if (res.report and scope.ok) else (3 if res.report else 1)
-    if Role(role) is Role.test and res.report and scope.ok:
-        from ateam.runner.run import classify_test_report
+    with _Result(result_file, {"outcome": "refused", "subtype": None, "error": None, "cost_usd": 0.0, "session_id": None,
+                               "test_outcome": None, "test_class": None, "report": None}) as out:
+        ctx = _context(target)
+        cs = load_contracts(ctx.paths.contracts)
+        if contract_id not in cs:
+            _fail(f"unknown contract {contract_id}")
+        contract = cs[contract_id]
+        records = load_records(ctx.paths.records)
+        try:
+            require_binding(contract, records, ctx.db)   # before setup: a contract that does not bind never provisions a worktree
+        except ContractNotBinding as e:
+            out["outcome"] = "not_binding"
+            _fail(str(e), code=4)
+        wt_git = _require_isolated_worktree(ctx, worktree)
+        worktree = wt_git.root
+        tiers = load_tiers(ctx.config.tiers)
+        if tier and tier not in tiers:
+            _fail(f"unknown tier {tier!r}; known: {', '.join(tiers)}")
+        try:
+            ensure_setup(worktree, ctx.config, ctx.db, on_command=lambda c: click.echo(f"setup: {c}"))
+        except SetupError as e:
+            out["outcome"] = "setup_failed"
+            _fail(f"setup failed: {e.cmd} (exit {e.returncode})\n{e.output}")
+        try:
+            res, tree, scope, cp = asyncio.run(run_contract_attempt(
+                paths=ctx.paths, config=ctx.config, git_worktree=wt_git, worktree=worktree,
+                base=base or default_base(wt_git, ctx.config.target_branch),
+                contract=contract, records=records, role=Role(role), tiers=tiers,
+                db=ctx.db, resume=resume, prompt=prompt, tier_override=tier,
+            ))
+        except ContractNotBinding as e:
+            out["outcome"] = "not_binding"
+            _fail(str(e), code=4)
+        except ValueError as e:
+            _fail(str(e))
+        out.update(subtype=res.subtype, error=res.error, cost_usd=res.cost_usd, session_id=res.session_id, report=res.report)
+        click.echo(f"session {res.session_id} subtype={res.subtype} turns={res.num_turns} cost=${res.cost_usd:.4f} wall={res.wall_s:.0f}s")
+        if res.denials:
+            click.echo("denials: " + "; ".join(res.denials))
+        if res.error:
+            click.echo(f"error: {res.error}")
+        click.echo(f"scope ok={scope.ok} outside={scope.outside} dirty={scope.dirty} changed={tree.changed_vs_base}")
+        code = 0 if (res.report and scope.ok) else (3 if res.report else 1)
+        out["outcome"] = {0: "completed", 3: "scope_breach", 1: "failed"}[code]
+        if Role(role) is Role.test and res.report and scope.ok:
+            from ateam.runner.run import classify_test_report
 
-        test_outcome, test_class = classify_test_report(res.report)
-        click.echo(f"classification: {test_outcome}/{test_class or '-'}")
-        if test_outcome == "failed":
-            code = 5   # a failed verdict (owner, 2026-10-26); 0 met, 3 scope breach, 1 no report, 4 refused
-    click.echo(json.dumps(res.report, indent=2) if res.report else "no structured report")
-    sys.exit(code)
+            test_outcome, test_class = classify_test_report(res.report)
+            out.update(test_outcome=test_outcome, test_class=test_class)
+            click.echo(f"classification: {test_outcome}/{test_class or '-'}")
+            if test_outcome == "failed":
+                code = 5   # a failed verdict (owner, 2026-10-26); 0 met, 3 scope breach, 1 no report, 4 refused
+        click.echo(json.dumps(res.report, indent=2) if res.report else "no structured report")
+        sys.exit(code)
 
 
 # ---------------------------------------------------------------- verify (minimal)
@@ -1445,8 +1495,10 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
 @main.command()
 @click.argument("contract_id")
 @click.option("--cwd", "worktree", type=click.Path(file_okay=False, exists=True, path_type=Path), required=True, help="Worktree holding the committed work.")
+@click.option("--base", "base_rev", default=None, help="Base commit for the diff and scope check (default: merge-base with the target branch).")
+@RESULT_FILE_OPTION
 @TARGET_OPTION
-def verify(contract_id: str, worktree: Path, target: Path) -> None:
+def verify(contract_id: str, worktree: Path, base_rev: str | None, result_file: Path | None, target: Path) -> None:
     """Minimal verification: the contract's checks, scope and acceptance tests, judged from the worktree.
 
     No TEST worker yet: judgment criteria are listed, not checked. Exit 0 verified, 1 failed or refused, 4 guard."""
@@ -1464,141 +1516,146 @@ def verify(contract_id: str, worktree: Path, target: Path) -> None:
     from ateam.runner.run import default_base
     from ateam.treecheck import scope_check, tree_state
 
-    ctx = _context(target)
-    cs = load_contracts(ctx.paths.contracts)
-    if contract_id not in cs:
-        _fail(f"unknown contract {contract_id}")
-    wt_git = _require_isolated_worktree(ctx, worktree)
-    contract = cs[contract_id]
-    intent = intent_git(ctx.paths)
+    with _Result(result_file, {"status": "refused", "failure_class": None, "reasons": []}) as out:
+        ctx = _context(target)
+        cs = load_contracts(ctx.paths.contracts)
+        if contract_id not in cs:
+            _fail(f"unknown contract {contract_id}")
+        wt_git = _require_isolated_worktree(ctx, worktree)
+        contract = cs[contract_id]
+        intent = intent_git(ctx.paths)
 
-    def set_file_status(c, status: str, subject: str) -> None:
-        saved = save_contract(ctx.paths.contracts, c.model_copy(update={"status": ContractStatus(status)}))
+        def set_file_status(c, status: str, subject: str) -> None:
+            saved = save_contract(ctx.paths.contracts, c.model_copy(update={"status": ContractStatus(status)}))
+            try:
+                commit_intent(ctx.paths, subject, [f"contracts/{saved.name}"])
+            except (IntentError, GitError) as e:
+                if "nothing to commit" not in str(e):
+                    _fail(f"could not commit {contract_id} -> {status} in the intent repo: {e}; restore it with "
+                          f"git -C \"{ctx.paths.intent}\" checkout -- contracts/{saved.name} and re-run")
+
+        # Markers in the store: `running` before the checks start, `pending` (the verdict and its checkpoint) after them
+        # and before the intent commit. A check runs as the owner and could forge either, so a marker can only ever
+        # finish a failed verdict; a verified one is earned again by a run that completes its own checks.
+        pending_key, running_key = f"verify-pending:{contract_id}", f"verify-running:{contract_id}"
+        pending_raw, running_raw = ctx.db.get_meta(pending_key), ctx.db.get_meta(running_key)
+        if pending_raw or running_raw:
+            dirty = intent.status_porcelain()
+            if dirty:
+                _fail(f"an earlier verify of {contract_id} was interrupted and the intent repo has uncommitted changes "
+                      f"({', '.join(path for _, path in dirty)}); review them, commit or discard them, and re-run", code=4)
+            marker = json.loads(pending_raw or running_raw)
+            # The walk starts from the store, never from the marker: a marker can be forged by a check.
+            before_status = ctx.db.contract_status(contract_id)
+            if before_status not in ("ready", "building", "failed"):
+                _fail(f"an earlier verify of {contract_id} was interrupted and the state store says {before_status}; "
+                      "investigate before verifying again", code=4)
+            if pending_raw and marker["status"] == ContractStatus.failed:
+                set_file_status(contract, "failed", f"ateam: verify {contract_id} -> failed")
+                ctx.db.finish_verification(contract_id, before_status, v.walk_to(before_status, "failed"), by="verify",
+                                           reason=str(marker.get("reason", ""))[:500], checkpoint=marker["checkpoint"],
+                                           clear_keys=[pending_key, running_key])
+                click.echo(f"recovered: an interrupted verify had judged {contract_id} failed; the state store now agrees")
+                out.update(status="failed", failure_class=marker["checkpoint"].get("failure_class") or "implementation",
+                           reasons=[str(marker.get("reason", ""))])
+                sys.exit(1)
+            if not pending_raw:
+                note = "a previous verify was stopped while its checks ran"
+                set_file_status(contract, "failed", f"ateam: verify {contract_id} -> failed")
+                ctx.db.finish_verification(
+                    contract_id, before_status, v.walk_to(before_status, "failed"), by="verify",
+                    reason=f"{v.VERIFIER}; tamper: {note}", clear_keys=[pending_key, running_key],
+                    checkpoint=Checkpoint(
+                        base="", head="", commits=[], diff_names=[], dirty=[], checks=[], contract_hash=contract.content_hash(),
+                        record_hashes={ref.id: ref.hash for ref in contract.records}, session_id=None, notes=None,
+                        warnings=[v.VERIFIER, note],
+                    ).to_dict(),
+                )
+                click.echo(f"  tamper: {note}")
+                click.echo(f"{contract_id} -> failed (tamper)")
+                out.update(status="failed", failure_class="tamper", reasons=[note])
+                sys.exit(1)
+            set_file_status(contract, before_status, f"ateam: verify {contract_id} interrupted; back to {before_status}")
+            ctx.db.delete_meta(pending_key, running_key)
+            contract = load_contracts(ctx.paths.contracts)[contract_id]
+            click.echo(f"note: an earlier verify of {contract_id} was interrupted before it was recorded; verifying again")
+
+        if contract.status == ContractStatus.paused:
+            _fail(f"{contract_id} is paused; the owner resumes it before it is verified", code=4)
         try:
-            commit_intent(ctx.paths, subject, [f"contracts/{saved.name}"])
+            require_binding(contract, load_records(ctx.paths.records), ctx.db)
+            require_clean(ctx.paths)
+        except (ContractNotBinding, IntentError) as e:
+            _fail(str(e), code=4)
+        if not contract.checks:
+            _fail(f"minimal verify needs at least one deterministic check; {contract_id} has none")
+        base = base_rev or default_base(wt_git, ctx.config.target_branch)
+        tree = tree_state(wt_git, base)
+        scope = scope_check(tree, contract.paths, contract.incidental)
+        if scope.dirty:
+            _fail(f"the worktree has uncommitted changes ({', '.join(scope.dirty)}); commit the work first")
+        start = ctx.db.contract_status(contract_id)   # equal to the file's status: require_binding checked it
+
+        click.echo(f"verifying {contract_id} in {wt_git.root} against base {base[:12]} ({v.VERIFIER})")
+        ctx.db.set_meta(running_key, json.dumps({"start": start, "parent": intent.head()}))
+        before = v.snapshot(wt_git, intent, ctx.git, ctx.db.fingerprint(contract_id))
+        results = v.run_checks(contract.checks, wt_git.root, v.check_env(os.environ, ctx.config.env))
+        after = v.snapshot(wt_git, intent, ctx.git, ctx.db.fingerprint(contract_id))
+        tamper, warnings = v.compare(before, after)
+        acceptance = v.acceptance_presence(contract, wt_git.root)
+        outcome = v.decide(scope, results, acceptance, tamper)
+
+        for r in results:
+            state = "passed" if r.passed else ("errored" if r.errored else "failed")
+            click.echo(f"  {r.name}: {state}" + ("" if r.passed or r.exit_code is None else f" (exit {r.exit_code})"))
+            if not r.passed and r.tail.strip():
+                click.echo("\n".join("      " + line for line in r.tail.splitlines()[-20:]))
+        for a in acceptance:
+            state = {True: "present", False: "MISSING", None: "not checked by minimal verify"}[a.ok]
+            click.echo(f"  {a.id} [{a.kind}]: {state}" + ("" if a.ok is None else f" ({a.detail})"))
+        if not scope.ok:
+            click.echo("  scope: outside the contract's paths: " + ", ".join(scope.outside))
+        for t in tamper:
+            click.echo(f"  tamper: {t}")
+        for w in warnings:
+            click.echo(f"  warning: {w}")
+
+        # Recorded from the contract as it was before the checks: nothing read after them is trusted.
+        final = contract.model_copy(update={"status": ContractStatus(outcome.status)})
+        steps = v.walk_to(start, outcome.status)
+        log = wt_git.run("log", "--format=%h %s", f"{base}..{after.worktree_head}") if after.worktree_head != base else ""
+        checkpoint = Checkpoint(
+            base=base, head=after.worktree_head, commits=[line for line in log.splitlines() if line],
+            diff_names=tree.changed_vs_base, dirty=[*after.worktree_tracked, *after.worktree_untracked],
+            checks=[r.fact() for r in results], contract_hash=final.content_hash(),
+            record_hashes={ref.id: ref.hash for ref in final.records}, session_id=None, notes=None,
+            warnings=[v.VERIFIER, *warnings],
+        ).to_dict()
+        summary = (f"{outcome.failure_class}: " if outcome.failure_class else "") + ("; ".join(outcome.reasons) or "all checks passed")
+        reason = f"{v.VERIFIER}; {summary}"[:500]
+        subject = f"ateam: verify {contract_id} -> {outcome.status}"
+        ctx.db.set_meta(pending_key, json.dumps({
+            "status": outcome.status, "parent": intent.head(), "subject": subject, "start": start, "steps": steps,
+            "reason": reason, "checkpoint": checkpoint,
+        }, default=str))
+
+        # The intent repo is the truth; the state store follows it.
+        saved = save_contract(ctx.paths.contracts, final)
+        rel = f"contracts/{saved.name}"
+        try:
+            commit_intent(ctx.paths, subject, [rel])
         except (IntentError, GitError) as e:
             if "nothing to commit" not in str(e):
-                _fail(f"could not commit {contract_id} -> {status} in the intent repo: {e}; restore it with "
-                      f"git -C \"{ctx.paths.intent}\" checkout -- contracts/{saved.name} and re-run")
-
-    # Markers in the store: `running` before the checks start, `pending` (the verdict and its checkpoint) after them
-    # and before the intent commit. A check runs as the owner and could forge either, so a marker can only ever
-    # finish a failed verdict; a verified one is earned again by a run that completes its own checks.
-    pending_key, running_key = f"verify-pending:{contract_id}", f"verify-running:{contract_id}"
-    pending_raw, running_raw = ctx.db.get_meta(pending_key), ctx.db.get_meta(running_key)
-    if pending_raw or running_raw:
-        dirty = intent.status_porcelain()
-        if dirty:
-            _fail(f"an earlier verify of {contract_id} was interrupted and the intent repo has uncommitted changes "
-                  f"({', '.join(path for _, path in dirty)}); review them, commit or discard them, and re-run", code=4)
-        marker = json.loads(pending_raw or running_raw)
-        # The walk starts from the store, never from the marker: a marker can be forged by a check.
-        before_status = ctx.db.contract_status(contract_id)
-        if before_status not in ("ready", "building", "failed"):
-            _fail(f"an earlier verify of {contract_id} was interrupted and the state store says {before_status}; "
-                  "investigate before verifying again", code=4)
-        if pending_raw and marker["status"] == ContractStatus.failed:
-            set_file_status(contract, "failed", f"ateam: verify {contract_id} -> failed")
-            ctx.db.finish_verification(contract_id, before_status, v.walk_to(before_status, "failed"), by="verify",
-                                       reason=str(marker.get("reason", ""))[:500], checkpoint=marker["checkpoint"],
-                                       clear_keys=[pending_key, running_key])
-            click.echo(f"recovered: an interrupted verify had judged {contract_id} failed; the state store now agrees")
-            sys.exit(1)
-        if not pending_raw:
-            note = "a previous verify was stopped while its checks ran"
-            set_file_status(contract, "failed", f"ateam: verify {contract_id} -> failed")
-            ctx.db.finish_verification(
-                contract_id, before_status, v.walk_to(before_status, "failed"), by="verify",
-                reason=f"{v.VERIFIER}; tamper: {note}", clear_keys=[pending_key, running_key],
-                checkpoint=Checkpoint(
-                    base="", head="", commits=[], diff_names=[], dirty=[], checks=[], contract_hash=contract.content_hash(),
-                    record_hashes={ref.id: ref.hash for ref in contract.records}, session_id=None, notes=None,
-                    warnings=[v.VERIFIER, note],
-                ).to_dict(),
-            )
-            click.echo(f"  tamper: {note}")
-            click.echo(f"{contract_id} -> failed (tamper)")
-            sys.exit(1)
-        set_file_status(contract, before_status, f"ateam: verify {contract_id} interrupted; back to {before_status}")
-        ctx.db.delete_meta(pending_key, running_key)
-        contract = load_contracts(ctx.paths.contracts)[contract_id]
-        click.echo(f"note: an earlier verify of {contract_id} was interrupted before it was recorded; verifying again")
-
-    if contract.status == ContractStatus.paused:
-        _fail(f"{contract_id} is paused; the owner resumes it before it is verified", code=4)
-    try:
-        require_binding(contract, load_records(ctx.paths.records), ctx.db)
-        require_clean(ctx.paths)
-    except (ContractNotBinding, IntentError) as e:
-        _fail(str(e), code=4)
-    if not contract.checks:
-        _fail(f"minimal verify needs at least one deterministic check; {contract_id} has none")
-    base = default_base(wt_git, ctx.config.target_branch)
-    tree = tree_state(wt_git, base)
-    scope = scope_check(tree, contract.paths, contract.incidental)
-    if scope.dirty:
-        _fail(f"the worktree has uncommitted changes ({', '.join(scope.dirty)}); commit the work first")
-    start = ctx.db.contract_status(contract_id)   # equal to the file's status: require_binding checked it
-
-    click.echo(f"verifying {contract_id} in {wt_git.root} against base {base[:12]} ({v.VERIFIER})")
-    ctx.db.set_meta(running_key, json.dumps({"start": start, "parent": intent.head()}))
-    before = v.snapshot(wt_git, intent, ctx.git, ctx.db.fingerprint(contract_id))
-    results = v.run_checks(contract.checks, wt_git.root, v.check_env(os.environ, ctx.config.env))
-    after = v.snapshot(wt_git, intent, ctx.git, ctx.db.fingerprint(contract_id))
-    tamper, warnings = v.compare(before, after)
-    acceptance = v.acceptance_presence(contract, wt_git.root)
-    outcome = v.decide(scope, results, acceptance, tamper)
-
-    for r in results:
-        state = "passed" if r.passed else ("errored" if r.errored else "failed")
-        click.echo(f"  {r.name}: {state}" + ("" if r.passed or r.exit_code is None else f" (exit {r.exit_code})"))
-        if not r.passed and r.tail.strip():
-            click.echo("\n".join("      " + line for line in r.tail.splitlines()[-20:]))
-    for a in acceptance:
-        state = {True: "present", False: "MISSING", None: "not checked by minimal verify"}[a.ok]
-        click.echo(f"  {a.id} [{a.kind}]: {state}" + ("" if a.ok is None else f" ({a.detail})"))
-    if not scope.ok:
-        click.echo("  scope: outside the contract's paths: " + ", ".join(scope.outside))
-    for t in tamper:
-        click.echo(f"  tamper: {t}")
-    for w in warnings:
-        click.echo(f"  warning: {w}")
-
-    # Recorded from the contract as it was before the checks: nothing read after them is trusted.
-    final = contract.model_copy(update={"status": ContractStatus(outcome.status)})
-    steps = v.walk_to(start, outcome.status)
-    log = wt_git.run("log", "--format=%h %s", f"{base}..{after.worktree_head}") if after.worktree_head != base else ""
-    checkpoint = Checkpoint(
-        base=base, head=after.worktree_head, commits=[line for line in log.splitlines() if line],
-        diff_names=tree.changed_vs_base, dirty=[*after.worktree_tracked, *after.worktree_untracked],
-        checks=[r.fact() for r in results], contract_hash=final.content_hash(),
-        record_hashes={ref.id: ref.hash for ref in final.records}, session_id=None, notes=None,
-        warnings=[v.VERIFIER, *warnings],
-    ).to_dict()
-    summary = (f"{outcome.failure_class}: " if outcome.failure_class else "") + ("; ".join(outcome.reasons) or "all checks passed")
-    reason = f"{v.VERIFIER}; {summary}"[:500]
-    subject = f"ateam: verify {contract_id} -> {outcome.status}"
-    ctx.db.set_meta(pending_key, json.dumps({
-        "status": outcome.status, "parent": intent.head(), "subject": subject, "start": start, "steps": steps,
-        "reason": reason, "checkpoint": checkpoint,
-    }, default=str))
-
-    # The intent repo is the truth; the state store follows it.
-    saved = save_contract(ctx.paths.contracts, final)
-    rel = f"contracts/{saved.name}"
-    try:
-        commit_intent(ctx.paths, subject, [rel])
-    except (IntentError, GitError) as e:
-        if "nothing to commit" not in str(e):
-            ctx.db.delete_meta(pending_key, running_key)
-            click.echo(f"error: could not commit the verification in the intent repo: {e}")
-            click.echo("Nothing was recorded in the state store. Restore the contract file and re-run:")
-            click.echo(f"  git -C \"{ctx.paths.intent}\" checkout -- {rel}")
-            sys.exit(1)
-    ctx.db.finish_verification(contract_id, start, steps, by="verify", reason=reason, checkpoint=checkpoint,
-                               clear_keys=[pending_key, running_key])
-    click.echo(f"{contract_id} -> {outcome.status}" + (f" ({outcome.failure_class})" if outcome.failure_class else ""))
-    sys.exit(0 if outcome.status == ContractStatus.verified else 1)
+                ctx.db.delete_meta(pending_key, running_key)
+                click.echo(f"error: could not commit the verification in the intent repo: {e}")
+                click.echo("Nothing was recorded in the state store. Restore the contract file and re-run:")
+                click.echo(f"  git -C \"{ctx.paths.intent}\" checkout -- {rel}")
+                sys.exit(1)
+        ctx.db.finish_verification(contract_id, start, steps, by="verify", reason=reason, checkpoint=checkpoint,
+                                   clear_keys=[pending_key, running_key])
+        click.echo(f"{contract_id} -> {outcome.status}" + (f" ({outcome.failure_class})" if outcome.failure_class else ""))
+        out.update(status=str(outcome.status), failure_class=outcome.failure_class, reasons=list(outcome.reasons))
+        sys.exit(0 if outcome.status == ContractStatus.verified else 1)
 
 
 if __name__ == "__main__":
