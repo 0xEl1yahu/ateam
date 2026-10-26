@@ -45,15 +45,16 @@ WORKER_COMMON = (
 
 COMMON = WORKER_COMMON
 
+# A role without write tools is never asked to keep a handoff file it cannot write (owner, 2026-10-26).
+READ_ONLY_WORKER_COMMON = WORKER_COMMON.replace(f" {HANDOFF}", "")
+
 INVESTIGATION_COMMON = (
     "You are one investigation session inside ATeam, an engineering harness. You read and reason; you never modify "
     "files or state, and shell commands are limited to read-only inspection. Your brief below has labelled sections: "
     "Rules (the target's own instructions; authoritative), Records (approved records are binding; proposed ones are "
     "not and must not be re-proposed), Existing plans and contracts (what is already planned; avoid overlap and name "
-    "dependencies), Request (planning only) or Discovery limits (discovery only), Checks, Tiers, Rubric, and Handoff "
-    f"file. {AUTHORITY} Keep the handoff file named under the Handoff file section up to date; it lives outside the "
-    "repository. It is a YAML mapping with the keys progress, unresolved, files, hypotheses and next. End by "
-    "producing the structured report you were asked for. To read part of a file use the Read tool with offset and "
+    "dependencies), Request (planning only) or Discovery limits (discovery only), Checks, Tiers and Rubric. "
+    f"{AUTHORITY} Your structured report is the only record of this session: end by producing it. To read part of a file use the Read tool with offset and "
     "limit; sed, awk and interpreters are not available to you."
 )
 
@@ -160,7 +161,7 @@ ROLE_SPECS: dict[Role, RoleSpec] = {
             "ROLE: INVESTIGATE. You read and analyse; you never modify files or state. Shell commands are limited "
             "to read-only inspection. Answer the questions in the brief with cited evidence (file paths, line "
             "numbers, commits, test names). Separate what is documented from what you infer, and what the code "
-            "does from what it is meant to do. List what you could not determine as unknowns. " + COMMON
+            "does from what it is meant to do. List what you could not determine as unknowns. " + READ_ONLY_WORKER_COMMON
         ),
         report_schema=INVESTIGATE_SCHEMA,
     ),

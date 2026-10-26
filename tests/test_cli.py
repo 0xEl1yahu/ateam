@@ -616,7 +616,7 @@ def test_plan_brief_contains_rules_records_and_plan_index(monkeypatch, cli_targe
     index = _section(brief, "Existing plans and contracts")
     assert "P-0001" in index and "C-0001" in index
     assert "add a health function" in _section(brief, "Request")
-    assert str(p.scratch_root / "P-0002" / "handoff.yaml") in _section(brief, "Handoff file")
+    assert "handoff.yaml" not in brief and "## Handoff file" not in brief   # read-only sessions keep no handoff (owner, 2026-10-26)
     assert "files_read" in seen["prompt"] and "Read the Rules section first" in seen["prompt"]
 
 
@@ -628,7 +628,7 @@ def test_init_brief_has_discovery_limits_and_rules(monkeypatch, cli_target):
     brief = seen["brief_text"]
     assert "Routes never read env." in _section(brief, "Rules")
     assert "at most 5 candidates" in _section(brief, "Discovery limits")
-    assert str(TargetPaths.from_root(cli_target).scratch_root / "init" / "handoff.yaml") in brief
+    assert "handoff.yaml" not in brief
     assert seen["prompt"].startswith("Discover this repository's existing engineering intent. Read the Rules section")
 
 

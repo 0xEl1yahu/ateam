@@ -35,14 +35,16 @@ def render_record(r: Record) -> str:
     return "\n".join(lines)
 
 
-def _task(contract: Contract, scratch_dir: Path | None) -> str:
+def _task(contract: Contract, scratch_dir: Path | None, role: Role | None = None) -> str:
     lines = [
         f"Contract {contract.id} ({contract.plan}): {contract.title}",
         "Paths you may change: " + ", ".join(contract.paths),
         "Incidental paths also allowed: " + (", ".join(contract.incidental) or "none"),
         "Depends on: " + (", ".join(contract.depends_on) or "nothing"),
     ]
-    if scratch_dir is not None:
+    if scratch_dir is not None and role is Role.investigate:   # read-only: no handoff file to keep (owner, 2026-10-26)
+        lines.append(f"Scratch directory: {scratch_dir}")
+    elif scratch_dir is not None:
         lines.append(f"Handoff file: {scratch_dir / 'handoff.yaml'}  (your scratch directory: {scratch_dir})")
     lines += [
         "",
@@ -87,7 +89,7 @@ def assemble_brief(
     notes = None
     if role != Role.test and checkpoint is not None and checkpoint.notes:
         notes = yaml.safe_dump(checkpoint.notes, sort_keys=False).strip()
-    return Brief(binding=binding, task=_task(contract, scratch_dir), prior_work=_prior(checkpoint), notes=notes)
+    return Brief(binding=binding, task=_task(contract, scratch_dir, role), prior_work=_prior(checkpoint), notes=notes)
 
 
 def render_brief(b: Brief) -> str:
@@ -228,7 +230,6 @@ def assemble_investigation_brief(
         ("Checks", "\n".join(f"{c.name}: {c.cmd}" for c in config.checks) or "none configured"),
         ("Tiers", "light, standard, careful; investigate may also be none."),
         ("Rubric", _demote_headings(rubric_text().strip())),
-        ("Handoff file", str(scratch_dir / "handoff.yaml")),
     ]
     return "\n\n".join(f"## {h}\n{body}" for h, body in sections) + "\n"
 
@@ -252,6 +253,5 @@ def assemble_review_brief(
         ("Draft plan", _demote_headings(draft.strip())),
         ("Checks", "\n".join(f"{c.name}: {c.cmd}" for c in config.checks) or "none configured"),
         ("Rubric", _demote_headings(rubric_text().strip())),
-        ("Handoff file", str(scratch_dir / "handoff.yaml")),
     ]
     return "\n\n".join(f"## {h}\n{body}" for h, body in sections) + "\n"

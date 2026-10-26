@@ -10,9 +10,13 @@ def test_role_tools():
 
 
 def test_authority_sentence_and_handoff_instruction():
-    for spec in ROLE_SPECS.values():
-        assert AUTHORITY in spec.system_prompt
-        assert "handoff" in spec.system_prompt and "unresolved" in spec.system_prompt and ".ateam-scratch" not in spec.system_prompt
+    # owner, 2026-10-26: only roles that can write keep the handoff instruction
+    for role, spec in ROLE_SPECS.items():
+        assert AUTHORITY in spec.system_prompt and ".ateam-scratch" not in spec.system_prompt
+        if role is Role.investigate:
+            assert "handoff" not in spec.system_prompt.lower()
+        else:
+            assert "handoff" in spec.system_prompt and "unresolved" in spec.system_prompt
 
 
 def test_report_schemas_are_strict():
@@ -27,15 +31,16 @@ def test_investigation_common_has_no_worker_promises():
     from ateam.roles import INVESTIGATION_COMMON
     for phrase in ("frozen contract", "Task (", "Binding ("):
         assert phrase not in INVESTIGATION_COMMON
-    assert "Handoff file" in INVESTIGATION_COMMON
+    assert "handoff" not in INVESTIGATION_COMMON.lower()   # read-only sessions cannot write one (owner, 2026-10-26)
     assert AUTHORITY in INVESTIGATION_COMMON
 
 
 def test_worker_specs_unchanged():
     import ateam.roles as roles
     assert roles.COMMON is roles.WORKER_COMMON
-    for role in Role:
+    for role in (Role.build, Role.test):
         assert roles.WORKER_COMMON in ROLE_SPECS[role].system_prompt
+    assert roles.READ_ONLY_WORKER_COMMON in ROLE_SPECS[Role.investigate].system_prompt   # no handoff for a read-only role
     for spec in (roles.DISCOVERY_SPEC, roles.PLANNER_SPEC):
         assert roles.INVESTIGATION_COMMON in spec.system_prompt
         assert roles.WORKER_COMMON not in spec.system_prompt

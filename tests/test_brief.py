@@ -44,7 +44,7 @@ from ateam.config import NamedCheck, TargetConfig
 from ateam.contracts.model import Contract
 from ateam.plans.model import Plan, PlanStatus
 
-_HEADINGS_PLANNING = ["Rules", "Records", "Existing plans and contracts", "Request", "Checks", "Tiers", "Rubric", "Handoff file"]
+_HEADINGS_PLANNING = ["Rules", "Records", "Existing plans and contracts", "Request", "Checks", "Tiers", "Rubric"]
 
 
 def _inv(root, tmp_path, **kw):
@@ -106,9 +106,9 @@ def test_discovery_kind_has_limits_not_request(target_repo, tmp_path):
     assert _headings(_inv(target_repo, tmp_path))[3] == "Request" and "add a thing" in _inv(target_repo, tmp_path)
 
 
-def test_handoff_line_present(target_repo, tmp_path):
-    text = _inv(target_repo, tmp_path)
-    assert text.rstrip().endswith(f"## Handoff file\n{tmp_path / 'scratch' / 'handoff.yaml'}")
+def test_investigation_and_review_briefs_have_no_handoff_section(target_repo, tmp_path):
+    for text in (_inv(target_repo, tmp_path), _review(target_repo, tmp_path)):
+        assert "Handoff file" not in text and "handoff.yaml" not in text
 
 
 def test_brief_docs_outside_target_are_not_read(target_repo, tmp_path):
@@ -230,9 +230,8 @@ def _review(root, tmp_path, **kw):
 
 def test_review_brief_headings(target_repo, tmp_path):
     text = _review(target_repo, tmp_path)
-    assert _headings(text) == ["Rules", "Records", "Existing plans and contracts", "Request", "Draft plan", "Checks", "Rubric", "Handoff file"]
+    assert _headings(text) == ["Rules", "Records", "Existing plans and contracts", "Request", "Draft plan", "Checks", "Rubric"]
     assert "### Draft\ntitle: Health\n#### contracts" in text                     # the draft's own headings are demoted two levels
-    assert str(tmp_path / "scratch" / "handoff.yaml") in text
 
 
 def test_review_brief_excludes_replaced_plan(target_repo, tmp_path):
@@ -263,3 +262,13 @@ def test_plan_index_lists_interfaces(target_repo, tmp_path, sample_contract):
     plan = _plan_with_unknowns().model_copy(update={"contracts": [c.id]})
     text = _inv(target_repo, tmp_path, plans={plan.id: plan}, contracts={c.id: c})
     assert "    produces: integrate(plan_id: str) -> MergeProposal\n    consumes: load_plan(id: str) -> Plan" in text
+
+
+def test_build_and_test_briefs_keep_the_handoff_file_and_investigate_does_not(sample_contract, tmp_path):
+    from ateam.brief import assemble_brief
+    from ateam.roles import Role
+    scratch = tmp_path / "scratch"
+    for role in (Role.build, Role.test):
+        assert f"Handoff file: {scratch / 'handoff.yaml'}" in assemble_brief(sample_contract, [], None, role, scratch_dir=scratch).task
+    inv = assemble_brief(sample_contract, [], None, Role.investigate, scratch_dir=scratch).task
+    assert "handoff" not in inv.lower() and f"Scratch directory: {scratch}" in inv
