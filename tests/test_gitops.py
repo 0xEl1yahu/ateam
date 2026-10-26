@@ -63,3 +63,81 @@ def test_is_clean_prefix_does_not_match_sibling_names(target_repo):
     assert g.is_clean(["docs"]) and g.is_clean(["docs/"])
     (target_repo / "docs").mkdir(); (target_repo / "docs/new.md").write_text("x\n")
     assert not g.is_clean(["docs"])
+
+
+# ---- primitives for integrate and merge
+
+def _commit(g, rel, text, msg):
+    (g.root / rel).parent.mkdir(parents=True, exist_ok=True)
+    (g.root / rel).write_text(text); g.run("add", "-A"); g.run("commit", "-q", "-m", msg)
+    return g.head()
+
+
+def test_rev_parse_branch_exists_create_branch(target_repo):
+    g = GitRepo(target_repo)
+    head = g.head()
+    assert g.rev_parse("main") == head and len(head) == 40
+    with pytest.raises(GitError):
+        g.rev_parse("nope")
+    assert not g.branch_exists("ateam/P-0001")
+    g.create_branch("ateam/P-0001", head)
+    assert g.branch_exists("ateam/P-0001") and g.current_branch() == "main" and g.head() == head
+
+
+def test_is_ancestor(target_repo):
+    g = GitRepo(target_repo)
+    first = g.head()
+    second = _commit(g, "a.txt", "a\n", "a")
+    assert g.is_ancestor(first, second) and g.is_ancestor(second, second) and not g.is_ancestor(second, first)
+    with pytest.raises(GitError):
+        g.is_ancestor("0" * 40, second)
+
+
+def test_merge_no_ff_makes_a_merge_commit(target_repo, tmp_path):
+    g = GitRepo(target_repo)
+    base = g.head()
+    g.create_branch("side", base)
+    wt = tmp_path / "side"; g.run("worktree", "add", "-q", str(wt), "side")
+    side = _commit(GitRepo(wt), "b.txt", "b\n", "b")
+    new = g.merge_no_ff(side, "ateam: merge side")
+    assert new == g.head() and g.run("rev-list", "--parents", "-n", "1", "HEAD").split()[1:] == [base, side]
+    assert g.run("log", "-1", "--format=%s").strip() == "ateam: merge side"
+
+
+def test_merge_conflict_aborts_and_names_paths(target_repo, tmp_path):
+    from ateam.gitops import MergeConflict
+    g = GitRepo(target_repo)
+    base = g.head()
+    g.create_branch("side", base)
+    wt = tmp_path / "side"; g.run("worktree", "add", "-q", str(wt), "side")
+    side = _commit(GitRepo(wt), "src/app.py", "side\n", "side")
+    mine = _commit(g, "src/app.py", "mine\n", "mine")
+    with pytest.raises(MergeConflict) as e:
+        g.merge_no_ff(side, "ateam: merge side")
+    assert e.value.paths == ["src/app.py"]
+    assert g.head() == mine and g.status_porcelain() == [] and not g.merge_in_progress()
+
+
+def test_merge_ff_only(target_repo, tmp_path):
+    g = GitRepo(target_repo)
+    base = g.head()
+    g.create_branch("ahead", base)
+    wt = tmp_path / "ahead"; g.run("worktree", "add", "-q", str(wt), "ahead")
+    ahead = _commit(GitRepo(wt), "c.txt", "c\n", "c")
+    assert g.merge_ff_only(ahead) == ahead == g.head()
+    _commit(GitRepo(wt), "d.txt", "d\n", "d")
+    mine = _commit(g, "e.txt", "e\n", "e")
+    with pytest.raises(GitError):
+        g.merge_ff_only(GitRepo(wt).head())
+    assert g.head() == mine
+
+
+def test_worktree_add_existing_and_show_file(target_repo, tmp_path):
+    g = GitRepo(target_repo)
+    g.create_branch("ateam/P-0001", g.head())
+    wt = tmp_path / "integ"
+    g.worktree_add_existing(wt, "ateam/P-0001")
+    assert GitRepo(wt).current_branch() == "ateam/P-0001"
+    assert g.show_file("HEAD", "src/app.py").startswith("def greet")
+    with pytest.raises(GitError):
+        g.show_file("HEAD", "missing.txt")

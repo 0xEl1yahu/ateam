@@ -10,6 +10,14 @@ class GitError(Exception):
     pass
 
 
+class MergeConflict(GitError):
+    """A merge stopped on conflicts; it has been aborted, so the checkout is as it was."""
+
+    def __init__(self, paths: list[str], message: str) -> None:
+        super().__init__(message)
+        self.paths = paths
+
+
 class GitRepo:
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
@@ -77,6 +85,60 @@ class GitRepo:
     def worktree_remove(self, path: Path, force: bool = False) -> None:
         args = ["worktree", "remove", *(["--force"] if force else []), str(path)]
         self.run(*args)
+
+    def rev_parse(self, ref: str) -> str:
+        """The full sha of the commit `ref` names; GitError when it names none."""
+        return self.run("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").strip()
+
+    def branch_exists(self, name: str) -> bool:
+        r = subprocess.run(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{name}"], cwd=self.root)
+        return r.returncode == 0
+
+    def create_branch(self, name: str, start: str) -> None:
+        """Make a branch at `start` without checking it out."""
+        self.run("branch", name, start)
+
+    def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        """True when `ancestor` is reachable from `descendant` (a commit is its own ancestor)."""
+        r = subprocess.run(["git", "merge-base", "--is-ancestor", ancestor, descendant], cwd=self.root, text=True, capture_output=True)
+        if r.returncode in (0, 1):
+            return r.returncode == 0
+        raise GitError(f"git merge-base --is-ancestor {ancestor} {descendant} failed in {self.root}: {r.stderr.strip()}")
+
+    def merge_in_progress(self) -> bool:
+        r = subprocess.run(["git", "rev-parse", "--verify", "--quiet", "MERGE_HEAD"], cwd=self.root, capture_output=True)
+        return r.returncode == 0
+
+    def merge_no_ff(self, rev: str, message: str) -> str:
+        """Merge `rev` with a merge commit and return the new HEAD. Any failure that leaves a merge in progress is
+        aborted first; a conflict raises MergeConflict naming the conflicting paths."""
+        try:
+            self.run("merge", "--no-ff", "--no-edit", "-m", message, rev)
+        except GitError as e:
+            if not self.merge_in_progress():
+                raise
+            paths = [p for p in self.run("diff", "--name-only", "--diff-filter=U").splitlines() if p]
+            self.run("merge", "--abort")
+            if paths:
+                raise MergeConflict(paths, f"merging {rev} conflicts in {', '.join(paths)}") from e
+            raise
+        return self.head()
+
+    def merge_ff_only(self, rev: str) -> str:
+        """Fast-forward to `rev` and return the new HEAD; GitError (nothing changed) when that is not a fast-forward."""
+        self.run("merge", "--ff-only", "-q", rev)
+        return self.head()
+
+    def worktree_add_existing(self, path: Path, branch: str) -> None:
+        """Check out an existing branch in a new linked worktree."""
+        self.run("worktree", "add", "-q", str(path), branch)
+
+    def show_file(self, rev: str, relpath: str) -> str:
+        """The content of `relpath` as committed at `rev`."""
+        return self.run("show", f"{rev}:{relpath}")
+
+    def diff_stat(self, a: str, b: str) -> str:
+        return self.run("diff", "--stat", a, b)
 
     def is_ignored(self, path: str) -> bool:
         """True when git would ignore `path` (tracked .gitignore rules, so the same on every clone)."""
