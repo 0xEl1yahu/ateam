@@ -863,6 +863,66 @@ def integrate(plan_id: str, target: Path) -> None:
     sys.exit(3 if res.outcome == "conflict" else 1)
 
 
+def _interrupt_handler(stop, say):
+    """The first Ctrl-C asks the scheduler to stop after the running steps; a second one exits at once."""
+
+    def handle(signum, frame) -> None:
+        if stop.is_set():
+            raise SystemExit(130)
+        stop.set()
+        say("stopping after the running steps; Ctrl-C again to exit now")
+
+    return handle
+
+
+@main.command("run")
+@click.argument("plan_id")
+@click.option("--dry-run", is_flag=True, help="Print the schedule and the worst-case cost; launch and write nothing.")
+@TARGET_OPTION
+def run_cmd(plan_id: str, dry_run: bool, target: Path) -> None:
+    """Execute an approved plan until the merge gate or a pause. Never merges into the target branch.
+
+    Exit 0 merge_proposed (or a dry run), 1 paused or stalled, 4 refused or a re-run is needed, 130 interrupted."""
+    import signal
+    import threading
+
+    from ateam import scheduler
+
+    _context(target)   # exit 2 when the target has no intent repo
+    stop = threading.Event()
+    box: dict = {}
+
+    def work() -> None:
+        try:
+            box["summary"] = scheduler.run_plan(lambda: Context(target), plan_id, click.echo, stop,
+                                                launch=scheduler.default_launch, dry_run=dry_run)
+        except BaseException as e:  # noqa: BLE001  (reported below, in the main thread)
+            box["error"] = e
+
+    in_main = threading.current_thread() is threading.main_thread()
+    previous = signal.signal(signal.SIGINT, _interrupt_handler(stop, click.echo)) if in_main else None
+    worker = threading.Thread(target=work, name="ateam-run", daemon=True)
+    worker.start()
+    try:
+        while worker.is_alive():
+            worker.join(0.2)
+    finally:
+        if in_main:
+            signal.signal(signal.SIGINT, previous)
+    if "error" in box:
+        if isinstance(box["error"], scheduler.RunRefused):
+            _fail(str(box["error"]), code=4)
+        raise box["error"]
+    summary = box["summary"]
+    for m in summary.messages:
+        if summary.outcome not in ("merge_proposed", "dry_run"):
+            click.echo(m)
+    if summary.outcome == "merge_proposed":
+        click.echo(f"{plan_id} -> merge_proposed. Review {summary.proposal}, then: ateam merge {plan_id}   "
+                   f"(or: ateam reject {plan_id} \"reason\")")
+    sys.exit({"merge_proposed": 0, "dry_run": 0, "paused": 1, "stalled": 1, "rerun": 4, "interrupted": 130}[summary.outcome])
+
+
 @main.command("merge")
 @click.argument("plan_id")
 @TARGET_OPTION
