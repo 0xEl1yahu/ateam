@@ -935,7 +935,7 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
     from ateam.contracts.store import load_contracts
     from ateam.records.store import load_records
     from ateam.roles import Role
-    from ateam.runner.run import default_base, run_contract_attempt
+    from ateam.runner.run import SetupError, default_base, ensure_setup, run_contract_attempt
     from ateam.tiers import load_tiers
 
     from ateam.gitops import GitError
@@ -964,6 +964,10 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
     tiers = load_tiers(ctx.config.tiers)
     if tier and tier not in tiers:
         _fail(f"unknown tier {tier!r}; known: {', '.join(tiers)}")
+    try:
+        ensure_setup(worktree, ctx.config, ctx.db, on_command=lambda c: click.echo(f"setup: {c}"))
+    except SetupError as e:
+        _fail(f"setup failed: {e.cmd} (exit {e.returncode})\n{e.output}")
     try:
         res, tree, scope, cp = asyncio.run(run_contract_attempt(
             paths=ctx.paths, config=ctx.config, git_worktree=wt_git, worktree=worktree,

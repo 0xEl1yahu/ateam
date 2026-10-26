@@ -172,3 +172,56 @@ async def test_attempt_fails_as_tamper_when_intent_repo_changes_during_run(monke
     )
     row = db.telemetry_rows()[-1]
     assert row["outcome"] == "tamper" and row["failure_class"] == "tamper"
+
+
+# ---- setup runs once per worktree
+
+def _setup_db(tmp_path):
+    from ateam.state.db import StateDB
+
+    db = StateDB(tmp_path / "setup-state.db")
+    db.init_schema()
+    return db
+
+
+def test_ensure_setup_runs_commands_once_per_worktree(target_repo, ateam_home, tmp_path):
+    from ateam.config import TargetConfig
+    from ateam.runner.run import ensure_setup
+
+    db = _setup_db(tmp_path)
+    cfg = TargetConfig(setup=["touch setup-ran", "echo second"], env={"ATEAM_X": "1"})
+    ran = ensure_setup(target_repo, cfg, db)
+    assert ran == cfg.setup and (target_repo / "setup-ran").exists()
+    assert db.get_meta(f"setup:{target_repo.resolve()}")
+    (target_repo / "setup-ran").unlink()
+    assert ensure_setup(target_repo, cfg, db) == [] and not (target_repo / "setup-ran").exists()
+
+
+def test_ensure_setup_passes_config_env(target_repo, ateam_home, tmp_path):
+    from ateam.config import TargetConfig
+    from ateam.runner.run import ensure_setup
+
+    cfg = TargetConfig(setup=["echo $ATEAM_X > env-out"], env={"ATEAM_X": "seen"})
+    ensure_setup(target_repo, cfg, _setup_db(tmp_path))
+    assert (target_repo / "env-out").read_text().strip() == "seen"
+
+
+def test_ensure_setup_with_no_commands_records_nothing(target_repo, ateam_home, tmp_path):
+    from ateam.config import TargetConfig
+    from ateam.runner.run import ensure_setup
+
+    db = _setup_db(tmp_path)
+    assert ensure_setup(target_repo, TargetConfig(), db) == []
+    assert db.get_meta(f"setup:{target_repo.resolve()}") is None
+
+
+def test_ensure_setup_failure_records_nothing(target_repo, ateam_home, tmp_path):
+    from ateam.config import TargetConfig
+    from ateam.runner.run import SetupError, ensure_setup
+
+    db = _setup_db(tmp_path)
+    cfg = TargetConfig(setup=["echo before", "echo boom >&2; exit 3", "echo never"])
+    with pytest.raises(SetupError) as e:
+        ensure_setup(target_repo, cfg, db)
+    assert e.value.cmd == "echo boom >&2; exit 3" and e.value.returncode == 3 and "boom" in e.value.output
+    assert db.get_meta(f"setup:{target_repo.resolve()}") is None

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -86,6 +89,32 @@ def build_policy(
         worktree=worktree, role=role, allowed_paths=list(contract.paths), protected=list(config.protected_paths),
         bound=bound, scratch_dir=scratch_dir, ateam_home=scratch_dir.parent.parent.parent if scratch_dir else None,
     )
+
+
+class SetupError(Exception):
+    """A config.setup command failed; nothing is recorded, so the next run tries again."""
+
+    def __init__(self, cmd: str, returncode: int, output: str) -> None:
+        super().__init__(f"setup failed: {cmd} (exit {returncode})")
+        self.cmd = cmd
+        self.returncode = returncode
+        self.output = output
+
+
+def ensure_setup(worktree: Path, config: TargetConfig, db: StateDB, on_command=None) -> list[str]:
+    """Run config.setup once per worktree; return the commands run ([] when already done or none configured)."""
+    key = f"setup:{worktree.resolve()}"
+    if not config.setup or db.get_meta(key):
+        return []
+    env = {**os.environ, **config.env}
+    for cmd in config.setup:
+        if on_command:
+            on_command(cmd)
+        proc = subprocess.run(cmd, shell=True, cwd=worktree, env=env, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise SetupError(cmd, proc.returncode, (proc.stdout or "") + (proc.stderr or ""))
+    db.set_meta(key, datetime.now(timezone.utc).isoformat())
+    return list(config.setup)
 
 
 def default_base(git_worktree: GitRepo, target_branch: str) -> str:
