@@ -42,3 +42,10 @@ def test_review_round_trips_and_leaves_content_hash_unchanged():
     q = p.model_copy(update={"review": review})
     assert q.content_hash() == p.content_hash()
     assert Plan.model_validate(q.model_dump(mode="json")).review == review
+
+
+def test_review_notes_default_empty_and_round_trip():
+    from ateam.plans.model import PlanReview
+    assert PlanReview(verdict="unavailable").notes == ""
+    r = PlanReview(verdict="defensible", notes="looked at routes.py")
+    assert PlanReview.model_validate(r.model_dump(mode="json")).notes == "looked at routes.py"

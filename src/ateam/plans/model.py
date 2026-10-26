@@ -50,6 +50,7 @@ class PlanReview(BaseModel):
     verdict: Literal["defensible", "needs_revision", "unavailable"]
     findings: list[ReviewFinding] = Field(default_factory=list)
     revised: bool = False
+    notes: str = ""
     session_id: str | None = None
     cost_usd: float = 0.0
 

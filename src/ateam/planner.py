@@ -218,6 +218,8 @@ def render_review(review: PlanReview) -> list[str]:
         head += " (the planner revised the plan once in response; findings refer to the first draft)"
     lines = [head]
     lines.extend(f"  - {format_finding(f)}" for f in review.findings)
+    if review.notes.strip():
+        lines.append(f"  notes: {review.notes.strip()}")
     return lines
 
 

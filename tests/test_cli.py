@@ -871,14 +871,18 @@ def _review_investigation(monkeypatch, plan_reports, review):
             report, cost = review, 0.02
             if review == "crash":
                 raise RuntimeError("review sdk exploded")
-            if review in ("tamper", "no_report"):
+            if review in ("tamper", "intent_tamper", "no_report"):
                 report = None
             if review == "tamper":
                 tampered = ["planted.txt changed"]
+            if review == "intent_tamper":
+                tampered = ["intent repo changed during the session"]
         else:
             report, cost = reports.pop(0), 0.01
             if report == "crash":
                 raise RuntimeError("revision sdk exploded")
+            if report == "intent_tamper":
+                report, tampered = None, ["intent repo changed during the session"]
         db = kw["db"]
         a = db.start_attempt(kw["name"], "investigate", "light", "haiku", {})
         db.finish_attempt(a, "completed" if report else "failed", None, 1, 1, cost, 1, 0.1, f"{kind}-{n}")
@@ -998,3 +1002,61 @@ def test_covered_plan_is_not_reviewed(monkeypatch, cli_target):
     assert r.exit_code == 0, r.output
     assert [c["kind"] for c in calls] == ["plan"]
     assert _stored_plan(cli_target, "P-0002").status == "plan_covered" and _stored_plan(cli_target, "P-0002").review is None
+
+
+def _intent_subject(cli_target):
+    return GitRepo(TargetPaths.from_root(cli_target).intent).run("log", "-1", "--format=%s").strip()
+
+
+def _untracked_plan_file(cli_target, pid="P-0001"):
+    status = GitRepo(TargetPaths.from_root(cli_target).intent).run("status", "--porcelain", "--untracked-files=all")
+    return any(line.startswith("?? ") and f"plans/{pid}-" in line for line in status.splitlines())
+
+
+def test_review_intent_tamper_writes_plan_but_commits_nothing(monkeypatch, cli_target):
+    before = _intent_subject(cli_target)
+    _review_investigation(monkeypatch, [_canned_plan()], "intent_tamper")
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    intent = TargetPaths.from_root(cli_target).intent
+    assert "warning: the review session changed the intent repo; nothing was committed." in r.output
+    assert f'git -C "{intent}" add plans contracts records && git -C "{intent}" commit -m "ateam: propose plan P-0001"' in r.output
+    assert _intent_subject(cli_target) == before and _untracked_plan_file(cli_target)
+    stored = _stored_plan(cli_target)
+    assert stored.review.verdict == "unavailable" and stored.contracts == ["C-0002"]
+    db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
+    assert db.feature_status("P-0001") == "plan_proposed"
+
+
+def test_revision_intent_tamper_keeps_first_plan_and_commits_nothing(monkeypatch, cli_target):
+    before = _intent_subject(cli_target)
+    review = {"verdict": "needs_revision", "notes": "n", "findings": [
+        {"contract": "C-0002", "severity": "blocking", "finding": "wrong file", "suggestion": "use routes.py"}]}
+    _review_investigation(monkeypatch, [_canned_plan(), "intent_tamper"], review)
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert "warning: the revision session changed the intent repo; nothing was committed." in r.output
+    assert _intent_subject(cli_target) == before and _untracked_plan_file(cli_target)
+    assert _stored_plan(cli_target).review.revised is False
+
+
+def test_planner_intent_tamper_writes_rejected_plan_but_commits_nothing(monkeypatch, cli_target):
+    before = _intent_subject(cli_target)
+    _review_investigation(monkeypatch, ["intent_tamper"], _DEFENSIBLE)
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 1
+    intent = TargetPaths.from_root(cli_target).intent
+    assert "warning: the planner session changed the intent repo; nothing was committed." in r.output
+    assert f'git -C "{intent}" add plans && git -C "{intent}" commit -m "ateam: reject plan P-0001' in r.output
+    assert _intent_subject(cli_target) == before and _untracked_plan_file(cli_target)
+    assert _stored_plan(cli_target).status == "plan_rejected"
+    db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
+    assert db.feature_status("P-0001") == "plan_rejected"
+
+
+def test_review_notes_are_stored_and_printed(monkeypatch, cli_target):
+    _review_investigation(monkeypatch, [_canned_plan()], {"verdict": "defensible", "findings": [], "notes": "paths checked against routes.py"})
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert _stored_plan(cli_target).review.notes == "paths checked against routes.py"
+    assert "paths checked against routes.py" in r.output.split("Review: defensible")[1]

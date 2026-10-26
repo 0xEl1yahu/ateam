@@ -22,6 +22,9 @@ from ateam.state.db import StateDB
 from ateam.tiers import TierSpec
 
 
+INTENT_TAMPER = "intent repo changed during the session"
+
+
 @dataclass
 class InvestigationResult:
     res: WorkerResult
@@ -50,7 +53,7 @@ async def run_investigation(
         tampered = changed(checkout_before, take(target_git))
         intent_after = (intent.head(), intent.is_clean())
         if intent_after != intent_before or not intent_after[1]:
-            tampered.append("intent repo changed during the session")
+            tampered.append(INTENT_TAMPER)
     except Exception:
         db.finish_attempt(attempt_id, "failed", "environment", 0, 0, 0.0, 0, 0.0, None)
         raise

@@ -13,7 +13,7 @@ from ateam.config import TargetConfig, load_config
 from ateam.gitops import GitRepo
 from ateam.paths import TargetPaths, home_dir, lookup_target, normalise_remote, origin_url, record_target, repo_id, repo_id_source
 from ateam.intent import IntentError, commit_intent, require_clean
-from ateam.runner.investigate import run_investigation
+from ateam.runner.investigate import INTENT_TAMPER, run_investigation
 from ateam.state.db import StateDB
 
 TARGET_OPTION = click.option(
@@ -272,15 +272,25 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
     pid = f"P-{max(disk_next, db_next):04d}"
     ctx.db.transition("feature", pid, "requested", by="owner", reason=request[:200])
     ctx.db.transition("feature", pid, "investigating", by="ateam")
-    def _rejected(reason: str) -> None:
-        """Leave a visible, terminal trace: a rejected plan file (committed) and the feature state."""
+    def _uncommitted(session: str, what: str, subpaths: str, message: str) -> None:
+        """A session tampered: the files stay written for the owner to inspect, but no ateam: commit may carry a planted file."""
+        intent = ctx.paths.intent
+        click.echo(f"warning: the {session} session changed the {what}; nothing was committed. Inspect: git -C \"{intent}\" status, "
+                   f"then commit the plan by hand: git -C \"{intent}\" add {subpaths} && git -C \"{intent}\" commit -m \"{message}\"")
+
+    def _rejected(reason: str, tampered: list[str] | None = None) -> None:
+        """Leave a visible, terminal trace: a rejected plan file (committed unless the session tampered) and the feature state."""
         rejected = Plan(id=pid, title=request[:80], request=request, status=PlanStatus.plan_rejected,
                         replaces=replaces, history=[PlanHistoryEntry(at=datetime.now(UTC), by="ateam", to=PlanStatus.plan_rejected, why=reason)])
         save_plan(ctx.paths.plans, rejected)
-        try:
-            commit_intent(ctx.paths, f"ateam: reject plan {pid} ({reason})", ["plans"])
-        except (IntentError, GitError):
-            pass
+        message = f"ateam: reject plan {pid} ({reason})"
+        if tampered:
+            _uncommitted("planner", "intent repo" if INTENT_TAMPER in tampered else "checkout", "plans", message)
+        else:
+            try:
+                commit_intent(ctx.paths, message, ["plans"])
+            except (IntentError, GitError):
+                pass
         current = ctx.db.feature_status(pid)
         if current == "investigating":
             ctx.db.transition("feature", pid, "plan_proposed", by="ateam")
@@ -315,7 +325,7 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
         _fail(f"planning failed before any report: {e}. Re-run: ateam plan \"{request}\"")
 
     if result.tampered:
-        _rejected("planner changed the checkout or intent repo")
+        _rejected("planner changed the checkout or intent repo", tampered=result.tampered)
         _fail("planning changed the checkout or the intent repo; report discarded: " + "; ".join(result.tampered))
     if result.res.report is None:
         _rejected("planner produced no report")
@@ -331,6 +341,7 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
         click.echo(f"Re-run: ateam plan \"{request}\"")
         sys.exit(1)
     sessions = [result.res]
+    intent_tampered_by: str | None = None   # the first later session that changed the intent repo
     if not pr.covered and not no_review:
         # The review is advisory: whatever happens to its session, the validated plan is kept.
         exclude = frozenset({replaces}) if replaces else frozenset()
@@ -357,6 +368,8 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
             report = review_res.report
             if reviewed.tampered:
                 reason = "the session changed the checkout or intent repo: " + "; ".join(reviewed.tampered)
+                if INTENT_TAMPER in reviewed.tampered:
+                    intent_tampered_by = "review"
             elif report is None:
                 reason = f"no report, subtype {review_res.subtype}"
             elif not isinstance(report, dict) or report.get("verdict") not in ("defensible", "needs_revision"):
@@ -364,7 +377,7 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
             else:
                 try:
                     review = PlanReview.model_validate({
-                        "verdict": report["verdict"], "findings": report.get("findings") or [],
+                        "verdict": report["verdict"], "findings": report.get("findings") or [], "notes": report.get("notes") or "",
                         "session_id": review_res.session_id, "cost_usd": review_res.cost_usd,
                     })
                 except ValidationError:
@@ -393,6 +406,8 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
                 sessions.append(revised.res)
                 if revised.tampered:
                     revision_note = "the session changed the checkout or intent repo: " + "; ".join(revised.tampered)
+                    if INTENT_TAMPER in revised.tampered:
+                        intent_tampered_by = intent_tampered_by or "revision"
                 elif revised.res.report is None:
                     revision_note = f"no report, subtype {revised.res.subtype}"
                 else:
@@ -438,7 +453,10 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
     for r in pr.proposed.proposed:
         save_record(ctx.paths.records, r)
     save_plan(ctx.paths.plans, pr.plan.model_copy(update={"replaces": replaces}))
-    commit_intent(ctx.paths, f"ateam: propose plan {pid}", ["plans", "contracts", "records"])
+    if intent_tampered_by:
+        _uncommitted(intent_tampered_by, "intent repo", "plans contracts records", f"ateam: propose plan {pid}")
+    else:
+        commit_intent(ctx.paths, f"ateam: propose plan {pid}", ["plans", "contracts", "records"])
     ctx.db.transition("feature", pid, "plan_proposed", by="ateam")
     click.echo(render_plan_review(pr, tiers))
     _session_lines()
