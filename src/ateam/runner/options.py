@@ -12,12 +12,19 @@ from ateam.runner.policy import Policy
 from ateam.tiers import TierSpec
 
 
+# Keys the scrub blanks. The SDK starts the CLI with {**os.environ, **options.env}
+# (claude_agent_sdk/_internal/transport/subprocess_cli.py), so leaving a key out of options.env inherits it: every
+# scrubbed key is set to "" explicitly. CDPATH would redirect a bare `cd name`; BASH_ENV (non-interactive bash) and ENV
+# (sh mode) name startup files that could redefine cd or rm.
+_BLANKED = ("CDPATH", "BASH_ENV", "ENV")
+
+
 def clean_env() -> dict[str, str]:
-    """The parent environment minus every CLAUDE* variable, CDPATH, BASH_ENV and ENV, with auto-memory disabled and
-    the Bash tool on /bin/bash (the policy models bash grammar; the login shell may be zsh)."""
-    # CDPATH would redirect a bare `cd name`; BASH_ENV (non-interactive bash) and ENV (sh mode) name startup files
-    # that could redefine cd or rm
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE") and k not in ("CDPATH", "BASH_ENV", "ENV")}
+    """The parent environment with CDPATH, BASH_ENV and ENV set to "", plus the variables ATeam sets on purpose:
+    auto-memory disabled and the Bash tool on /bin/bash (the policy models bash grammar; the login shell may be zsh).
+    CLAUDE* variables are inherited: the worker needs the parent's login state, and the SDK drops CLAUDECODE itself."""
+    env = dict(os.environ)
+    env.update({k: "" for k in _BLANKED})
     env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
     env["SHELL"] = env["CLAUDE_CODE_SHELL"] = "/bin/bash"   # CLAUDE_CODE_SHELL overrides Claude Code's shell detection
     return env

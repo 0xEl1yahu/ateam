@@ -3,13 +3,15 @@ from ateam.runner.options import clean_env, worker_options
 from ateam.tiers import TierSpec
 
 
-def test_clean_env_strips_claude(monkeypatch):
-    monkeypatch.setenv("CLAUDECODE", "1")
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "x")
+# The SDK starts the CLI with {**os.environ, **options.env} (claude_agent_sdk/_internal/transport/subprocess_cli.py):
+# a key left out of options.env is inherited, so a scrubbed key is set to "" explicitly.
+
+def test_clean_env_keeps_login_state_and_sets_its_own(monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/tmp/elsewhere")
     monkeypatch.setenv("PATH", "/usr/bin")
     e = clean_env()
-    assert "CLAUDECODE" not in e and "CLAUDE_CODE_SESSION_ID" not in e
-    assert e["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1" and e["PATH"] == "/usr/bin"
+    assert e["CLAUDE_CONFIG_DIR"] == "/tmp/elsewhere" and e["PATH"] == "/usr/bin"
+    assert e["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1" and e["SHELL"] == e["CLAUDE_CODE_SHELL"] == "/bin/bash"
 
 
 def test_clean_env_strips_cdpath_and_startup_files(monkeypatch):
@@ -18,7 +20,14 @@ def test_clean_env_strips_cdpath_and_startup_files(monkeypatch):
     monkeypatch.setenv("BASH_ENV", "/tmp/funcs.sh")
     monkeypatch.setenv("ENV", "/tmp/funcs.sh")
     e = clean_env()
-    assert "CDPATH" not in e and "BASH_ENV" not in e and "ENV" not in e
+    assert e["CDPATH"] == "" and e["BASH_ENV"] == "" and e["ENV"] == ""
+
+
+def test_clean_env_blanks_startup_files_even_when_not_inherited(monkeypatch):
+    for k in ("CDPATH", "BASH_ENV", "ENV"):
+        monkeypatch.delenv(k, raising=False)
+    e = clean_env()
+    assert e["CDPATH"] == "" and e["BASH_ENV"] == "" and e["ENV"] == ""
 
 
 def test_worker_options_clean_room(policy_build, tmp_path):

@@ -101,16 +101,34 @@ class SetupError(Exception):
         self.output = output
 
 
+SETUP_TIMEOUT_S = 600
+
+
+def setup_key(worktree: Path) -> str:
+    """The state-store key that marks setup done for this worktree: its resolved path plus the identity (inode and
+    change time) of its `.git` entry, so a worktree removed and recreated at the same path runs setup again."""
+    resolved = worktree.resolve()
+    marker = resolved / ".git"
+    st = marker.stat() if marker.exists() else resolved.stat()
+    return f"setup:{resolved}:{st.st_ino}:{st.st_ctime_ns}"
+
+
 def ensure_setup(worktree: Path, config: TargetConfig, db: StateDB, on_command=None) -> list[str]:
-    """Run config.setup once per worktree; return the commands run ([] when already done or none configured)."""
-    key = f"setup:{worktree.resolve()}"
+    """Run config.setup once per worktree; return the commands run ([] when already done or none configured).
+    Each command has SETUP_TIMEOUT_S seconds; a timeout is a SetupError."""
+    key = setup_key(worktree)
     if not config.setup or db.get_meta(key):
         return []
     env = {**os.environ, **config.env}
     for cmd in config.setup:
         if on_command:
             on_command(cmd)
-        proc = subprocess.run(cmd, shell=True, cwd=worktree, env=env, capture_output=True, text=True)
+        try:
+            proc = subprocess.run(cmd, shell=True, cwd=worktree, env=env, capture_output=True, text=True, timeout=SETUP_TIMEOUT_S)
+        except subprocess.TimeoutExpired as e:
+            out = e.stdout or ""
+            out = out.decode(errors="replace") if isinstance(out, bytes) else out
+            raise SetupError(cmd, -1, f"{out}timed out after {SETUP_TIMEOUT_S} s") from None
         if proc.returncode != 0:
             raise SetupError(cmd, proc.returncode, (proc.stdout or "") + (proc.stderr or ""))
     db.set_meta(key, datetime.now(timezone.utc).isoformat())

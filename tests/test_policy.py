@@ -1541,3 +1541,21 @@ def test_macos_wrapper_lookalikes_allowed(policy_build, cmd):
     ok, reason = policy_build.command_allowed(cmd)
     assert ok, (cmd, reason)
 
+
+
+# ---- final review: a decoded spelling of ATeam's home meets the home rule (nothing here is run in a shell)
+
+def test_decoded_home_path_meets_the_home_rule(tmp_path):
+    from ateam.roles import Role
+    from ateam.runner.policy import Policy
+
+    home = tmp_path / "ateam-home"
+    scratch = home / "scratch" / "C-1"
+    scratch.mkdir(parents=True)
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    p = Policy(worktree=wt, role=Role.build, allowed_paths=["**"], protected=[], scratch_dir=scratch, ateam_home=home)
+    encoded = str(home).replace("ateam-home", "\\x61team-home")
+    ok, reason = p.command_allowed(f"cat $'{encoded}/intent/config.yaml'")
+    assert not ok and "ATeam's home" in reason
+    assert p.command_allowed(f"cat $'{home}/scratch/C-1/handoff.yaml'")[0]

@@ -1206,7 +1206,8 @@ class Policy:
             if any(sp in seg for sp in home_spellings) and not mentions_scratch:
                 return False, "ATeam's home (intent repo, state store, logs) is off limits to workers; only your scratch directory is writable"
             if home_spellings:
-                for tok in seg.replace('"', "").replace("'", "").split():
+                decoded = [e for w in words for e in _brace_expand(w)]   # a $'...' or quoted spelling of a home path
+                for tok in seg.replace('"', "").replace("'", "").split() + decoded:
                     for piece in self._token_paths(tok):
                         if _WILDCARD.search(piece):
                             if self._wildcard_reaches_home(piece):
