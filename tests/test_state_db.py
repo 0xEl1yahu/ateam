@@ -252,3 +252,56 @@ def test_reject_unstarted_approved_plan_edge_and_retire(tmp_path):
     assert db.feature_status("P-0001") == "plan_rejected"
     assert db.contract_status("C-0002") == "superseded" == db.contract_status("C-0003")
     assert db.transitions("feature", "P-0001")[-1]["reason"] == "start fresh"
+
+
+# ---- scheduler support (plan 2026-10-26-scheduler, task 1)
+
+@pytest.mark.parametrize("pid", [1, None])
+def test_run_lock_is_process_exclusive(pid, tmp_path):
+    import os
+    db = fresh(tmp_path)
+    with db.conn:
+        db.conn.execute("INSERT INTO run_lock (singleton, plan_id, acquired_at, pid) VALUES (1, 'P-0001', 'then', ?)", (pid,))
+    assert not db.acquire_run_lock("P-0001")          # same plan, another (or unknown) process: never stolen
+    assert db.run_lock_info() == {"plan_id": "P-0001", "pid": pid, "acquired_at": "then"}
+    db.release_run_lock("P-0001")
+    assert db.run_lock_info() is None
+    assert db.acquire_run_lock("P-0001") and db.run_lock_info()["pid"] == os.getpid()
+
+
+def test_open_attempts_are_closed_as_interrupted(tmp_path):
+    db = fresh(tmp_path)
+    a = db.start_attempt("C-0002", "build", "light", "haiku", {})
+    b = db.start_attempt("C-0003", "test", "light", "haiku", {})
+    db.finish_attempt(b, "completed", None, 1, 1, 0.1, 1, 1.0, "s")
+    c = db.start_attempt("C-0009", "build", "light", "haiku", {})
+    assert [r["attempt_id"] for r in db.open_attempts(["C-0002", "C-0003"])] == [a]
+    db.interrupt_attempt(a); db.interrupt_attempt(b)
+    rows = {r["attempt_id"]: r for r in db.telemetry_rows()}
+    assert rows[a]["outcome"] == "interrupted" and rows[a]["failure_class"] is None and rows[a]["finished_at"]
+    assert rows[b]["outcome"] == "completed" and rows[c]["finished_at"] is None
+
+
+def test_attempts_for_filters_by_role(tmp_path):
+    db = fresh(tmp_path)
+    for role in ("build", "test", "build"):
+        db.start_attempt("C-0002", role, "light", "haiku", {})
+    db.start_attempt("C-0003", "build", "light", "haiku", {})
+    assert len(db.attempts_for("C-0002")) == 3
+    assert [r["role"] for r in db.attempts_for("C-0002", role="build")] == ["build", "build"]
+
+
+def test_latest_checkpoint_by_role(tmp_path):
+    db = fresh(tmp_path)
+    b = db.start_attempt("C-0002", "build", "light", "haiku", {})
+    t = db.start_attempt("C-0002", "test", "light", "haiku", {})
+    db.set_checkpoint("C-0002", b, {"notes": "build"})
+    db.set_checkpoint("C-0002", t, {"notes": None})
+    db.set_checkpoint("C-0002", None, {"verify": True})
+    assert db.latest_checkpoint("C-0002") == {"verify": True}
+    assert db.latest_checkpoint("C-0002", role="build") == {"notes": "build"}
+    assert db.latest_checkpoint("C-0002", role="test") == {"notes": None}
+
+
+def test_busy_timeout_is_set(tmp_path):
+    assert fresh(tmp_path).conn.execute("PRAGMA busy_timeout").fetchone()[0] >= 10000
