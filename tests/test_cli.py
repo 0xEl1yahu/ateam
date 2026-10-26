@@ -2098,3 +2098,10 @@ def test_review_no_report_retains_terminal_and_transport_details(monkeypatch, cl
     notes = _stored_plan(cli_target).review.notes
     assert all(part in notes for part in ("error_max_turns", "max_turns", "TransportError: disconnected"))
     assert notes in result.output
+
+
+def test_brief_uses_role_scratch(cli_target):
+    r = run("brief", "C-0001", "--role", "test", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert "C-0001-test" in r.output
+    assert "C-0001-test" not in run("brief", "C-0001", "--role", "build", "--target", str(cli_target)).output

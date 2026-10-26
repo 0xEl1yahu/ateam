@@ -1338,9 +1338,10 @@ def brief(contract_id: str, role: str, target: Path) -> None:
         _fail(f"unknown contract {contract_id}")
     recs = load_records(ctx.paths.records)
     selected = [recs[ref.id] for ref in cs[contract_id].records if ref.id in recs]
-    prev_raw = ctx.db.latest_checkpoint(contract_id)
+    prev_raw = ctx.db.latest_checkpoint(contract_id, role="build") if Role(role) is Role.build else ctx.db.latest_checkpoint(contract_id)
     prev = Checkpoint.from_dict(prev_raw) if prev_raw else None
-    click.echo(render_brief(assemble_brief(cs[contract_id], selected, prev, Role(role), scratch_dir=ctx.paths.scratch_root / contract_id)))
+    scratch = ctx.paths.scratch_root / (f"{contract_id}-test" if Role(role) is Role.test else contract_id)
+    click.echo(render_brief(assemble_brief(cs[contract_id], selected, prev, Role(role), scratch_dir=scratch)))
 
 
 def _require_isolated_worktree(ctx: Context, worktree: Path) -> GitRepo:
