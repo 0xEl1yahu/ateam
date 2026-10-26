@@ -13,8 +13,8 @@ SCHEMA_VERSION = 1
 FEATURE_TRANSITIONS: dict[str | None, set[str]] = {
     None: {"requested"},
     "requested": {"investigating"},
-    "investigating": {"plan_proposed"},
-    "plan_proposed": {"plan_approved", "plan_rejected"},
+    "investigating": {"plan_proposed", "plan_covered"},
+    "plan_proposed": {"plan_approved", "plan_rejected", "superseded"},
     "plan_approved": {"executing"},
     "executing": {"paused", "integrating"},
     "paused": {"executing", "abandoned"},
@@ -23,8 +23,8 @@ FEATURE_TRANSITIONS: dict[str | None, set[str]] = {
     "plan_rejected": set(),
     "merged": set(),
     "abandoned": set(),
-    "plan_covered": set(),   # terminal; the transition into it is wired with the CLI
-    "superseded": set(),     # terminal; likewise
+    "plan_covered": set(),   # terminal; entered from investigating by `ateam plan`
+    "superseded": set(),     # terminal; entered from plan_proposed when a replacing plan is approved
 }
 
 CONTRACT_TRANSITIONS: dict[str | None, set[str]] = {

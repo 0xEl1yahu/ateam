@@ -235,8 +235,9 @@ def init(remote: str | None, max_candidates: int, tier: str, target: Path) -> No
 @main.command()
 @click.argument("request")
 @click.option("--tier", default="careful", show_default=True, type=click.Choice(["light", "standard", "careful"]))
+@click.option("--replaces", default=None, metavar="P-xxxx", help="Supersede this plan_proposed plan when the new plan is approved.")
 @TARGET_OPTION
-def plan(request: str, tier: str, target: Path) -> None:
+def plan(request: str, tier: str, replaces: str | None, target: Path) -> None:
     """Turn a feature request into contracts and a plan for approval."""
     import asyncio
 
@@ -255,6 +256,12 @@ def plan(request: str, tier: str, target: Path) -> None:
     from ateam.plans.model import Plan, PlanHistoryEntry, PlanStatus
 
     ctx = _context(target)
+    if replaces is not None:
+        old = load_plans(ctx.paths.plans).get(replaces)
+        if old is None:
+            _fail(f"--replaces names unknown plan {replaces}")
+        if old.status != PlanStatus.plan_proposed:
+            _fail(f"--replaces needs a plan_proposed plan; {replaces} is {old.status}")
     disk_next = int(next_plan_id(ctx.paths.plans).split("-")[1])
     db_max = ctx.db.max_feature_id()
     db_next = int(db_max.split("-")[1]) + 1 if db_max else 1
@@ -264,7 +271,7 @@ def plan(request: str, tier: str, target: Path) -> None:
     def _rejected(reason: str) -> None:
         """Leave a visible, terminal trace: a rejected plan file (committed) and the feature state."""
         rejected = Plan(id=pid, title=request[:80], request=request, status=PlanStatus.plan_rejected,
-                        history=[PlanHistoryEntry(at=datetime.now(UTC), by="ateam", to=PlanStatus.plan_rejected, why=reason)])
+                        replaces=replaces, history=[PlanHistoryEntry(at=datetime.now(UTC), by="ateam", to=PlanStatus.plan_rejected, why=reason)])
         save_plan(ctx.paths.plans, rejected)
         try:
             commit_intent(ctx.paths, f"ateam: reject plan {pid} ({reason})", ["plans"])
@@ -284,6 +291,7 @@ def plan(request: str, tier: str, target: Path) -> None:
             kind="planning", target_root=ctx.paths.root, config=ctx.config, records=records,
             plans=existing_plans, contracts=load_contracts(ctx.paths.contracts),
             scratch_dir=ctx.paths.scratch_root / pid, request=request,
+            exclude_plans=frozenset({replaces}) if replaces else frozenset(),
         )
     except Exception as e:  # noqa: BLE001  the feature is already investigating; never strand it
         _rejected(f"brief assembly failed: {type(e).__name__}")
@@ -310,7 +318,7 @@ def plan(request: str, tier: str, target: Path) -> None:
         _fail(f"planning produced no report (subtype {result.res.subtype}{', ' + result.res.error if result.res.error else ''})")
     try:
         pr = report_to_plan(result.res.report, request, pid, ctx.paths.contracts, records, ctx.config, ctx.paths.root, ctx.paths.records,
-                            tiers=tiers, existing_plans=existing_plans)
+                            tiers=tiers, existing_plans=existing_plans, replaces=replaces)
     except PlanError as e:
         _rejected("planner output invalid")
         click.echo("The planner's output is not usable; nothing was written. Problems:")
@@ -318,11 +326,18 @@ def plan(request: str, tier: str, target: Path) -> None:
             click.echo(f"  - {problem}")
         click.echo(f"Re-run: ateam plan \"{request}\"")
         sys.exit(1)
+    if pr.covered:
+        save_plan(ctx.paths.plans, pr.plan)
+        commit_intent(ctx.paths, f"ateam: plan {pid} covered by {', '.join(pr.plan.covered_by)}", ["plans"])
+        ctx.db.transition("feature", pid, "plan_covered", by="ateam", reason=f"covered by {', '.join(pr.plan.covered_by)}")
+        click.echo(render_plan_review(pr, tiers))
+        click.echo(f"\nsession {result.res.session_id}: {result.res.num_turns} turns, ${result.res.cost_usd:.4f}")
+        return
     for c in pr.contracts:
         save_contract(ctx.paths.contracts, c)
     for r in pr.proposed.proposed:
         save_record(ctx.paths.records, r)
-    save_plan(ctx.paths.plans, pr.plan)
+    save_plan(ctx.paths.plans, pr.plan.model_copy(update={"replaces": replaces}))
     commit_intent(ctx.paths, f"ateam: propose plan {pid}", ["plans", "contracts", "records"])
     ctx.db.transition("feature", pid, "plan_proposed", by="ateam")
     click.echo(render_plan_review(pr, tiers))
@@ -442,6 +457,14 @@ def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, targe
         "history": [*plan_.history, PlanHistoryEntry(at=datetime.now(UTC), by="owner", to=PlanStatus.plan_approved)],
     })
     save_plan(ctx.paths.plans, plan_)
+    superseded_id = None
+    old_plan = plans_.get(plan_.replaces) if plan_.replaces else None
+    if old_plan is not None and old_plan.status == PlanStatus.plan_proposed:
+        superseded_id = old_plan.id
+        save_plan(ctx.paths.plans, old_plan.model_copy(update={
+            "status": PlanStatus.superseded,
+            "history": [*old_plan.history, PlanHistoryEntry(at=datetime.now(UTC), by="owner", to=PlanStatus.superseded, why=f"replaced by {plan_id}")],
+        }))
     try:
         commit_intent(ctx.paths, f"ateam: approve plan {plan_id}", ["plans", "contracts"])
     except (IntentError, GitError) as e:
@@ -456,6 +479,10 @@ def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, targe
             ctx.db.set_record_hash(r.id, r.content_hash())
     ctx.db.transition("feature", plan_id, "plan_approved", by="owner")
     click.echo(f"{plan_id} -> plan_approved")
+    if superseded_id is not None:
+        if ctx.db.feature_status(superseded_id) == "plan_proposed":
+            ctx.db.transition("feature", superseded_id, "superseded", by="owner", reason=f"replaced by {plan_id}")
+        click.echo(f"{superseded_id} -> superseded")
 
 
 @main.command()

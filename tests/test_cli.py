@@ -1,3 +1,4 @@
+import pytest
 from click.testing import CliRunner
 
 from ateam.cli import main
@@ -689,3 +690,94 @@ def test_init_and_plan_default_to_careful(monkeypatch, cli_target):
     capturing_report(_canned_plan())
     assert run("plan", "add a health function", "--target", str(cli_target)).exit_code == 0
     assert seen == ["careful", "careful"]
+
+
+# ---- plan covered, --replaces, supersede on approval
+
+def _capturing_investigation(monkeypatch, report, briefs):
+    from ateam.runner import investigate as inv_mod
+    from ateam.runner.run import WorkerResult
+
+    async def fake(**kw):
+        briefs.append(kw["brief_text"])
+        db = kw["db"]
+        a = db.start_attempt(kw["name"], "investigate", "light", "haiku", {})
+        db.finish_attempt(a, "completed", None, 1, 1, 0.001, 1, 0.1, "s")
+        res = WorkerResult("success", False, "completed", "s", 1, 0.001, {}, {}, report, [], [], None, 0.1)
+        return inv_mod.InvestigationResult(res=res, attempt_id=a, tampered=[])
+
+    monkeypatch.setattr("ateam.cli.run_investigation", fake, raising=False)
+    monkeypatch.setattr(inv_mod, "run_investigation", fake)
+
+
+def test_plan_covered_writes_plan_file_commits_and_transitions(monkeypatch, cli_target):
+    from ateam.plans.store import load_plans
+    p = _proposed_plan(monkeypatch, cli_target)
+    _patch_investigation(monkeypatch, {"title": "Health again", "contracts": [], "depends_on_plans": ["P-0001"], "unknowns": [], "notes": "n"})
+    r = run("plan", "health check again", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert "covered by" in r.output
+    plans = load_plans(p.plans)
+    assert plans["P-0002"].status == "plan_covered" and plans["P-0002"].covered_by == ["P-0001"] and plans["P-0002"].contracts == []
+    assert set(load_contracts(p.contracts)) == {"C-0001", "C-0002"}
+    g = GitRepo(p.intent)
+    assert g.is_clean() and g.run("log", "-1", "--format=%s").strip() == "ateam: plan P-0002 covered by P-0001"
+    db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
+    assert db.feature_status("P-0002") == "plan_covered"
+    assert "plan_covered" in run("plans", "list", "--target", str(cli_target)).output
+
+
+def test_plan_replaces_hides_old_plan_from_brief_and_records_it(monkeypatch, cli_target):
+    from ateam.plans.store import load_plans
+    p = _proposed_plan(monkeypatch, cli_target)
+    briefs: list[str] = []
+    _capturing_investigation(monkeypatch, _canned_plan(), briefs)
+    r = run("plan", "a better health function", "--replaces", "P-0001", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    section = briefs[0].split("## Existing plans and contracts")[1].split("\n## ")[0]
+    assert "P-0001" not in section
+    assert load_plans(p.plans)["P-0002"].replaces == "P-0001"
+
+
+@pytest.mark.parametrize("status", ["plan_approved", "plan_rejected", "plan_covered"])
+def test_plan_replaces_refuses_non_proposed_plan(status, monkeypatch, cli_target):
+    from ateam.plans.model import PlanStatus
+    from ateam.plans.store import load_plans, save_plan
+    p = _proposed_plan(monkeypatch, cli_target)
+    old = load_plans(p.plans)["P-0001"]
+    save_plan(p.plans, old.model_copy(update={"status": PlanStatus(status)}))
+    commit_intent(p, "set status", ["plans"])
+    briefs: list[str] = []
+    _capturing_investigation(monkeypatch, _canned_plan(), briefs)
+    r = run("plan", "again", "--replaces", "P-0001", "--target", str(cli_target))
+    assert r.exit_code == 1 and f"--replaces needs a plan_proposed plan; P-0001 is {status}" in r.output
+    assert briefs == []
+    db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
+    assert db.feature_status("P-0002") is None
+
+
+def test_plan_replaces_refuses_unknown_plan(monkeypatch, cli_target):
+    briefs: list[str] = []
+    _capturing_investigation(monkeypatch, _canned_plan(), briefs)
+    r = run("plan", "again", "--replaces", "P-0009", "--target", str(cli_target))
+    assert r.exit_code == 1 and "P-0009" in r.output and briefs == []
+
+
+def test_approve_supersedes_the_replaced_plan(monkeypatch, cli_target):
+    from ateam.plans.store import load_plans
+    p = _proposed_plan(monkeypatch, cli_target)
+    _patch_investigation(monkeypatch, _canned_plan())
+    assert run("plan", "a better health function", "--replaces", "P-0001", "--target", str(cli_target)).exit_code == 0
+    r = run("approve", "P-0002", "--skip-records", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    plans = load_plans(p.plans)
+    assert plans["P-0002"].status == "plan_approved"
+    assert plans["P-0001"].status == "superseded" and plans["P-0001"].history[-1].why == "replaced by P-0002"
+    assert load_contracts(p.contracts)["C-0002"].status == "draft"
+    db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
+    assert db.feature_status("P-0001") == "superseded" and db.feature_status("P-0002") == "plan_approved"
+    g = GitRepo(p.intent)
+    assert g.is_clean()
+    files = g.run("show", "--name-only", "--format=", "HEAD")
+    assert "P-0001" in files and "P-0002" in files
+    assert "superseded" in run("plans", "list", "--target", str(cli_target)).output
