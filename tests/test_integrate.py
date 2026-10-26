@@ -335,3 +335,42 @@ def test_proposal_shows_record_status_and_final_check_results(verified):
     res, _, _ = _integrate(verified.root)
     text = res.proposal.read_text()
     assert "## Final checks on the integration tip" in text and "- unit: passed" in text
+
+
+# ---- public helpers for the scheduler (plan 2026-10-26-scheduler, task 4)
+
+def test_prepare_integration_is_idempotent(verified):
+    from ateam.integrate import integration_branch, prepare_integration
+    ctx = Context(verified.root)
+    tip = GitRepo(verified.root).rev_parse("main")
+    out: list[str] = []
+    wt = prepare_integration(ctx, "P-0001", tip, out.append)
+    start = ctx.db.get_meta("integration:P-0001")
+    again = prepare_integration(ctx, "P-0001", _commit_on_main(verified.root, "docs/later.md", "x\n"), out.append)
+    assert again.root == wt.root and ctx.db.get_meta("integration:P-0001") == start
+    assert GitRepo(verified.root).rev_parse(integration_branch("P-0001")) == tip   # the recorded start, not the new tip
+
+
+def test_merge_contract_records_and_tolerates_a_repeat(verified):
+    from ateam.integrate import merge_contract, prepare_integration
+    ctx = Context(verified.root)
+    wt = prepare_integration(ctx, "P-0001", GitRepo(verified.root).rev_parse("main"), lambda m: None)
+    sha = merge_contract(ctx, wt, "P-0001", "C-0001", lambda m: None)
+    assert wt.head() == sha and wt.is_ancestor(ctx.db.latest_checkpoint("C-0001")["head"], sha)
+    assert load_contracts(verified.paths.contracts)["C-0001"].status == "integrated" == ctx.db.contract_status("C-0001")
+    intent_head = GitRepo(verified.paths.intent).head()
+    assert merge_contract(ctx, wt, "P-0001", "C-0001", lambda m: None) == sha
+    assert GitRepo(verified.paths.intent).head() == intent_head and wt.head() == sha
+
+
+def test_merge_contract_conflict_records_nothing(verified):
+    from ateam.gitops import MergeConflict
+    from ateam.integrate import merge_contract, prepare_integration
+    _commit_on_main(verified.root, "src/a/a.py", "A = 'main'\n")
+    ctx = Context(verified.root)
+    wt = prepare_integration(ctx, "P-0001", GitRepo(verified.root).rev_parse("main"), lambda m: None)
+    intent_head = GitRepo(verified.paths.intent).head()
+    with pytest.raises(MergeConflict):
+        merge_contract(ctx, wt, "P-0001", "C-0001", lambda m: None)
+    assert load_contracts(verified.paths.contracts)["C-0001"].status == "verified" == ctx.db.contract_status("C-0001")
+    assert GitRepo(verified.paths.intent).head() == intent_head and wt.status_porcelain() == []

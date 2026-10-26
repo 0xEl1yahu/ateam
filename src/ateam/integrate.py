@@ -104,8 +104,8 @@ def integrate(ctx, plan_id: str, echo: Callable[[str], None]) -> IntegrateResult
     checks = check_set(config, [cs[c] for c in cids])
     if not checks:
         raise IntegrateRefused(f"{plan_id} has no deterministic checks (config.checks or the contracts'); integrate needs at least one")
-    _reconcile_contracts(db, owner, cs, cids, branch, echo)
-    store = _reconcile_feature(paths, db, plan, echo)
+    reconcile_contracts(db, owner, cs, cids, branch, echo)
+    store = reconcile_feature(paths, db, plan, echo)
 
     target_tip = owner.rev_parse(config.target_branch)
     if store == "merge_proposed":
@@ -136,18 +136,10 @@ def integrate(ctx, plan_id: str, echo: Callable[[str], None]) -> IntegrateResult
     for cid in dependency_order({c: cs[c] for c in cids}):
         if cs[cid].status == ContractStatus.integrated:
             continue
-        head = db.latest_checkpoint(cid)["head"]
-        if wt.is_ancestor(head, "HEAD"):
-            merge = wt.head()   # merged before an interruption; only the records are missing
-        else:
-            try:
-                merge = wt.merge_no_ff(head, f"ateam: integrate {cid} into {branch}")
-            except MergeConflict as e:
-                return _pause(paths, db, plan, "conflict", f"environment_failure: {cid} conflicts in {', '.join(e.paths)}", [], echo)
-        saved = save_contract(paths.contracts, cs[cid].model_copy(update={"status": ContractStatus.integrated}))
-        commit_intent_files(paths, f"ateam: integrate {cid}", [saved])
-        db.transition("contract", cid, "integrated", by="integrate", reason=f"merged {merge}")
-        echo(f"{cid} -> integrated ({merge[:12]})")
+        try:
+            merge_contract(ctx, wt, plan_id, cid, echo)
+        except MergeConflict as e:
+            return _pause(paths, db, plan, "conflict", f"environment_failure: {cid} conflicts in {', '.join(e.paths)}", [], echo)
 
     _require_heads(db, wt, cids, "HEAD", branch)
     if not wt.is_ancestor(target_tip, "HEAD"):
@@ -224,7 +216,33 @@ def _preflight(db, cs: dict[str, Contract], cids: list[str], records: dict) -> N
             raise IntegrateRefused(f"{cid} has no verify checkpoint naming its head")
 
 
-def _reconcile_contracts(db, owner: GitRepo, cs, cids, branch: str, echo) -> None:
+def prepare_integration(ctx, plan_id: str, target_tip: str, echo) -> GitRepo:
+    """Record the integration start (once), make or check ateam/<plan-id>, and make or check its worktree."""
+    return _prepare(ctx.paths, ctx.db, ctx.git, ctx.config, plan_id, integration_branch(plan_id), target_tip, echo)
+
+
+def merge_contract(ctx, wt: GitRepo, plan_id: str, cid: str, echo) -> str:
+    """Merge a verified contract's head onto the integration branch and record it integrated: the contract file in
+    an intent commit first, then the store. A repeat, or a file already integrated by an interrupted run, records
+    only what is missing. A conflict raises MergeConflict with the merge aborted and nothing recorded."""
+    paths, db = ctx.paths, ctx.db
+    contract = load_contracts(paths.contracts)[cid]
+    head = db.latest_checkpoint(cid)["head"]
+    if wt.is_ancestor(head, "HEAD"):
+        merged = [t["reason"] for t in db.transitions("contract", cid) if (t.get("reason") or "").startswith("merged ")]
+        merge = merged[-1].removeprefix("merged ") if merged else wt.head()   # merged before an interruption
+    else:
+        merge = wt.merge_no_ff(head, f"ateam: integrate {cid} into {integration_branch(plan_id)}")
+    if contract.status != ContractStatus.integrated:
+        saved = save_contract(paths.contracts, contract.model_copy(update={"status": ContractStatus.integrated}))
+        commit_intent_files(paths, f"ateam: integrate {cid}", [saved])
+    if db.contract_status(cid) != "integrated":
+        db.transition("contract", cid, "integrated", by="integrate", reason=f"merged {merge}")
+        echo(f"{cid} -> integrated ({merge[:12]})")
+    return merge
+
+
+def reconcile_contracts(db, owner: GitRepo, cs, cids, branch: str, echo) -> None:
     """A contract whose file says integrated while the store says verified lost its store step in a crash, provided
     its verified head is on the integration branch. Any other disagreement is refused."""
     for cid in cids:
@@ -239,7 +257,7 @@ def _reconcile_contracts(db, owner: GitRepo, cs, cids, branch: str, echo) -> Non
             raise IntegrateRefused(f"{cid} is {file_status} in its file and {stored} in the state store; investigate before integrating")
 
 
-def _reconcile_feature(paths, db, plan: Plan, echo) -> str:
+def reconcile_feature(paths, db, plan: Plan, echo) -> str:
     """The store status after replaying the steps of integrate's own walk that a crash lost."""
     file_status, stored = str(plan.status), db.feature_status(plan.id)
     if file_status == stored:
