@@ -253,10 +253,25 @@ def _reject_stale_planning(ctx: Context) -> None:
     from ateam.plans.model import Plan, PlanHistoryEntry, PlanStatus
     from ateam.plans.store import load_plans, save_plan
 
+    from ateam.gitops import GitError
+
     for fid in ctx.db.features_with_status("investigating"):
         marker = ctx.db.get_meta(f"planning:{fid}")
         if marker and marker.isdigit() and _process_alive(int(marker)):
             continue
+        existing = load_plans(ctx.paths.plans).get(fid)
+        files = sorted(ctx.paths.plans.glob(f"{fid}-*.yaml"))
+        if existing is not None and str(existing.status) in ("plan_proposed", "plan_covered") and files:
+            rel = intent_relpath(ctx.paths, files[0])
+            git = GitRepo(ctx.paths.intent)
+            try:
+                committed = git.show_file("HEAD", rel) == files[0].read_text() and git.is_clean([rel])
+            except GitError:
+                committed = False
+            if committed:   # the proposal was committed and only the store step was lost (owner, 2026-10-26)
+                ctx.db.transition("feature", fid, str(existing.status), by="ateam", reason="completed from its committed plan file")
+                click.echo(f"{fid} -> {existing.status} (completed from its committed plan file)")
+                continue
         why = "interrupted (found stale)"
         requested = next((t["reason"] for t in ctx.db.transitions("feature", fid) if t["to_status"] == "requested"), None)
         plan = load_plans(ctx.paths.plans).get(fid) or Plan(id=fid, title=(requested or "interrupted planning")[:80],
@@ -266,10 +281,17 @@ def _reject_stale_planning(ctx: Context) -> None:
             *plan.history, PlanHistoryEntry(at=datetime.now(UTC), by="ateam", to=PlanStatus.plan_rejected, why=why)]})
         try:
             require_clean(ctx.paths)
-            commit_intent_files(ctx.paths, f"ateam: reject plan {fid} ({why})", [save_plan(ctx.paths.plans, plan)])
         except IntentError as e:
             click.echo(f"warning: could not record {fid} as rejected in the intent repo: {e}")
             continue
+        written = save_plan(ctx.paths.plans, plan)
+        message = f"ateam: reject plan {fid} (interrupted, found stale)"
+        try:
+            commit_intent_files(ctx.paths, message, [written])
+        except (IntentError, GitError) as e:
+            rel = intent_relpath(ctx.paths, written)
+            _fail(f"could not commit the rejection of stale plan {fid}: {e}. Nothing else was run. Commit it by hand: "
+                  f"git -C \"{ctx.paths.intent}\" add -- {rel} && git -C \"{ctx.paths.intent}\" commit -m \"{message}\" -- {rel}")
         ctx.db.transition("feature", fid, "plan_rejected", by="ateam", reason=why)
         click.echo(f"{fid} -> plan_rejected (interrupted, found stale)")
 
@@ -348,9 +370,9 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
     db_max = ctx.db.max_feature_id()
     db_next = int(db_max.split("-")[1]) + 1 if db_max else 1
     pid = f"P-{max(disk_next, db_next):04d}"
+    ctx.db.set_meta(f"planning:{pid}", str(os.getpid()))   # first, so a concurrent cleanup never sees this plan unmarked
     ctx.db.transition("feature", pid, "requested", by="owner", reason=request[:200])
     ctx.db.transition("feature", pid, "investigating", by="ateam")
-    ctx.db.set_meta(f"planning:{pid}", str(os.getpid()))   # lets a later `ateam plan` tell this from a stale plan
     def _manual(files: list[Path], message: str) -> str:
         """The command that commits exactly `files` by hand; the pathspec on `commit` keeps anything else staged out."""
         intent = ctx.paths.intent
@@ -388,6 +410,10 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
             scratch_dir=ctx.paths.scratch_root / pid, request=request,
             exclude_plans=frozenset({replaces}) if replaces else frozenset(),
         )
+    except KeyboardInterrupt:
+        _rejected("interrupted")
+        click.echo(f"interrupted: {pid} -> plan_rejected; re-run: ateam plan \"{request}\"")
+        sys.exit(130)
     except Exception as e:  # noqa: BLE001  the feature is already investigating; never strand it
         _rejected(f"brief assembly failed: {type(e).__name__}")
         _fail(f"could not assemble the planning brief: {e}. Re-run: ateam plan \"{request}\"")
@@ -418,6 +444,10 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
     try:
         pr = report_to_plan(result.res.report, request, pid, ctx.paths.contracts, records, ctx.config, ctx.paths.root, ctx.paths.records,
                             tiers=tiers, existing_plans=existing_plans, replaces=replaces)
+    except KeyboardInterrupt:
+        _rejected("interrupted")
+        click.echo(f"interrupted: {pid} -> plan_rejected; re-run: ateam plan \"{request}\"")
+        sys.exit(130)
     except PlanError as e:
         _rejected("planner output invalid")
         click.echo("The planner's output is not usable; no contracts were written. Problems:")
@@ -425,6 +455,10 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
             click.echo(f"  - {problem}")
         click.echo(f"Re-run: ateam plan \"{request}\"")
         sys.exit(1)
+    except Exception as e:  # noqa: BLE001  a report the planner code could not read; never strand the plan
+        _rejected(f"planner output could not be read: {type(e).__name__}")
+        _fail(f"the planner's report could not be read ({type(e).__name__}: {e}); no contracts were written. "
+              f"Re-run: ateam plan \"{request}\"")
     sessions = [result.res]
     intent_tampered_by: str | None = None   # the first later session that changed the intent repo
     proposal = {"committed": True}          # False when the proposal commit failed: the plan is written, the run exits 1

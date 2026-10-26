@@ -383,3 +383,14 @@ def test_out_of_range_and_prose_are_left_alone():
 def test_planner_prompt_explains_contract_n():
     from ateam.roles import PLANNER_SPEC
     assert "contract N" in PLANNER_SPEC.system_prompt and "zero-based" in PLANNER_SPEC.system_prompt
+
+
+def test_contract_refs_skip_other_plans_and_structural_fields(target_repo, target_paths, records_three):
+    first = contract("First")
+    second = contract("Second", deps=[0])
+    second["acceptance"][0]["statement"] = "P-0002's contract 1 owns the schema; this plan's contract 0 adds the helper"
+    rep = report(first, second, unknowns=["see plan contract 1 in P-0002"])
+    r = report_to_plan(rep, "add health", "P-0001", target_paths.contracts, records_three, CFG, target_repo, target_paths.records)
+    assert r.contracts[1].acceptance[0].statement == "P-0002's contract 1 owns the schema; this plan's C-0001 adds the helper"
+    assert r.plan.unknowns == ["see plan contract 1 in P-0002"]
+    assert r.contracts[1].acceptance[0].check.ref == "tests/test_routes.py::RoutesTest::test_health"

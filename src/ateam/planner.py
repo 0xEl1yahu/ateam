@@ -162,19 +162,51 @@ def _interface_notes(raw: list[dict], ids: list[str], interfaces: list[list[Inte
     return notes
 
 
-_CONTRACT_REF = re.compile(r"\bcontract (\d+)\b", re.IGNORECASE)
+_CONTRACT_REF = re.compile(r"\bcontract (\d+)\b(?![.\-]\d)", re.IGNORECASE)
+_OTHER_PLAN = re.compile(r"(P-\d{4}'s|\bplan(?:'s)?)\s+$", re.IGNORECASE)   # "P-0002's contract 1", "plan contract 1"
+
+
+def _resolve_one(text: str, ids: list[str]) -> str:
+    def repl(m: re.Match) -> str:
+        n = int(m.group(1))
+        before = text[max(0, m.start() - 16):m.start()]
+        another_plan = bool(_OTHER_PLAN.search(before)) and "this plan" not in before
+        return m.group(0) if n >= len(ids) or another_plan else ids[n]
+    return _CONTRACT_REF.sub(repl, text)
 
 
 def resolve_contract_refs(value, ids: list[str]):
-    """`contract N` (zero-based, as the planner writes it before ids exist) becomes the contract's id in every string
-    of a report; an index outside the plan, and prose that merely mentions a contract, are left as written."""
+    """`contract N` (zero-based, as the planner writes it before ids exist) becomes the contract's id; an index outside
+    the plan, a reference to another plan's contract, and prose that merely mentions a contract are left as written."""
     if isinstance(value, str):
-        return _CONTRACT_REF.sub(lambda m: ids[int(m.group(1))] if int(m.group(1)) < len(ids) else m.group(0), value)
+        return _resolve_one(value, ids)
     if isinstance(value, list):
         return [resolve_contract_refs(v, ids) for v in value]
     if isinstance(value, dict):
         return {k: resolve_contract_refs(v, ids) for k, v in value.items()}
     return value
+
+
+def _resolve_prose(report: dict, ids: list[str]) -> dict:
+    """Apply resolve_contract_refs to the report's prose fields only."""
+    out = dict(report)
+    for key in ("title", "unknowns", "notes", "out_of_scope", "verification_approach"):
+        if key in out:
+            out[key] = resolve_contract_refs(out[key], ids)
+    out["proposed_records"] = [{**r, **{k: resolve_contract_refs(r[k], ids) for k in ("statement", "rationale") if k in r}}
+                               for r in (report.get("proposed_records") or [])]
+    contracts = []
+    for c in report.get("contracts") or []:
+        c = dict(c)
+        if "title" in c:
+            c["title"] = resolve_contract_refs(c["title"], ids)
+        c["acceptance"] = [{**a, "statement": resolve_contract_refs(a.get("statement", ""), ids)} for a in c.get("acceptance") or []]
+        c["interfaces"] = [{**i, **({"note": resolve_contract_refs(i["note"], ids)} if i.get("note") else {})} for i in c.get("interfaces") or []]
+        if isinstance(c.get("allocation"), dict) and "reasoning" in c["allocation"]:
+            c["allocation"] = {**c["allocation"], "reasoning": resolve_contract_refs(c["allocation"]["reasoning"], ids)}
+        contracts.append(c)
+    out["contracts"] = contracts
+    return out
 
 
 def report_to_plan(
@@ -239,7 +271,7 @@ def report_to_plan(
 
     start = int(next_contract_id(contracts_dir).split("-")[1])
     ids = [f"C-{start + i:04d}" for i in range(len(raw))]
-    report = resolve_contract_refs(report, ids)
+    report = _resolve_prose(report, ids)   # prose fields only: paths, checks, refs and signatures are left as written
     raw = list(report.get("contracts") or [])
     contracts: list[Contract] = []
     all_interfaces: list[list[Interface]] = []

@@ -2158,3 +2158,94 @@ def test_plan_leaves_a_live_planning_session_alone(monkeypatch, cli_target):
     r = run("plan", "add a health function", "--target", str(cli_target))
     assert r.exit_code == 0, r.output
     assert _db(cli_target).feature_status("P-0001") == "investigating" and "found stale" not in r.output
+
+
+# ---- planner fixes: final review
+
+def _dead_pid():
+    import subprocess
+    proc = subprocess.Popen(["true"]); proc.wait()
+    return proc.pid
+
+
+def test_plan_cleans_up_a_plan_whose_marker_names_a_dead_process_and_commits_it(monkeypatch, cli_target):
+    _investigating(cli_target, "P-0001", marker=_dead_pid())
+    _patch_investigation(monkeypatch, _canned_plan())
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    g = GitRepo(TargetPaths.from_root(cli_target).intent)
+    assert g.is_clean() and "ateam: reject plan P-0001" in g.run("log", "--format=%s")
+    assert _db(cli_target).feature_status("P-0001") == "plan_rejected"
+
+
+def test_a_stale_plan_with_a_committed_proposal_is_completed_not_rejected(monkeypatch, cli_target):
+    from ateam.plans.model import Plan, PlanStatus
+    from ateam.plans.store import load_plans, save_plan
+    p = TargetPaths.from_root(cli_target)
+    _investigating(cli_target, "P-0001")
+    save_plan(p.plans, Plan(id="P-0001", title="t", request="an earlier request", status=PlanStatus.plan_proposed))
+    commit_intent(p, "ateam: propose plan P-0001", ["plans"])     # the commit landed; the store step was lost
+    _patch_investigation(monkeypatch, _canned_plan())
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert "P-0001 -> plan_proposed (completed from its committed plan file)" in r.output
+    assert _db(cli_target).feature_status("P-0001") == "plan_proposed"
+    assert load_plans(p.plans)["P-0001"].status == "plan_proposed"
+
+
+def test_cleanup_commit_failure_stops_before_any_session(monkeypatch, cli_target):
+    from ateam.gitops import GitError
+    _investigating(cli_target, "P-0001")
+    briefs: list[str] = []
+    _capturing_investigation(monkeypatch, _canned_plan(), briefs)
+
+    def failing_commit(paths, message, files):
+        raise GitError("gpg failed to sign the data")
+
+    monkeypatch.setattr("ateam.cli.commit_intent_files", failing_commit)
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 1 and "gpg failed" in r.output and "git -C" in r.output and "commit" in r.output
+    assert briefs == [] and "Traceback" not in r.output
+
+
+@pytest.mark.parametrize("where", ["brief", "report"])
+def test_plan_interrupted_outside_the_session_is_rejected(where, monkeypatch, cli_target):
+    from ateam.plans.store import load_plans
+    _patch_investigation(monkeypatch, _canned_plan())
+
+    def ctrl_c(*a, **kw):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("ateam.cli.assemble_investigation_brief" if where == "brief" else "ateam.planner.report_to_plan", ctrl_c)
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 130, r.output
+    assert load_plans(TargetPaths.from_root(cli_target).plans)["P-0001"].history[-1].why == "interrupted"
+    assert _db(cli_target).feature_status("P-0001") == "plan_rejected"
+
+
+def test_an_unexpected_error_reading_the_report_rejects_the_plan(monkeypatch, cli_target):
+    _patch_investigation(monkeypatch, _canned_plan())
+
+    def broken(*a, **kw):
+        raise KeyError("title")
+
+    monkeypatch.setattr("ateam.planner.report_to_plan", broken)
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 1 and "Traceback" not in r.output
+    assert _db(cli_target).feature_status("P-0001") == "plan_rejected"
+
+
+def test_the_planning_marker_exists_before_the_plan_is_investigating(monkeypatch, cli_target):
+    from ateam.state.db import StateDB as DB
+    real = DB.transition
+    seen = {}
+
+    def spy(self, kind, id, to, by, reason=None):
+        if kind == "feature" and to == "investigating":
+            seen["marker"] = self.get_meta(f"planning:{id}")
+        return real(self, kind, id, to, by, reason)
+
+    monkeypatch.setattr(DB, "transition", spy)
+    _patch_investigation(monkeypatch, _canned_plan())
+    assert run("plan", "add a health function", "--target", str(cli_target)).exit_code == 0
+    assert seen["marker"] is not None
