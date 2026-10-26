@@ -53,3 +53,5 @@ Adapted from the Claude Code team's own published practices (Boris Cherny's "how
 - This repo is nested inside an unrelated parent git repo at `~/Documents/GitHub`. Confirm `git rev-parse --show-toplevel` ends in `/ateam` before any git command; never stage the parent.
 - `docs/2026-10-25-product-*.md` were written by another session; leave them unless asked.
 - End commit messages with `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
+
+- A review invalidated by a snapshot change must retain the observed reason in the saved plan; a changed shared Git ref does not establish which session caused it.

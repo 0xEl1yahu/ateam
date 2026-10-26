@@ -114,3 +114,18 @@ async def test_run_investigation_passes_resume_and_starts_its_own_attempt(monkey
                                      spec=DISCOVERY_SPEC, prompt="again", brief_text="BRIEF", tier=inv_env["tier"], db=inv_env["db"],
                                      resume="s1")
     assert seen == [None, "s1"] and second.attempt_id != first.attempt_id
+
+
+@pytest.mark.asyncio
+async def test_concurrent_branch_creation_still_discards_valid_review(monkeypatch, inv_env):
+    from ateam.roles import REVIEWER_SPEC
+
+    async def fake_query(prompt, options):
+        inv_env["target_git"].run("branch", "other-session")
+        yield _result({"verdict": "defensible", "findings": [], "notes": "valid review"})
+
+    monkeypatch.setattr("ateam.runner.run.query", fake_query)
+    result = await _run(inv_env, name="P-0001-review", spec=REVIEWER_SPEC)
+    assert result.res.report is None
+    assert any("refs changed" in reason for reason in result.tampered)
+    assert inv_env["db"].telemetry_rows()[-1]["outcome"] == "tamper"

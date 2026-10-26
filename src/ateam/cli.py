@@ -429,11 +429,15 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
             sessions.append(review_res)
             report = review_res.report
             if reviewed.tampered:
-                reason = "the session changed the checkout or intent repo: " + "; ".join(reviewed.tampered)
+                reason = "repository state changed during review: " + "; ".join(reviewed.tampered)
                 if INTENT_TAMPER in reviewed.tampered:
                     intent_tampered_by = "review"
             elif report is None:
                 reason = f"no report, subtype {review_res.subtype}"
+                if review_res.terminal_reason:
+                    reason += f", terminal reason {review_res.terminal_reason}"
+                if review_res.error:
+                    reason += f", {review_res.error}"
             elif not isinstance(report, dict) or report.get("verdict") not in ("defensible", "needs_revision"):
                 reason = "the report is not a review"
             else:
@@ -446,7 +450,7 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
                     reason = "the report does not match the review schema"
         if review is None:
             click.echo(f"warning: review unavailable ({reason}); the plan is unreviewed")
-            review = PlanReview(verdict="unavailable", session_id=review_res.session_id if review_res else None,
+            review = PlanReview(verdict="unavailable", notes=reason, session_id=review_res.session_id if review_res else None,
                                 cost_usd=review_res.cost_usd if review_res else 0.0)
         progress["review"] = review
         if review.verdict != "needs_revision" or not any(f.severity == "blocking" for f in review.findings):

@@ -2025,3 +2025,44 @@ def test_refresh_skips_unfrozen_contracts_and_honours_the_plan_filter(monkeypatc
     assert r.exit_code == 0 and "nothing to refresh" in r.output and "C-0003" not in r.output
     r = run("contracts", "refresh", "P-0009", "--target", str(cli_target))
     assert r.exit_code == 1 and "unknown plan P-0009" in r.output
+
+
+@pytest.mark.parametrize("failure, detail", [
+    ("crash", "review sdk exploded"),
+    ("tamper", "planted.txt changed"),
+    ("no_report", "no report, subtype success"),
+    ({"title": "not a review"}, "the report is not a review"),
+])
+def test_review_failure_reason_survives_save_and_show(monkeypatch, cli_target, failure, detail):
+    _review_investigation(monkeypatch, [_canned_plan()], failure)
+    result = run("plan", "add health", "--target", str(cli_target))
+    assert result.exit_code == 0, result.output
+    review = _stored_plan(cli_target).review
+    assert review.verdict == "unavailable" and review.revised is False
+    assert detail in review.notes
+    assert review.notes in result.output
+    assert detail in run("plans", "show", "P-0001", "--target", str(cli_target)).output
+    if failure == "tamper":
+        assert "repository state changed during review" in review.notes
+        assert "the session changed" not in result.output
+
+
+def test_review_no_report_retains_terminal_and_transport_details(monkeypatch, cli_target):
+    import ateam.cli as cli
+    _review_investigation(monkeypatch, [_canned_plan()], "no_report")
+    fake = cli.run_investigation
+
+    async def detailed(**kw):
+        result = await fake(**kw)
+        if _is_review(kw):
+            result.res.subtype = "error_max_turns"
+            result.res.terminal_reason = "max_turns"
+            result.res.error = "TransportError: disconnected"
+        return result
+
+    monkeypatch.setattr(cli, "run_investigation", detailed)
+    result = run("plan", "add health", "--target", str(cli_target))
+    assert result.exit_code == 0, result.output
+    notes = _stored_plan(cli_target).review.notes
+    assert all(part in notes for part in ("error_max_turns", "max_turns", "TransportError: disconnected"))
+    assert notes in result.output
