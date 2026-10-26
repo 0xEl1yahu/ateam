@@ -38,7 +38,8 @@ WORKER_COMMON = (
     "(the frozen contract, authoritative), Verified prior work (facts the coordinator checked) and, sometimes, a "
     "previous worker's notes, which are unverified. You cannot change the contract or its acceptance criteria; if "
     "they are wrong, say so in your report instead of working around them. Never edit anything under .ateam/ or "
-    ".claude/. Never push, merge, rebase or run destructive commands. "
+    ".claude/. Never push, merge, rebase or run destructive commands. Use absolute paths with `cd`; a relative "
+    "`cd` is denied. "
     f"{AUTHORITY} {HANDOFF} End by producing the structured report you were asked for."
 )
 
@@ -52,7 +53,8 @@ INVESTIGATION_COMMON = (
     "dependencies), Request (planning only) or Discovery limits (discovery only), Checks, Tiers, Rubric, and Handoff "
     f"file. {AUTHORITY} Keep the handoff file named under the Handoff file section up to date; it lives outside the "
     "repository. It is a YAML mapping with the keys progress, unresolved, files, hypotheses and next. End by "
-    "producing the structured report you were asked for."
+    "producing the structured report you were asked for. To read part of a file use the Read tool with offset and "
+    "limit; sed, awk and interpreters are not available to you."
 )
 
 _PROPOSAL = {
@@ -133,8 +135,9 @@ TEST_SCHEMA = {
             },
         },
         "notes": {"type": "string"},
+        "requirements_unclear": {"type": "boolean"},
     },
-    "required": ["verdicts", "notes"],
+    "required": ["verdicts", "notes", "requirements_unclear"],
 }
 
 ROLE_SPECS: dict[Role, RoleSpec] = {
@@ -169,6 +172,8 @@ ROLE_SPECS: dict[Role, RoleSpec] = {
             "contract, independently of whoever built it. You may run checks and tests and write scratch files "
             "only in your scratch directory (the one holding the handoff file). You never edit source or the contract's named tests. For every criterion "
             "return met, not_met or cannot_determine with concrete evidence. A builder's claims are not evidence. "
+            "Set requirements_unclear to true when a criterion cannot be judged fairly because the contract itself is "
+            "ambiguous or contradictory; say which criterion and why in notes. Leave it false when the code is simply wrong. "
             + COMMON
         ),
         report_schema=TEST_SCHEMA,
@@ -253,6 +258,20 @@ PLANNER_SCHEMA = {
                             "required": ["id", "statement", "check"],
                         },
                     },
+                    "interfaces": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "kind": {"type": "string", "enum": ["produces", "consumes"]},
+                                "name": {"type": "string"},
+                                "signature": {"type": "string"},
+                                "note": {"type": "string"},
+                            },
+                            "required": ["kind", "name", "signature", "note"],
+                        },
+                    },
                     "checks": {"type": "array", "items": {"type": "string"}},
                     "allocation": {
                         "type": "object",
@@ -276,7 +295,7 @@ PLANNER_SCHEMA = {
                         "required": ["attempts", "usd_per_attempt", "max_turns"],
                     },
                 },
-                "required": ["title", "paths", "incidental", "depends_on", "acceptance", "checks", "allocation"],
+                "required": ["title", "paths", "incidental", "depends_on", "acceptance", "interfaces", "checks", "allocation"],
             },
         },
         "proposed_records": {"type": "array", "items": _CANDIDATE},
@@ -325,7 +344,10 @@ PLANNER_SPEC = RoleSpec(
         "name only the configured checks; the allocation gives complexity, risk and uncertainty as low, medium or high, a "
         "reasoning that cites the repository signals you used (component boundaries, bound records, test coverage, "
         "migrations, concurrency, security surface, ambiguity), and tiers that follow the rubric. Propose records only for "
-        "decisions this plan itself introduces. List open questions as unknowns rather than guessing. You never modify "
+        "decisions this plan itself introduces. For every contract list the interfaces it produces (new or changed "
+        "functions, classes, CLI flags, file formats, with exact signatures) and the ones it consumes from other contracts "
+        "or existing code; a later contract that consumes a name must match the producing contract's signature exactly. "
+        "List open questions as unknowns rather than guessing. You never modify "
         "files or state; shell commands are limited to read-only inspection. Read the Rules section first and treat "
         "anything it marks as the owner's decision as out of your scope: raise it under unknowns instead of deciding "
         "it. Cite in files_read every repository file you opened. State in out_of_scope what you deliberately left "
@@ -333,4 +355,46 @@ PLANNER_SPEC = RoleSpec(
         "depends_on_plans any existing plan this one needs merged first. " + INVESTIGATION_COMMON
     ),
     report_schema=PLANNER_SCHEMA,
+)
+
+REVIEW_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "verdict": {"type": "string", "enum": ["defensible", "needs_revision"]},
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "contract": {"type": "string"},
+                    "severity": {"type": "string", "enum": ["blocking", "important", "minor"]},
+                    "finding": {"type": "string"},
+                    "suggestion": {"type": "string"},
+                },
+                "required": ["contract", "severity", "finding", "suggestion"],
+            },
+        },
+        "notes": {"type": "string"},
+    },
+    "required": ["verdict", "findings", "notes"],
+}
+
+REVIEWER_SPEC = RoleSpec(
+    role=Role.investigate,
+    tools=_INVESTIGATE_TOOLS,
+    system_prompt=(
+        "ROLE: INVESTIGATE, task: plan review. You are a staff engineer reviewing a draft plan for technical "
+        "defensibility before the owner sees it. The draft is in the Draft plan section of your brief, written for the "
+        "Request section; your brief has no Tiers section. For each contract judge whether the acceptance criteria are "
+        "complete, testable and sufficient for the request; whether the paths are the right files (read them); whether "
+        "the record citations fit; whether the allocation reasoning is justified by the code; whether the checks can run "
+        "in a fresh worktree; and what failure modes are missing. Check that every consumed interface is produced by an earlier contract or exists in "
+        "the code, with the same signature. Report each problem as a finding naming the contract id "
+        "(or 'plan' for the plan as a whole), a severity and a concrete suggestion. Severity blocking means the owner "
+        "would be approving something that cannot work or misses the request; important means a real gap the plan should "
+        "close; minor is everything else. Never rewrite the plan yourself; the planner revises it. " + INVESTIGATION_COMMON
+    ),
+    report_schema=REVIEW_SCHEMA,
 )

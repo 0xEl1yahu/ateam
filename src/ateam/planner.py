@@ -6,20 +6,22 @@ Allocation corrections the rubric requires are applied and recorded as notes, ne
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+import yaml
 from pydantic import ValidationError
 
 from ateam.allocation import budget_for, check_allocation, default_tiers, investigate_tier_for, tier_for_complexity, tier_for_test
 from ateam.config import TargetConfig
-from ateam.contracts.model import Acceptance, Allocation, Budget, Contract, ContractStatus, Level
+from ateam.contracts.model import Acceptance, Allocation, Budget, Contract, ContractStatus, Interface, Level
 from ateam.contracts.select import select_records
 from ateam.contracts.store import next_id as next_contract_id
 from ateam.discovery import DiscoveryResult, candidates_to_records, render_discovery_report
 from ateam.globs import is_valid_pattern, matches
-from ateam.plans.model import Plan, PlanHistoryEntry, PlanStatus
+from ateam.plans.model import Plan, PlanHistoryEntry, PlanReview, PlanStatus, ReviewFinding
 from ateam.records.graph import RecordGraph
 from ateam.records.model import Record
 from ateam.roles import Role
@@ -39,6 +41,7 @@ class PlanResult:
     proposed: DiscoveryResult
     problems: list[str] = field(default_factory=list)
     bound_preview: dict[str, list[str]] = field(default_factory=dict)
+    covered: bool = False
 
 
 def _has_cycle(raw: list[dict]) -> bool:
@@ -62,16 +65,86 @@ def _has_cycle(raw: list[dict]) -> bool:
     return seen != n
 
 
+_TEXT_SEARCH_CAP = 2_000_000
+
+
+def _search_text(repo_root: Path, globs: list[str], files: list[str]) -> str:
+    """Plain text of the files a name could live in: the contract's paths plus the files the planner read."""
+    seen: dict[Path, None] = {}
+    root = repo_root.resolve()
+    for g in globs:
+        pattern = g[:-2] + "**/*" if g.endswith("**") else g   # pathlib's trailing ** matches directories only
+        try:
+            for f in root.glob(pattern):
+                if f.is_file():
+                    seen[f] = None
+        except (ValueError, NotImplementedError, OSError):
+            continue
+    for rel in files:
+        f = (root / rel).resolve()
+        if f.is_relative_to(root) and f.is_file():
+            seen[f] = None
+    parts: list[str] = []
+    total = 0
+    for f in seen:
+        try:
+            text = f.read_text(errors="replace")
+        except OSError:
+            continue
+        total += len(text)
+        if total > _TEXT_SEARCH_CAP:
+            break
+        parts.append(text)
+    return "\n".join(parts)
+
+
+def _interface_notes(raw: list[dict], ids: list[str], interfaces: list[list[Interface]], repo_root: Path, files_read: list[str]) -> list[str]:
+    notes: list[str] = []
+    produced: dict[str, tuple[str, str]] = {}   # name -> (contract id, signature), from earlier contracts only
+    for i, ifs in enumerate(interfaces):
+        text: str | None = None
+        for itf in ifs:
+            if itf.kind != "consumes":
+                continue
+            prior = produced.get(itf.name)
+            if prior is not None:
+                if " ".join(prior[1].split()) != " ".join(itf.signature.split()):
+                    notes.append(f"{ids[i]} consumes `{itf.signature}` but {prior[0]} produces `{prior[1]}`")
+                continue
+            if text is None:
+                scope = [*raw[i].get("paths", []), *raw[i].get("incidental", [])]
+                text = _search_text(repo_root, scope, files_read)
+            if itf.name not in text:
+                notes.append(f"{ids[i]} consumes `{itf.name}` which no contract produces and the code does not define")
+        for itf in ifs:
+            if itf.kind == "produces":
+                produced[itf.name] = (ids[i], itf.signature)
+    return notes
+
+
 def report_to_plan(
     report: dict, request: str, plan_id: str, contracts_dir: Path, records: dict[str, Record], config: TargetConfig,
     repo_root: Path, records_dir: Path, by: str = "ateam-plan",
-    tiers: dict | None = None, existing_plans: dict[str, Plan] | None = None,
+    tiers: dict | None = None, existing_plans: dict[str, Plan] | None = None, replaces: str | None = None,
 ) -> PlanResult:
     raw = list(report.get("contracts") or [])
     fatal: list[str] = []
     notes: list[str] = []
     known_checks = {c.name: c for c in config.checks}
     if not raw:
+        dead_states = (PlanStatus.plan_rejected, PlanStatus.plan_covered, PlanStatus.superseded, PlanStatus.abandoned)
+        live = {pid for pid, p in (existing_plans or {}).items() if p.status not in dead_states and pid != replaces}
+        named = list(dict.fromkeys(report.get("depends_on_plans") or []))
+        if named and all(d in live and d != plan_id for d in named):
+            plan = Plan(
+                id=plan_id, title=(report.get("title") or request)[:80], request=request, status=PlanStatus.plan_covered,
+                covered_by=named, unknowns=list(report.get("unknowns") or []), files_read=list(report.get("files_read") or []),
+                out_of_scope=list(report.get("out_of_scope") or []), verification_approach=report.get("verification_approach") or "",
+                replaces=replaces, history=[PlanHistoryEntry(at=datetime.now(UTC), by=by, to=PlanStatus.plan_covered)],
+            )
+            if report.get("notes"):
+                notes.append(str(report["notes"]))
+            return PlanResult(plan=plan, contracts=[], proposed=DiscoveryResult(unknowns=list(plan.unknowns)), problems=notes, covered=True)
         fatal.append("the plan has no contracts")
     for i, c in enumerate(raw):
         title = c.get("title") or f"contract #{i}"
@@ -104,15 +177,22 @@ def report_to_plan(
             if dep not in existing_plans:
                 notes.append(f"depends_on_plans names unknown plan {dep}")
 
+    mentioned = re.findall(r"P-\d{4}", " ".join([*(report.get("unknowns") or []), str(report.get("notes") or "")]))
+    for pid in dict.fromkeys(mentioned):
+        if pid in existing_plans and pid not in depends_on_plans and pid != plan_id:
+            notes.append(f"unknowns mention {pid}, which is not in depends_on_plans")
+
     start = int(next_contract_id(contracts_dir).split("-")[1])
     ids = [f"C-{start + i:04d}" for i in range(len(raw))]
     contracts: list[Contract] = []
+    all_interfaces: list[list[Interface]] = []
     for i, c in enumerate(raw):
         cid = ids[i]
         try:
             alloc = Allocation.model_validate(c["allocation"])
             acceptance = [Acceptance.model_validate(a) for a in c.get("acceptance", [])]
             given_budget = Budget.model_validate(c["budget"]) if c.get("budget") else None
+            interfaces = [Interface.model_validate(x) for x in c.get("interfaces", [])]
         except (ValidationError, KeyError) as e:
             raise PlanError([f"{cid} ({c.get('title', '?')}): {str(e).splitlines()[0]}"]) from e
         defaults = default_tiers(alloc)
@@ -146,16 +226,21 @@ def report_to_plan(
                 file_part = a.check.ref.split("::")[0]
                 if not any(matches(g, file_part) for g in scope):
                     notes.append(f"{cid}: acceptance {a.id} names {file_part}, outside the contract's paths; a BUILD worker could not write it")
+        all_interfaces.append(interfaces)
         contracts.append(Contract(
             id=cid, plan=plan_id, title=c["title"], status=ContractStatus.draft,
             depends_on=list(dict.fromkeys(ids[d] for d in c.get("depends_on", []))), paths=list(c["paths"]), incidental=list(c.get("incidental", [])),
-            acceptance=acceptance, checks=[known_checks[n] for n in c.get("checks", [])], allocation=alloc, budget=budget,
+            acceptance=acceptance, interfaces=interfaces, checks=[known_checks[n] for n in c.get("checks", [])], allocation=alloc, budget=budget,
         ))
+
+    notes.extend(_interface_notes(raw, ids, all_interfaces, repo_root, list(report.get("files_read") or [])))
 
     proposed = candidates_to_records(
         list(report.get("proposed_records") or []), list(report.get("unknowns") or []), records, repo_root, records_dir,
         cap_global=config.global_record_cap, by=by,
+        declared_paths=[p for c in contracts for p in c.paths],
     )
+    notes.extend(proposed.notes)
     graph = RecordGraph(records)
     bound_preview = {c.id: [r.id for r in select_records(c.paths, graph, repo_root)] for c in contracts}
     plan = Plan(
@@ -168,9 +253,53 @@ def report_to_plan(
     return PlanResult(plan=plan, contracts=contracts, proposed=proposed, problems=notes, bound_preview=bound_preview)
 
 
+def render_draft(result: PlanResult) -> str:
+    """The draft plan as YAML for the staff-engineer review: what the owner would see, and each contract in full."""
+    p = result.plan
+    data = {
+        "plan": p.model_dump(mode="json", include={
+            "id", "title", "request", "depends_on_plans", "unknowns", "files_read", "out_of_scope", "verification_approach"}),
+        "proposed_records": [r.model_dump(mode="json", include={"id", "kind", "statement", "rationale", "binds"})
+                             for r in result.proposed.proposed],
+        "bound_records": {cid: list(rids) for cid, rids in result.bound_preview.items()},
+        "corrections_and_warnings": list(result.problems),
+        "contracts": [c.model_dump(mode="json") for c in result.contracts],
+    }
+    return yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
+
+
+def format_finding(f: ReviewFinding) -> str:
+    return f"[{f.severity}] {f.contract}: {f.finding.strip().rstrip('.')}. Suggestion: {f.suggestion.strip()}"
+
+
+def render_review(review: PlanReview) -> list[str]:
+    head = f"Review: {review.verdict}"
+    if review.verdict == "unavailable":
+        head += " (the review session failed; this plan is unreviewed)"
+    elif review.revised:
+        head += " (the planner revised the plan once in response; findings refer to the first draft)"
+    lines = [head]
+    lines.extend(f"  - {format_finding(f)}" for f in review.findings)
+    if review.notes.strip():
+        lines.append(f"  notes: {review.notes.strip()}")
+    return lines
+
+
 def render_plan_review(result: PlanResult, tiers) -> str:
     p = result.plan
     lines = [f"Plan {p.id}: {p.title}", f"Request: {p.request}", ""]
+    if result.covered:
+        lines.append(f"{p.id} covered by {', '.join(p.covered_by)}; no contracts written")
+        lines.append("")
+        if p.unknowns:
+            lines.append("Open questions:")
+            lines.extend(f"  - {u}" for u in p.unknowns)
+            lines.append("")
+        if result.problems:
+            lines.append("Planner's note:")
+            lines.extend(f"  - {n}" for n in result.problems)
+            lines.append("")
+        return "\n".join(lines).rstrip()
     for c in result.contracts:
         a = c.allocation
         lines.append(f"{c.id}  {c.title}")
@@ -179,6 +308,9 @@ def render_plan_review(result: PlanResult, tiers) -> str:
         for acc in c.acceptance:
             how = acc.check.type + (f" {acc.check.ref}" if acc.check.ref else "")
             lines.append(f"  - {acc.id}: {acc.statement}  [{how}]")
+        if c.interfaces:
+            lines.append("  interfaces:")
+            lines += [f"    {itf.kind}: {itf.signature}" + (f"  ({itf.note})" if itf.note else "") for itf in c.interfaces]
         lines.append("  checks: " + (", ".join(ch.name for ch in c.checks) or "none"))
         lines.append(f"  complexity: {a.complexity}   risk: {a.risk}   uncertainty: {a.uncertainty}")
         lines.append(f"  reasoning: {a.reasoning.strip()}")
@@ -204,6 +336,9 @@ def render_plan_review(result: PlanResult, tiers) -> str:
     if p.unknowns:
         lines.append("Open questions:")
         lines.extend(f"  - {u}" for u in p.unknowns)
+        lines.append("")
+    if p.review is not None:
+        lines.extend(render_review(p.review))
         lines.append("")
     if result.problems:
         lines.append("Notes (corrections applied or warnings):")

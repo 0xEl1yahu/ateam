@@ -19,7 +19,7 @@ def test_report_schemas_are_strict():
     for spec in ROLE_SPECS.values():
         assert spec.report_schema["type"] == "object" and spec.report_schema["additionalProperties"] is False
     assert set(ROLE_SPECS[Role.build].report_schema["properties"]) == {"status", "commits", "files", "checks_run", "risks", "proposals", "notes"}
-    assert set(ROLE_SPECS[Role.test].report_schema["properties"]) == {"verdicts", "notes"}
+    assert set(ROLE_SPECS[Role.test].report_schema["properties"]) == {"verdicts", "notes", "requirements_unclear"}
     assert ROLE_SPECS[Role.test].report_schema["properties"]["verdicts"]["items"]["properties"]["verdict"]["enum"] == ["met", "not_met", "cannot_determine"]
 
 
@@ -45,3 +45,33 @@ def test_planner_schema_new_fields_required():
     from ateam.roles import PLANNER_SCHEMA
     for name in ("depends_on_plans", "files_read", "out_of_scope", "verification_approach"):
         assert name in PLANNER_SCHEMA["required"] and name in PLANNER_SCHEMA["properties"]
+
+
+def test_investigation_common_tells_workers_to_use_read_for_line_ranges():
+    from ateam.roles import INVESTIGATION_COMMON
+    assert "Read tool with offset and limit" in INVESTIGATION_COMMON
+
+
+def test_test_schema_requires_requirements_unclear():
+    from ateam.roles import TEST_SCHEMA
+    assert "requirements_unclear" in TEST_SCHEMA["required"]
+    assert TEST_SCHEMA["properties"]["requirements_unclear"] == {"type": "boolean"}
+
+
+def test_test_prompt_explains_the_flag():
+    assert "requirements_unclear" in ROLE_SPECS[Role.test].system_prompt
+
+
+def test_review_schema_and_spec_shape():
+    from ateam.roles import INVESTIGATION_COMMON, REVIEW_SCHEMA, REVIEWER_SPEC
+    assert REVIEW_SCHEMA["type"] == "object" and REVIEW_SCHEMA["additionalProperties"] is False
+    assert set(REVIEW_SCHEMA["required"]) == set(REVIEW_SCHEMA["properties"]) == {"verdict", "findings", "notes"}
+    assert REVIEW_SCHEMA["properties"]["verdict"]["enum"] == ["defensible", "needs_revision"]
+    item = REVIEW_SCHEMA["properties"]["findings"]["items"]
+    assert item["additionalProperties"] is False
+    assert set(item["required"]) == set(item["properties"]) == {"contract", "severity", "finding", "suggestion"}
+    assert item["properties"]["severity"]["enum"] == ["blocking", "important", "minor"]
+    assert REVIEWER_SPEC.role == Role.investigate and REVIEWER_SPEC.tools == ["Read", "Glob", "Grep", "Bash"]
+    assert REVIEWER_SPEC.report_schema is REVIEW_SCHEMA
+    assert "staff engineer" in REVIEWER_SPEC.system_prompt and INVESTIGATION_COMMON in REVIEWER_SPEC.system_prompt
+    assert "never rewrite the plan" in REVIEWER_SPEC.system_prompt.lower()

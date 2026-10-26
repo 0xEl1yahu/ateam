@@ -79,14 +79,18 @@ Expected: each proposed record printed in full with any overlapping approved rec
 ```bash
 ateam plan "Add a health() function to src/api/routes.py that returns the string ok, with a unit test" --tier light
 ```
-Expected: the planner runs read-only in this checkout and prints the review: `Plan P-0001: ...`, then one contract block (`C-0001`) with paths that include `src/api/**` and `tests/**`, acceptance criteria with a `test` check naming `tests/test_routes.py::...`, the `unit` check, `complexity: low   risk: low   uncertainty: low` with the planner's reasoning, the tiers with model names, and `bound records: R-0001`. Then open questions and notes, and the two commands `Approve: ateam approve P-0001 ...` and `Reject: ...`. The plan, the draft contract and any proposed records are committed in the intent repo as `ateam: propose plan P-0001`; `ateam status` shows `P-0001  plan_proposed  1 contract(s)`.
+Without `--tier` the default is `careful`. A plan costs up to three sessions (plan, review, one revision if the review finds a blocking problem); the `session ...` lines at the end and a `total cost:` line show each. `--tier standard` or `--tier light`, or `--no-review`, reduces it.
+
+Expected: the planner runs read-only in this checkout, a second read-only session reviews the draft, and the command prints the plan: `Plan P-0001: ...`, then one contract block (`C-0001`) with paths that include `src/api/**` and `tests/**`, acceptance criteria with a `test` check naming `tests/test_routes.py::...`, the `unit` check, `complexity: low   risk: low   uncertainty: low` with the planner's reasoning, the tiers with model names, and `bound records: R-0001`. Then open questions, and a review block: `Review: defensible` (or `needs_revision`, with one `[blocking|important|minor] C-0001: ... Suggestion: ...` line per finding and a note that the planner revised the plan once), then notes, and the two commands `Approve: ateam approve P-0001 ...` and `Reject: ...`. The plan, the draft contract and any proposed records are committed in the intent repo as `ateam: propose plan P-0001`; `ateam status` shows `P-0001  plan_proposed  1 contract(s)`; `ateam plans show P-0001` prints the review again.
+
+Two outcomes besides a proposed plan. If a live plan already covers the request, you get `P-0001 covered by P-000X; no contracts written` and the plan is `plan_covered`. If you re-plan with `ateam plan "..." --replaces P-0001`, the old plan is left out of the new planner's index and `ateam approve` of the new plan prints `P-0001 -> superseded` after it.
 
 If the planner's output is unusable (a dependency cycle, a check that isn't configured), the command prints the problems, writes no contracts, records the plan as `plan_rejected` so `ateam plans list` shows what happened, and you re-run it; the next attempt gets the next id.
 
 ```bash
 ateam approve P-0001
 ```
-Expected: if the plan proposed records, the same review prompts first. Then `Frozen contracts, in dependency order:` with `C-0001  ready  build=light test=light investigate=none  records: R-0001`, any notes (a TEST tier raised to the BUILD tier is printed, never silent), and `P-0001 -> plan_approved`. From here the contract is binding.
+Expected: if the plan proposed records, the same review prompts first. Then `Frozen contracts, in dependency order:` with `C-0001  ready  build=light test=light investigate=none  records: R-0001`, any notes (a TEST tier raised to the BUILD tier is printed, never silent), and `P-0001 -> plan_approved`. If the plan used `--replaces`, the replaced plan then prints `P-0001 -> superseded`. From here the contract is binding.
 
 ## 3. Check what the worker will see
 
@@ -113,12 +117,12 @@ git -C ../ateam-playground-C-0001 log --oneline main..          # the worker's c
 git -C ../ateam-playground-C-0001 diff main                     # exactly what changed
 cat "$(dirname "$I")/scratch/C-0001/handoff.yaml"               # the worker's notes for a replacement (under ATeam home, not the worktree)
 ateam status                                                    # C-0001 ready, last attempt: build completed
-ateam brief C-0001 --role build                                 # now has prior work and the notes section
+ateam brief C-0001 --role build                                 # has prior work and the notes section
 ```
 
 Nothing of ATeam's is in the worktree or the target: `git status` in both is clean after the worker's commit.
 
-Running the same contract again in the same worktree is a second attempt: the brief now carries the verified prior work and the previous worker's notes, and the worker typically confirms the work rather than redoing it. `--base` defaults to the merge-base with the target branch, so reruns compare against the whole branch; pass `--base <ref>` to narrow it.
+Running the same contract again in the same worktree is a second attempt: the brief carries the verified prior work and the previous worker's notes, and the worker typically confirms the work rather than redoing it. `--base` defaults to the merge-base with the target branch, so reruns compare against the whole branch; pass `--base <ref>` to narrow it.
 
 ## 5. Try to break it
 
@@ -142,7 +146,7 @@ The same steps apply. Three cautions:
 
 1. Approvals and freezes commit in the intent repo, never in your checkout. Push it to a private remote (`ateam intent init --remote URL` or `ateam intent remote URL`, then `ateam intent push`) if you work from more than one machine; the other machine runs `ateam intent init --remote URL` once (before any plain `init`) and `ateam intent pull` after that. If the two machines diverge, `pull` refuses with git's non-fast-forward message; resolve it with git inside `$(ateam intent path)` and retry. If you add or change the target's `origin`, its id changes: `ateam doctor` warns and `ateam intent init --adopt` moves the existing intent repo to the new id.
 2. Contract `paths` are the only files a worker may change; list test files too, or the worker cannot write the test the contract asks for.
-3. Deterministic checks run in the worktree, which starts without any virtualenv. Either reference a check that needs only `python3` (`python3 -m unittest discover -s tests -t .`), or describe the setup in the contract's prompt for now; `config.setup` is honoured by the pass-two scheduler, not by `worker run`.
+3. Deterministic checks run in the worktree, which starts without any virtualenv. Either reference a check that needs only `python3` (`python3 -m unittest discover -s tests -t .`), or list the setup commands in `config.setup` (for example `.venv/bin/pip install -e '.[dev]'`). `ateam worker run` runs them once per worktree before the first attempt and stops if one fails.
 
 Telemetry for calibration lives in `~/.ateam/<repo-id>/state.db`, next to the intent repo and the scratch directories; `ateam status` shows the latest attempt per contract, and the `attempts` table holds tokens, cost, turns and wall time per run.
 

@@ -51,6 +51,10 @@ def _task(contract: Contract, scratch_dir: Path | None) -> str:
     for a in contract.acceptance:
         how = f"{a.check.type}" + (f" {a.check.ref}" if a.check.ref else "")
         lines.append(f"- {a.id}: {a.statement}  [{how}]")
+    if contract.interfaces:
+        lines.append("")
+        lines.append("Interfaces (follow these exactly; other contracts depend on them):")
+        lines += [f"- {i.kind}: {_one_line(i.signature)}" + (f"  ({_one_line(i.note)})" if i.note else "") for i in contract.interfaces]
     if contract.checks:
         lines.append("")
         lines.append("Deterministic checks:")
@@ -101,6 +105,12 @@ DOC_CAP = 12_000
 DEFAULT_MAX_CANDIDATES = 12
 
 
+RULES_SCOPE_NOTE = (
+    "These are the target's instructions for whoever develops it. They govern how work on the target is done; "
+    "they are not requirements of the Request."
+)
+
+
 def _rules(target_root: Path, config: TargetConfig) -> str:
     parts: list[str] = []
     missing: list[str] = []
@@ -127,7 +137,7 @@ def _rules(target_root: Path, config: TargetConfig) -> str:
     if not parts:
         parts.append("No rules files found (CLAUDE.md, AGENTS.md, config brief_docs).")
     parts.extend(f"missing: {rel}" for rel in missing)
-    return "\n\n".join(parts)
+    return RULES_SCOPE_NOTE + "\n\n" + "\n\n".join(parts)
 
 
 def _one_line(text: str) -> str:
@@ -141,22 +151,57 @@ def _record_lines(records: dict[str, Record], status: str) -> str:
     return "\n".join(f"- {r.id} {r.kind} [{', '.join(r.binds.paths) or 'global'}] {_one_line(r.statement)}" for r in rs)
 
 
-def _plans(plans: dict[str, Plan], contracts: dict[str, Contract]) -> str:
-    if not plans:
+PLAN_INDEX_CAP = 2500
+
+
+def _plan_block(p: Plan, contracts: dict[str, Contract]) -> str:
+    lines = [f"{p.id} {p.status}  {_one_line(p.title)}"]
+    if p.unknowns:
+        lines.append("  unknowns:")
+        lines += [f"    - {_one_line(u)}" for u in p.unknowns]
+    if p.verification_approach.strip():
+        lines.append("  verification: " + _one_line(p.verification_approach)[:80])
+    for cid in p.contracts:
+        c = contracts.get(cid)
+        if c is None:
+            continue
+        lines.append(f"  {c.id} {c.status}  {_one_line(c.title)}")
+        lines.append(f"    paths: {', '.join(c.paths)}")
+        lines += [f"    {a.id}: {_one_line(a.statement)}" for a in c.acceptance]
+        lines += [f"    {i.kind}: {_one_line(i.signature)}" for i in c.interfaces]
+    text = "\n".join(lines)
+    if len(text) > PLAN_INDEX_CAP:
+        text = text[:PLAN_INDEX_CAP] + f"\n[truncated at {PLAN_INDEX_CAP} characters]"
+    return text
+
+
+def _plans(plans: dict[str, Plan], contracts: dict[str, Contract], exclude: set[str] = frozenset()) -> str:
+    shown = sorted((p for p in plans.values() if p.id not in exclude), key=lambda p: p.id)
+    if not shown:
         return "none"
-    lines: list[str] = []
-    for p in sorted(plans.values(), key=lambda p: p.id):
-        lines.append(f"{p.id} {p.status}  {_one_line(p.title)}")
-        for cid in p.contracts:
-            c = contracts.get(cid)
-            if c is not None:
-                lines.append(f"  {c.id} {c.status}  {_one_line(c.title)}  [{', '.join(c.paths)}]")
-    return "\n".join(lines)
+    return "\n".join(_plan_block(p, contracts) for p in shown)
 
 
 def _demote_headings(text: str, levels: int = 2) -> str:
     """Push a document's own headings down so they cannot be read as top-level brief sections."""
     return "\n".join("#" * levels + line if line.startswith("#") else line for line in text.splitlines())
+
+
+def _context_sections(
+    target_root: Path, config: TargetConfig, records: dict[str, Record], plans: dict[str, Plan],
+    contracts: dict[str, Contract], exclude_plans: set[str],
+) -> list[tuple[str, str]]:
+    return [
+        ("Rules", _rules(target_root, config)),
+        (
+            "Records",
+            "Approved (binding; do not re-propose):\n"
+            + _record_lines(records, "approved")
+            + "\n\nProposed, not yet approved (not binding; do not re-propose):\n"
+            + _record_lines(records, "proposed"),
+        ),
+        ("Existing plans and contracts", _plans(plans, contracts, exclude_plans)),
+    ]
 
 
 def assemble_investigation_brief(
@@ -170,19 +215,10 @@ def assemble_investigation_brief(
     scratch_dir: Path,
     request: str | None = None,
     max_candidates: int | None = None,
+    exclude_plans: set[str] = frozenset(),
 ) -> str:
     """The brief an INVESTIGATE session starts with: the target's rules, records, plan index, checks and handoff path."""
-    sections = [
-        ("Rules", _rules(target_root, config)),
-        (
-            "Records",
-            "Approved (binding; do not re-propose):\n"
-            + _record_lines(records, "approved")
-            + "\n\nProposed, not yet approved (not binding; do not re-propose):\n"
-            + _record_lines(records, "proposed"),
-        ),
-        ("Existing plans and contracts", _plans(plans, contracts)),
-    ]
+    sections = _context_sections(target_root, config, records, plans, contracts, exclude_plans)
     if kind == "planning":
         sections.append(("Request", _demote_headings((request or "").strip())))
     else:
@@ -191,6 +227,30 @@ def assemble_investigation_brief(
     sections += [
         ("Checks", "\n".join(f"{c.name}: {c.cmd}" for c in config.checks) or "none configured"),
         ("Tiers", "light, standard, careful; investigate may also be none."),
+        ("Rubric", _demote_headings(rubric_text().strip())),
+        ("Handoff file", str(scratch_dir / "handoff.yaml")),
+    ]
+    return "\n\n".join(f"## {h}\n{body}" for h, body in sections) + "\n"
+
+
+def assemble_review_brief(
+    *,
+    target_root: Path,
+    config: TargetConfig,
+    records: dict[str, Record],
+    plans: dict[str, Plan],
+    contracts: dict[str, Contract],
+    scratch_dir: Path,
+    request: str,
+    draft: str,
+    exclude_plans: set[str] = frozenset(),
+) -> str:
+    """The brief for the staff-engineer review: the planner's context, the draft plan, and no Tiers section."""
+    sections = _context_sections(target_root, config, records, plans, contracts, exclude_plans)
+    sections += [
+        ("Request", _demote_headings(request.strip())),
+        ("Draft plan", _demote_headings(draft.strip())),
+        ("Checks", "\n".join(f"{c.name}: {c.cmd}" for c in config.checks) or "none configured"),
         ("Rubric", _demote_headings(rubric_text().strip())),
         ("Handoff file", str(scratch_dir / "handoff.yaml")),
     ]

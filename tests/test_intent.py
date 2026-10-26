@@ -4,7 +4,7 @@ import pytest
 
 from ateam.config import load_config
 from ateam.gitops import GitRepo
-from ateam.intent import IntentError, commit_intent, init_intent, intent_git, pull, push, set_remote
+from ateam.intent import IntentError, commit_intent, commit_intent_files, init_intent, intent_git, pull, push, set_remote
 from ateam.paths import TargetPaths
 
 
@@ -76,3 +76,15 @@ def test_remote_and_push_pull_against_bare(paths, tmp_path):
     assert (paths2.records / "R-0001-x.yaml").is_file()
     set_remote(paths2, str(bare))
     assert "Already up to date" in pull(paths2) or pull(paths2) is not None
+
+
+def test_commit_intent_files_stages_only_the_named_files(paths):
+    init_intent(paths)
+    mine = paths.records / "R-0001-x.yaml"; mine.write_text("id: R-0001\n")
+    (paths.records / "R-0099-planted.yaml").write_text("id: R-0099\n")
+    sha = commit_intent_files(paths, "ateam: approve R-0001", [mine])
+    git = intent_git(paths)
+    assert len(sha) == 40 and git.run("show", "--name-only", "--format=", "HEAD").split() == ["records/R-0001-x.yaml"]
+    assert "?? records/R-0099-planted.yaml" in git.run("status", "--porcelain", "--untracked-files=all").splitlines()
+    with pytest.raises(IntentError, match="nothing to commit"):
+        commit_intent_files(paths, "ateam: again", [mine])

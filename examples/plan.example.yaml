@@ -3,17 +3,28 @@
 id: P-0001
 title: Expose reading state through the books API
 request: "Let the API return and update each book's reading state"
-status: plan_proposed            # requested | investigating | plan_proposed | plan_approved | plan_rejected | executing | paused | integrating | merge_proposed | merged | abandoned
+status: plan_proposed            # requested | investigating | plan_proposed | plan_approved | plan_rejected | executing | paused | integrating | merge_proposed | merged | abandoned | plan_covered | superseded
 contracts: ["C-0001", "C-0002"]  # draft until the plan is approved, then frozen in dependency order
 proposed_records: ["R-0004"]     # records the planner proposed; reviewed at approval, never approved by code
 unknowns:
   - "Should PATCH accept re-reading when the book was never read?"
 depends_on_plans: []             # other plans that must be merged first
+covered_by: []                   # plans that already cover this request; non-empty means status plan_covered and no contracts
+replaces: null                   # a plan_proposed plan this one replaces (ateam plan --replaces); approving this plan marks that one superseded
 files_read:                      # files the planner read while investigating
   - "src/api/books.py"
 out_of_scope:                    # what this plan deliberately leaves alone
   - "Changing the books database schema"
 verification_approach: "Run the unit suite; call PATCH on a scratch book and read it back."
 tier_overrides: {}               # filled by `ateam approve --tier C-0002=careful` or `--tier C-0002:test=careful`
+review:                          # the staff-engineer review of the draft; `ateam plan --no-review` omits it, `ateam plans show` prints it
+  verdict: needs_revision        # defensible | needs_revision | unavailable (the review session failed; the plan is unreviewed)
+  findings:
+    - contract: C-0002
+      severity: blocking         # blocking | important | minor; blocking findings earn one revision round
+      finding: "C-0002 consumes set_reading_state, but no earlier contract produces it."
+      suggestion: "Make C-0002 depend on C-0001 and name the signature it consumes."
+  revised: true                  # the planner revised the plan once in response; findings refer to the first draft
+  notes: "The revision added the dependency."
 history:
   - {at: 2026-10-25T12:00:00Z, by: ateam-plan, to: plan_proposed}

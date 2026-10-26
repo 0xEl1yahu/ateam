@@ -27,7 +27,7 @@ def test_discovery_and_planner_specs_are_investigate_and_strict():
     assert set(PLANNER_SCHEMA["properties"]) == {"title", "contracts", "proposed_records", "unknowns", "notes",
                                                          "depends_on_plans", "files_read", "out_of_scope", "verification_approach"}
     c = PLANNER_SCHEMA["properties"]["contracts"]["items"]["properties"]
-    assert set(c) == {"title", "paths", "incidental", "depends_on", "acceptance", "checks", "allocation", "budget"}
+    assert set(c) == {"title", "paths", "incidental", "depends_on", "acceptance", "checks", "allocation", "budget", "interfaces"}
     assert c["depends_on"]["items"]["type"] == "integer"
 
 
@@ -98,3 +98,19 @@ async def test_run_investigation_closes_attempt_on_exception(monkeypatch, inv_en
         await _run(inv_env)
     rows = inv_env["db"].telemetry_rows()
     assert rows and rows[-1]["outcome"] == "failed" and rows[-1]["failure_class"] == "environment"
+
+
+@pytest.mark.asyncio
+async def test_run_investigation_passes_resume_and_starts_its_own_attempt(monkeypatch, inv_env):
+    seen = []
+
+    async def fake_query(prompt, options):
+        seen.append(options.resume)
+        yield _result({"candidates": [], "unknowns": [], "notes": "n"})
+
+    monkeypatch.setattr("ateam.runner.run.query", fake_query)
+    first = await _run(inv_env, name="P-0001")
+    second = await run_investigation(paths=inv_env["paths"], config=inv_env["config"], target_git=inv_env["target_git"], name="P-0001",
+                                     spec=DISCOVERY_SPEC, prompt="again", brief_text="BRIEF", tier=inv_env["tier"], db=inv_env["db"],
+                                     resume="s1")
+    assert seen == [None, "s1"] and second.attempt_id != first.attempt_id

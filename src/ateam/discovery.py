@@ -13,7 +13,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from ateam.globs import expand, is_valid_pattern
+from ateam.globs import expand, is_valid_pattern, matches
 from ateam.records.model import (
     DOCUMENTED_EVIDENCE, Basis, Binds, Evidence, HistoryEntry, Origin, Record, Status, compute_fingerprint,
 )
@@ -28,12 +28,13 @@ class DiscoveryResult:
     dropped: list[tuple[dict, str]] = field(default_factory=list)
     skipped_rejected: list[str] = field(default_factory=list)
     unknowns: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
     capped: int = 0
 
 
 def candidates_to_records(
     candidates: list[dict], unknowns: list[str], existing: dict[str, Record], repo_root: Path, records_dir: Path,
-    cap_global: int, by: str = "ateam-init",
+    cap_global: int, by: str = "ateam-init", declared_paths: list[str] | tuple[str, ...] = (),
 ) -> DiscoveryResult:
     result = DiscoveryResult(unknowns=list(unknowns))
     known = {r.fingerprint: r for r in existing.values()}
@@ -67,11 +68,16 @@ def candidates_to_records(
 
         paths = list(cand.get("paths") or [])
         dead = [g for g in paths if not is_valid_pattern(g) or not expand([g], repo_root)]
-        if dead:
-            result.dropped.append((cand, f"dead glob {dead[0]!r}: matches no file in the target"))
+        pending = [g for g in dead if is_valid_pattern(g) and any(g == d or matches(g, d) for d in declared_paths)]
+        if len(pending) < len(dead):
+            gone = next(g for g in dead if g not in pending)
+            result.dropped.append((cand, f"dead glob {gone!r}: matches no file in the target"))
             continue
 
         rationale = cand.get("rationale") or None
+        if pending:
+            rationale = f"{rationale or ''} (pending: path declared by this plan)".strip()
+            result.notes.append(f"pending: kept a record bound to {', '.join(pending)}: the path does not exist yet but a contract in this plan declares it")
         if origin == Origin.documented and not any(e.type in DOCUMENTED_EVIDENCE for e in evidence):
             origin = Origin.inferred
             rationale = f"{rationale or ''} (downgraded: no documentary evidence)".strip()

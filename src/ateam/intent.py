@@ -7,6 +7,8 @@ The target repository never contains any of this.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from ateam.config import TargetConfig, save_config
 from ateam.gitops import GitError, GitRepo
 from ateam.paths import TargetPaths, record_target
@@ -104,6 +106,25 @@ def commit_intent(paths: TargetPaths, message: str, subpaths: list[str]) -> str:
         if "nothing to commit" in str(e):
             raise IntentError(f"nothing to commit under {subpaths} in {paths.intent}") from e
         raise
+
+
+def intent_relpath(paths: TargetPaths, file: Path | str) -> str:
+    """A path relative to the intent repo root, as git expects it."""
+    f = Path(file)
+    return f.resolve().relative_to(paths.intent.resolve()).as_posix() if f.is_absolute() else f.as_posix()
+
+
+def commit_intent_files(paths: TargetPaths, message: str, files: list[Path | str]) -> str:
+    """Stage and commit exactly `files` (absolute, or relative to the intent repo); nothing else in the repo rides along."""
+    git = intent_git(paths)
+    rel = list(dict.fromkeys(intent_relpath(paths, f) for f in files))
+    if not rel:
+        raise IntentError(f"nothing to commit in {paths.intent}: no files named")
+    git.run("add", "--", *rel)
+    if not git.run("diff", "--cached", "--name-only", "--", *rel).strip():
+        raise IntentError(f"nothing to commit for {', '.join(rel)} in {paths.intent}")
+    git.run("commit", "-q", "-m", message, "--only", "--", *rel)
+    return git.head()
 
 
 def _ensure_identity(git: GitRepo) -> None:

@@ -172,3 +172,138 @@ async def test_attempt_fails_as_tamper_when_intent_repo_changes_during_run(monke
     )
     row = db.telemetry_rows()[-1]
     assert row["outcome"] == "tamper" and row["failure_class"] == "tamper"
+
+
+# ---- setup runs once per worktree
+
+def _setup_db(tmp_path):
+    from ateam.state.db import StateDB
+
+    db = StateDB(tmp_path / "setup-state.db")
+    db.init_schema()
+    return db
+
+
+def test_ensure_setup_runs_commands_once_per_worktree(target_repo, ateam_home, tmp_path):
+    from ateam.config import TargetConfig
+    from ateam.runner.run import ensure_setup, setup_key
+
+    db = _setup_db(tmp_path)
+    cfg = TargetConfig(setup=["touch setup-ran", "echo second"], env={"ATEAM_X": "1"})
+    ran = ensure_setup(target_repo, cfg, db)
+    assert ran == cfg.setup and (target_repo / "setup-ran").exists()
+    assert db.get_meta(setup_key(target_repo))
+    (target_repo / "setup-ran").unlink()
+    assert ensure_setup(target_repo, cfg, db) == [] and not (target_repo / "setup-ran").exists()
+
+
+def test_ensure_setup_passes_config_env(target_repo, ateam_home, tmp_path):
+    from ateam.config import TargetConfig
+    from ateam.runner.run import ensure_setup, setup_key
+
+    cfg = TargetConfig(setup=["echo $ATEAM_X > env-out"], env={"ATEAM_X": "seen"})
+    ensure_setup(target_repo, cfg, _setup_db(tmp_path))
+    assert (target_repo / "env-out").read_text().strip() == "seen"
+
+
+def test_ensure_setup_with_no_commands_records_nothing(target_repo, ateam_home, tmp_path):
+    from ateam.config import TargetConfig
+    from ateam.runner.run import ensure_setup, setup_key
+
+    db = _setup_db(tmp_path)
+    assert ensure_setup(target_repo, TargetConfig(), db) == []
+    assert db.get_meta(setup_key(target_repo)) is None
+
+
+def test_ensure_setup_failure_records_nothing(target_repo, ateam_home, tmp_path):
+    from ateam.config import TargetConfig
+    from ateam.runner.run import SetupError, ensure_setup, setup_key
+
+    db = _setup_db(tmp_path)
+    cfg = TargetConfig(setup=["echo before", "echo boom >&2; exit 3", "echo never"])
+    with pytest.raises(SetupError) as e:
+        ensure_setup(target_repo, cfg, db)
+    assert e.value.cmd == "echo boom >&2; exit 3" and e.value.returncode == 3 and "boom" in e.value.output
+    assert db.get_meta(setup_key(target_repo)) is None
+
+
+@pytest.mark.parametrize("verdicts,flag,expected", [
+    ([("A1", "met")], False, ("completed", None)),
+    ([("A1", "not_met")], False, ("failed", "implementation")),
+    ([("A1", "not_met")], True, ("failed", "requirements")),
+    ([("A1", "cannot_determine")], True, ("completed", None)),
+    ([("A1", "met")], True, ("completed", None)),
+])
+def test_classify_test_report(verdicts, flag, expected):
+    from ateam.runner.run import classify_test_report
+
+    report = {"verdicts": [{"id": i, "verdict": v, "evidence": "e"} for i, v in verdicts], "notes": "", "requirements_unclear": flag}
+    assert classify_test_report(report) == expected
+
+
+@pytest.mark.asyncio
+async def test_test_attempt_records_classification(monkeypatch, target_repo, sample_contract, records_three, ateam_home):
+    from ateam.config import TargetConfig
+    from ateam.contracts.select import freeze
+    from ateam.gitops import GitRepo
+    from ateam.paths import TargetPaths, home_dir
+    from ateam.roles import Role
+    from ateam.runner import run as run_mod
+    from ateam.state.db import StateDB
+    from ateam.tiers import load_tiers
+
+    report = {"verdicts": [{"id": "A1", "verdict": "not_met", "evidence": "x"}], "notes": "A1 is ambiguous", "requirements_unclear": True}
+
+    async def fake_query(prompt, options):
+        yield _result(structured_output=report)
+
+    monkeypatch.setattr("ateam.runner.run.query", fake_query)
+    db = StateDB(home_dir(target_repo) / "state.db"); db.init_schema()
+    contract = freeze(sample_contract, [records_three["R-0001"]])
+    db.upsert_contract(contract.id, contract.plan, contract.status, contract.content_hash())
+    git = GitRepo(target_repo)
+    await run_mod.run_contract_attempt(
+        paths=TargetPaths.from_root(target_repo), config=TargetConfig(), git_worktree=git, worktree=target_repo, base=git.head(),
+        contract=contract, records=records_three, role=Role.test, tiers=load_tiers(), db=db,
+    )
+    row = db.telemetry_rows()[-1]
+    assert row["outcome"] == "failed" and row["failure_class"] == "requirements"
+
+
+# Items 9 and 19: the setup marker follows the worktree, not only its path.
+def test_ensure_setup_runs_again_for_a_worktree_recreated_at_the_same_path(target_repo, ateam_home, tmp_path):
+    from ateam.config import TargetConfig
+    from ateam.gitops import GitRepo
+    from ateam.runner.run import ensure_setup, setup_key
+
+    db = _setup_db(tmp_path)
+    cfg = TargetConfig(setup=["touch setup-ran"])
+    wt = tmp_path / "wt-again"
+    g = GitRepo(target_repo)
+    g.worktree_add(wt, "wt-again", "main")
+    first = setup_key(wt)
+    assert ensure_setup(wt, cfg, db) == cfg.setup
+    assert ensure_setup(wt, cfg, db) == []
+    g.run("worktree", "remove", "--force", str(wt))
+    g.run("branch", "-D", "wt-again")
+    g.worktree_add(wt, "wt-again", "main")
+    assert setup_key(wt) != first and not (wt / "setup-ran").exists()
+    assert ensure_setup(wt, cfg, db) == cfg.setup and (wt / "setup-ran").exists()
+
+
+# Item 20: a setup command that hangs is a SetupError, not a hung run.
+def test_ensure_setup_times_out(target_repo, ateam_home, tmp_path, monkeypatch):
+    import ateam.runner.run as run_mod
+    from ateam.config import TargetConfig
+
+    monkeypatch.setattr(run_mod, "SETUP_TIMEOUT_S", 0.5)
+    db = _setup_db(tmp_path)
+    with pytest.raises(run_mod.SetupError) as e:
+        run_mod.ensure_setup(target_repo, TargetConfig(setup=["sleep 5"]), db)
+    assert e.value.cmd == "sleep 5" and "timed out after 0.5 s" in e.value.output
+    assert db.get_meta(run_mod.setup_key(target_repo)) is None
+
+
+def test_setup_timeout_is_ten_minutes():
+    from ateam.runner.run import SETUP_TIMEOUT_S
+    assert SETUP_TIMEOUT_S == 600

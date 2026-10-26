@@ -92,6 +92,21 @@ Three failure classes, each with its own mechanism:
 - **Durable intent lives in a private intent repo, not in the target.** (Owner, 2026-10-25.) Target repos are often public; records and contracts are private engineering notes. The target carries nothing of ATeam's: no `.ateam/` directory, no ignore lines, no scratch files. Records, contracts, plans, reports and `config.yaml` live in their own git repository under ATeam's home, `~/.ateam/<repo-id>/intent/`, created by `ateam intent init`, optionally pushed to a private remote so another machine gets the same intent by pulling it. Approval commits land in the intent repo. The target branch is still where integration happens; the target itself carries no ATeam files. See "Intent repo" below. This supersedes the earlier "Two homes for truth" wording that placed `.ateam/` inside the target, and the "Target repo layout" section.
 - **Workers never run `rm`.** Deletion is an integration-time action. A tracked file a worker must remove goes through `git rm`, so the deletion is in the reviewed diff. (Owner, 2026-10-25.)
 - **Approval commits land on the target branch in the owner's checkout.** `ateam approve`, `ateam reject` and `ateam supersede` stage only `.ateam/` paths and commit on the configured target branch. They refuse to act if the checkout is on another branch or `.ateam/` already has uncommitted changes.
+- **Investigations default to the careful tier.** `ateam init` and `ateam plan` run at `careful` unless `--tier` says otherwise; depth of reading is worth more than the dollar at planning time. (Owner, 2026-10-25.)
+- **INVESTIGATE may `cd` inside the worktree.** The target must resolve to an existing directory under the worktree (the owner's checkout for in-place investigations); anything else, including `cd` alone and `cd -`, is denied. (Owner, 2026-10-25.) Extended on 2026-10-26 to BUILD and TEST, to absolute paths only, and to the worker's scratch directory: see the 2026-10-26 bullets below.
+- **Plan, review, hand back.** Every `ateam plan` runs the planner, then a staff-engineer review of the draft by a fresh INVESTIGATE session; blocking findings earn the planner one revision round; the review travels with the plan to the owner. `--no-review` skips it. (Owner, 2026-10-25.)
+- **Records for files that do not exist yet** are accepted when a contract in the same plan declares the path; they stay proposed like any other record. (Owner, 2026-10-25.)
+- **Setup runs once per worktree.** `config.setup` commands run in a worktree before its first attempt, never again for that worktree; a failing setup stops the run. (Owner, 2026-10-25.)
+- **Failure classification** is the planner's rule (a failed `test`/`command` criterion is `implementation`) plus a `requirements_unclear` flag the TEST worker may raise, which classifies the attempt `requirements`. (Owner, 2026-10-25.)
+- **`ateam contracts refresh` stops on drift**: it leaves the draft in place and reports; it never rewrites a drifted contract. (Constrains a future feature; implemented with it.) (Owner, 2026-10-25.)
+- **Rebuild derives only from the intent repo.** Doctor's rebuild recreates state that the intent repo determines and nothing else. (Constrains a future feature; implemented with it.) (Owner, 2026-10-25.)
+- **Merge is fast-forward only by default, in the owner's checkout.** (Constrains a future feature; implemented with it.) (Owner, 2026-10-25.)
+- **Worker reads are confined to the worktree and the worker's scratch directory** (decoded path arguments, the Read/Glob/Grep tools, recursive searches of an ancestor directory). (Owner, 2026-10-26.) Decided, not yet implemented: it is a feature with false-positive risk and gets its own plan; today only ATeam's home is protected from reads.
+- **A request already covered by an existing plan is a `plan_covered` outcome, not a rejection.** `ateam plan --replaces P-xxxx` hides that plan from the planner and marks it `superseded` when the new plan is approved. (Owner, 2026-10-25.)
+- **BUILD and TEST `cd` only to an absolute path inside the worktree**, like INVESTIGATE, so the home check can resolve relative paths from every directory a worker enters. A relative `cd`, `cd` alone, `cd -` and any target outside the worktree are denied for every role with one reason: "workers may cd only to an absolute path inside the worktree or its scratch directory". (Owner, 2026-10-26.) The worker's scratch directory, the one writable place outside the worktree, is also a `cd` target for every role, by absolute path (controller ruling, 2026-10-26).
+- **Three INVESTIGATE allow rows from the lexer round stand**: an escaped `"\$(x)"`, an escaped `` "\`" `` inside double quotes, and a `$(...)` inside a comment are text, not substitutions. (Owner, 2026-10-26.)
+- **Workers run under `/bin/bash`.** The policy's shell model is bash 3.2 to 5.3: the lexer reads every command both as bash 3.2-5.2 and as 5.3 and checks the commands found under either reading; the worker environment sets `SHELL` and `CLAUDE_CODE_SHELL` to `/bin/bash` so the Bash tool does not run the login shell (zsh on macOS). (Owner, 2026-10-26.)
+- **`c=rm; $c x` and `$(echo rm) x` stay BUILD residuals**, backed by the post-run tree check: the command word is made at run time, which no pre-run lexer can see. They are pinned as strict expected failures in the policy tests. (Owner, 2026-10-26.)
 
 ## Calls made by the assistant (owner to check)
 
@@ -291,7 +306,11 @@ requested -> investigating -> plan_proposed -> plan_approved -> executing
 executing -> integrating -> merge_proposed -> merged
 executing -> paused(reason) -> executing | abandoned
 plan_proposed -> plan_rejected
+investigating -> plan_covered
+plan_proposed -> superseded
 ```
+
+`plan_covered` and `superseded` are terminal. `plan_covered`: the planner returned no contracts and named the plans that already cover the request. `superseded`: a later plan was approved with `--replaces` naming this one.
 
 Pause reasons are an enum: `decision_change_needed`, `scope_exceeded`, `budget_exhausted`, `verification_unresolvable`, `sensitive_action`, `environment_failure`, `records_drifted`.
 
@@ -304,8 +323,8 @@ Every transition is a row in SQLite with timestamp, actor and reason. `ateam sta
 | Role | May | May not | Ends with |
 |---|---|---|---|
 | INVESTIGATE | read, search, run read-only commands from a strict allow-list (git log/show/diff/blame/status/ls-files/grep/branch --list, ls, cat, head, tail, wc, grep, rg, find, tree, du, stat, file, pwd, sort, uniq, cut; no interpreters, no sed, no awk) | edit, write, run anything that can write, run tests | findings report with evidence and proposed records |
-| BUILD | read, edit, write, run checks, commit in its worktree | edit `.ateam/**` or `.claude/**`, touch files outside `paths` plus `incidental`, push, merge, run `rm` in any form (tracked files go through `git rm`; cleanup is an integration step) | build report: commits, files, checks run, risks, record proposals |
-| TEST | read, run checks and tests, write only under a scratch directory | edit source, edit tests that the contract names, see the builder's transcript | verdict per acceptance criterion with evidence |
+| BUILD | read, edit, write, run checks, commit in its worktree | edit `.ateam/**` or `.claude/**`, touch files outside `paths` plus `incidental`, push, merge, run `rm` in any form (tracked files go through `git rm`; cleanup is an integration step), cd outside the worktree and its scratch directory, or by a relative path | build report: commits, files, checks run, risks, record proposals |
+| TEST | read, run checks and tests, write only under a scratch directory | edit source, edit tests that the contract names, see the builder's transcript, cd outside the worktree and its scratch directory, or by a relative path | verdict per acceptance criterion with evidence |
 
 Enforcement, in layers. Layers 1 to 3 run before a tool executes (pre-guards); layer 4 verifies afterwards. The system prompt is not a layer.
 
@@ -314,7 +333,7 @@ Enforcement, in layers. Layers 1 to 3 run before a tool executes (pre-guards); l
 3. Path deny rules for `Edit` on `.ateam/**` and `.claude/**` in the session settings.
 4. Post-run checks: for BUILD and TEST, the worktree must be clean except for committed changes (staged, unstaged and untracked files are reported and fail the attempt) and the diff against the base must touch only `paths` plus `incidental`; for every role, the intent repo's head and cleanliness must be unchanged; for in-place investigations, the owner's checkout status, HEAD and stash list must be unchanged. Any change is recorded as `tamper`.
 
-Layers 1 to 3 stop built-in tools and recognised shell commands. They do not stop a script the worker writes and runs. Layer 4 catches the result. This is integrity verification, not a security boundary.
+Layers 1 to 3 stop built-in tools and recognised shell commands. They do not stop a script the worker writes and runs. Layer 4 catches the result. This is integrity verification, not a security boundary: the pre-guard exists so a confused or careless session cannot do damage, not to defeat an adversary (owner, 2026-10-26). Grading rule for policy findings: a path to a forbidden action through ordinary shell usage is Important; a contrived encoding is Minor, closed when the fix is a few lines and otherwise listed as a residual.
 
 The TEST worker receives the contract, the diff, the deterministic check results and the records. It does not receive the BUILD worker's report, so it cannot be anchored by the builder's claims.
 
@@ -416,7 +435,8 @@ Owner decision, 2026-10-25. `ateam doctor` is the harness's INVESTIGATE role tur
 
 ```
 ateam init <path>                 discover and propose a baseline
-ateam plan <path> "<request>"     investigate and propose contracts
+ateam plan <path> "<request>" [--tier careful] [--replaces P-xxxx] [--no-review]
+                                  investigate, review and propose contracts
 ateam approve P-0003 [--tier C-0012=careful] [--reject-record R-0009 "reason"]
 ateam run P-0003                  execute until a gate or pause
 ateam status [P-0003]
@@ -427,6 +447,8 @@ ateam merge P-0003 / ateam reject P-0003 "reason"
 ateam telemetry [--csv]
 ateam doctor                      claude version, SDK version, target repo health
 ```
+
+`ateam init` and `ateam plan` both default to `--tier careful`.
 
 ## The spike (done 2026-10-24, throwaway)
 

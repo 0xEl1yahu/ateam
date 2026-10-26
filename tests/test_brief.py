@@ -39,7 +39,7 @@ def test_no_checkpoint_and_render(sample_contract, records_three):
 
 import re
 
-from ateam.brief import assemble_investigation_brief
+from ateam.brief import PLAN_INDEX_CAP, RULES_SCOPE_NOTE, assemble_investigation_brief
 from ateam.config import NamedCheck, TargetConfig
 from ateam.contracts.model import Contract
 from ateam.plans.model import Plan, PlanStatus
@@ -93,7 +93,8 @@ def test_plans_section_lists_contracts_with_paths(target_repo, tmp_path, sample_
     text = _inv(target_repo, tmp_path, plans={"P-0001": plan}, contracts={"C-0001": sample_contract})
     sec = text.split("## Existing plans and contracts")[1].split("## Request")[0]
     assert "P-0001 plan_proposed  Reading state" in sec
-    assert "  C-0001 draft  Expose reading state through the books API  [src/api/**, tests/api/test_books.py]" in sec
+    assert "  C-0001 draft  Expose reading state through the books API" in sec
+    assert "    paths: src/api/**, tests/api/test_books.py" in sec
 
 
 def test_discovery_kind_has_limits_not_request(target_repo, tmp_path):
@@ -166,3 +167,99 @@ def test_multiline_statements_and_titles_cannot_forge_headings(target_repo, tmp_
     text = _inv(target_repo, tmp_path, records={**records_three, "R-0003": rec}, plans={"P-0001": plan},
                 contracts={"C-0001": contract})
     assert _headings(text) == _HEADINGS_PLANNING
+
+
+def test_rules_section_opens_with_scope_note(target_repo, tmp_path):
+    empty = _inv(target_repo, tmp_path)
+    (target_repo / "CLAUDE.md").write_text("Always be kind.\n")
+    text = _inv(target_repo, tmp_path)
+    body = text.split("## Rules\n", 1)[1]
+    assert body.startswith(RULES_SCOPE_NOTE + "\n\n### CLAUDE.md")
+    assert RULES_SCOPE_NOTE == ("These are the target's instructions for whoever develops it. They govern how work on the "
+                                "target is done; they are not requirements of the Request.")
+    assert text.count(RULES_SCOPE_NOTE) == 1 and empty.count(RULES_SCOPE_NOTE) == 1
+
+
+def _idx(text):
+    return text.split("## Existing plans and contracts")[1].split("## Request")[0]
+
+
+def _plan_with_unknowns():
+    return Plan(id="P-0001", title="Reading state", request="r", status=PlanStatus.plan_proposed, contracts=["C-0001"],
+                unknowns=["Is the column\n## Injected\nnullable?", "Who owns migrations?"],
+                verification_approach="Run the API tests and then compare the response shape against the stored fixtures by hand.")
+
+
+def test_plan_index_lists_acceptance_unknowns_and_excludes(target_repo, tmp_path, sample_contract):
+    plan = _plan_with_unknowns()
+    text = _inv(target_repo, tmp_path, plans={plan.id: plan}, contracts={sample_contract.id: sample_contract})
+    sec = _idx(text)
+    assert f"  {sample_contract.id} draft  {sample_contract.title}" in sec
+    assert f"    A1: {sample_contract.acceptance[0].statement}" in sec
+    assert f"    A3: {sample_contract.acceptance[1].statement}" in sec
+    assert "  unknowns:" in sec and "Who owns migrations?" in sec
+    assert "Is the column ## Injected nullable?" in sec
+    assert "  verification: " + plan.verification_approach[:80] in sec
+    assert plan.verification_approach[:81] not in sec
+    assert _headings(text) == _HEADINGS_PLANNING
+    text2 = _inv(target_repo, tmp_path, plans={plan.id: plan}, contracts={sample_contract.id: sample_contract}, exclude_plans={plan.id})
+    sec2 = _idx(text2)
+    assert plan.id not in sec2 and sample_contract.id not in sec2
+
+
+def test_plan_index_caps_each_plan(target_repo, tmp_path, sample_contract):
+    big = sample_contract.model_copy(update={"acceptance": [
+        sample_contract.acceptance[0].model_copy(update={"statement": "x" * (PLAN_INDEX_CAP + 500)})]})
+    p1 = _plan_with_unknowns()
+    p2 = Plan(id="P-0002", title="Small", request="r")
+    text = _inv(target_repo, tmp_path, plans={"P-0001": p1, "P-0002": p2}, contracts={"C-0001": big})
+    sec = _idx(text)
+    assert sec.count("[truncated at 2500 characters]") == 1
+    assert "P-0002 requested  Small" in sec
+
+
+# --- review brief ---
+
+def _review(root, tmp_path, **kw):
+    from ateam.brief import assemble_review_brief
+    args = dict(target_root=root, config=TargetConfig(), records={}, plans={}, contracts={},
+                scratch_dir=tmp_path / "scratch", request="add a thing", draft="# Draft\ntitle: Health\n## contracts\n- C-0002")
+    args.update(kw)
+    return assemble_review_brief(**args)
+
+
+def test_review_brief_headings(target_repo, tmp_path):
+    text = _review(target_repo, tmp_path)
+    assert _headings(text) == ["Rules", "Records", "Existing plans and contracts", "Request", "Draft plan", "Checks", "Rubric", "Handoff file"]
+    assert "### Draft\ntitle: Health\n#### contracts" in text                     # the draft's own headings are demoted two levels
+    assert str(tmp_path / "scratch" / "handoff.yaml") in text
+
+
+def test_review_brief_excludes_replaced_plan(target_repo, tmp_path):
+    plans = {"P-0001": Plan(id="P-0001", title="Old", request="r", status=PlanStatus.plan_proposed),
+             "P-0002": Plan(id="P-0002", title="Other", request="r", status=PlanStatus.plan_proposed)}
+    text = _review(target_repo, tmp_path, plans=plans, exclude_plans=frozenset({"P-0001"}))
+    index = text.split("## Existing plans and contracts\n")[1].split("\n## ")[0]
+    assert "P-0001" not in index and "P-0002" in index
+
+
+def _with_interfaces(c):
+    from ateam.contracts.model import Interface
+    return c.model_copy(update={"interfaces": [
+        Interface(kind="produces", name="integrate", signature="integrate(plan_id: str) -> MergeProposal"),
+        Interface(kind="consumes", name="load_plan", signature="load_plan(id: str)\n -> Plan")]})
+
+
+def test_worker_brief_lists_interfaces(sample_contract):
+    text = render_brief(assemble_brief(_with_interfaces(sample_contract), [], None, Role.build))
+    assert "Interfaces (follow these exactly" in text
+    assert "- produces: integrate(plan_id: str) -> MergeProposal" in text
+    assert "- consumes: load_plan(id: str) -> Plan" in text
+    assert "Interfaces" not in render_brief(assemble_brief(sample_contract, [], None, Role.build))
+
+
+def test_plan_index_lists_interfaces(target_repo, tmp_path, sample_contract):
+    c = _with_interfaces(sample_contract)
+    plan = _plan_with_unknowns().model_copy(update={"contracts": [c.id]})
+    text = _inv(target_repo, tmp_path, plans={plan.id: plan}, contracts={c.id: c})
+    assert "    produces: integrate(plan_id: str) -> MergeProposal\n    consumes: load_plan(id: str) -> Plan" in text

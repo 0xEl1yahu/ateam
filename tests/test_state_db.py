@@ -16,7 +16,7 @@ def test_init_schema_idempotent(tmp_path):
 
 
 def test_transition_tables_match_design():
-    assert FEATURE_TRANSITIONS["plan_proposed"] == {"plan_approved", "plan_rejected"}
+    assert FEATURE_TRANSITIONS["plan_proposed"] == {"plan_approved", "plan_rejected", "superseded"}
     assert CONTRACT_TRANSITIONS["verified"] == {"integrated"}
     assert "integrated" not in CONTRACT_TRANSITIONS["ready"]
 
@@ -164,3 +164,8 @@ def test_meta_key_value(tmp_path):
     assert db.get_meta("repo_id_source") is None
     db.set_meta("repo_id_source", "path"); db.set_meta("repo_id_source", "origin")
     assert db.get_meta("repo_id_source") == "origin"
+
+
+def test_feature_transitions_include_covered_and_superseded():
+    assert "plan_covered" in FEATURE_TRANSITIONS["investigating"] and "superseded" in FEATURE_TRANSITIONS["plan_proposed"]
+    assert FEATURE_TRANSITIONS["plan_covered"] == set() == FEATURE_TRANSITIONS["superseded"]

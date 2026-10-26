@@ -155,3 +155,138 @@ def test_review_prints_new_sections(target_repo, target_paths, records_three):
     assert "Out of scope:" in text and "the UI" in text
     assert "Verification approach: run the unit suite" in text
     assert text.index("C-0001") < text.index("Depends on plans:")
+
+
+def _plan(pid, status):
+    from ateam.plans.model import Plan
+
+    return Plan(id=pid, title="t", request="r", status=status)
+
+
+def _empty_report(**extra):
+    rep = report()
+    rep.update(extra)
+    return rep
+
+
+def test_zero_contracts_with_live_dependency_is_covered(target_repo, target_paths, records_three):
+    from ateam.plans.model import PlanStatus
+
+    rep = _empty_report(depends_on_plans=["P-0001"], proposed_records=[], unknowns=["already done by P-0001"])
+    r = report_to_plan(rep, "x", "P-0007", target_paths.contracts, records_three, CFG, target_repo, target_paths.records,
+                       existing_plans={"P-0001": _plan("P-0001", PlanStatus.plan_proposed)})
+    assert r.covered and r.plan.status == PlanStatus.plan_covered and r.plan.covered_by == ["P-0001"] and r.contracts == []
+    assert r.plan.contracts == [] and r.proposed.proposed == []
+    text = render_plan_review(r, load_tiers())
+    assert "P-0007 covered by P-0001; no contracts written" in text
+
+
+@pytest.mark.parametrize("status", ["plan_rejected", "plan_covered", "superseded", "abandoned"])
+def test_zero_contracts_naming_a_dead_plan_is_fatal(status, target_repo, target_paths, records_three):
+    from ateam.plans.model import PlanStatus
+
+    rep = _empty_report(depends_on_plans=["P-0001"])
+    with pytest.raises(PlanError, match="no contracts"):
+        report_to_plan(rep, "x", "P-0007", target_paths.contracts, records_three, CFG, target_repo, target_paths.records,
+                       existing_plans={"P-0001": _plan("P-0001", PlanStatus(status))})
+
+
+def test_zero_contracts_naming_the_replaced_plan_is_fatal(target_repo, target_paths, records_three):
+    from ateam.plans.model import PlanStatus
+
+    rep = _empty_report(depends_on_plans=["P-0001"])
+    with pytest.raises(PlanError, match="no contracts"):
+        report_to_plan(rep, "x", "P-0007", target_paths.contracts, records_three, CFG, target_repo, target_paths.records,
+                       existing_plans={"P-0001": _plan("P-0001", PlanStatus.plan_proposed)}, replaces="P-0001")
+
+
+def test_zero_contracts_without_dependencies_or_with_unknown_one_is_fatal(target_repo, target_paths, records_three):
+    for deps in ([], ["P-0009"]):
+        with pytest.raises(PlanError, match="no contracts"):
+            report_to_plan(_empty_report(depends_on_plans=deps), "x", "P-0007", target_paths.contracts, records_three, CFG, target_repo, target_paths.records)
+
+
+def test_unknowns_mentioning_a_plan_not_in_dependencies_adds_note(target_repo, target_paths, records_three):
+    from ateam.plans.model import PlanStatus
+
+    existing = {"P-0002": _plan("P-0002", PlanStatus.plan_proposed), "P-0003": _plan("P-0003", PlanStatus.plan_proposed)}
+    rep = report(contract("A"), unknowns=["'verified' comes from P-0002", "see P-0003"])
+    rep.update(depends_on_plans=["P-0003"], notes="also relies on P-0002")
+    r = report_to_plan(rep, "x", "P-0001", target_paths.contracts, records_three, CFG, target_repo, target_paths.records, existing_plans=existing)
+    assert "unknowns mention P-0002, which is not in depends_on_plans" in r.problems
+    assert not any("P-0003, which is not" in n for n in r.problems)
+    assert sum("P-0002, which is not" in n for n in r.problems) == 1
+
+
+def test_plan_fields_default_so_content_hash_is_stable():
+    from ateam.plans.model import Plan
+
+    p = Plan(id="P-0001", title="t", request="r")
+    assert p.covered_by == [] and p.replaces is None
+
+
+def test_pending_path_record_kept_through_the_planner(target_repo, target_paths, records_three):
+    cand = dict(kind="invariant", statement="Integrator owns merges", rationale="x", origin="inferred", basis="observation",
+                evidence=[{"type": "doc", "ref": "README.md#x"}], paths=["src/ateam/newmod.py"], serves=[])
+    rep = report(contract("A", paths=("src/ateam/newmod.py",)), proposed=[cand])
+    r = report_to_plan(rep, "x", "P-0001", target_paths.contracts, records_three, CFG, target_repo, target_paths.records)
+    assert len(r.plan.proposed_records) == 1
+
+
+def _ifc(kind, name, signature):
+    return {"kind": kind, "name": name, "signature": signature, "note": ""}
+
+
+def _with(c, *ifaces):
+    return {**c, "interfaces": list(ifaces)}
+
+
+def test_interface_signature_mismatch_is_a_note(target_repo, target_paths, records_three):
+    rep = report(_with(contract("First"), _ifc("produces", "foo", "foo(a)")),
+                 _with(contract("Second", deps=[0]), _ifc("consumes", "foo", "foo(a, b)")))
+    r = report_to_plan(rep, "x", "P-0001", target_paths.contracts, records_three, CFG, target_repo, target_paths.records)
+    assert "C-0002 consumes `foo(a, b)` but C-0001 produces `foo(a)`" in r.problems
+    assert [i.name for i in r.contracts[0].interfaces] == ["foo"] and r.contracts[1].interfaces[0].kind == "consumes"
+
+
+def test_interface_matching_producer_is_quiet(target_repo, target_paths, records_three):
+    rep = report(_with(contract("First"), _ifc("produces", "foo", "foo(a)")),
+                 _with(contract("Second", deps=[0]), _ifc("consumes", "foo", "foo(a)")))
+    r = report_to_plan(rep, "x", "P-0001", target_paths.contracts, records_three, CFG, target_repo, target_paths.records)
+    assert r.problems == []
+
+
+def test_consume_without_producer_or_text_match_is_a_note(target_repo, target_paths, records_three):
+    rep = report(contract("First"), _with(contract("Second", deps=[0]), _ifc("consumes", "bar", "bar()")))
+    r = report_to_plan(rep, "x", "P-0001", target_paths.contracts, records_three, CFG, target_repo, target_paths.records)
+    assert "C-0002 consumes `bar` which no contract produces and the code does not define" in r.problems
+
+
+def test_consume_found_in_code_text_is_quiet(target_repo, target_paths, records_three):
+    (target_repo / "src" / "api").mkdir(parents=True, exist_ok=True)
+    (target_repo / "src" / "api" / "mod.py").write_text("def existing_helper(x):\n    return x\n")
+    rep = report(_with(contract("First"), _ifc("consumes", "existing_helper", "existing_helper(x)")))
+    r = report_to_plan(rep, "x", "P-0001", target_paths.contracts, records_three, CFG, target_repo, target_paths.records)
+    assert r.problems == []
+    rep2 = {**report(_with(contract("A", paths=("docs/**", "tests/**")), _ifc("consumes", "existing_helper", "existing_helper(x)"))),
+            "files_read": ["src/api/mod.py"]}
+    r2 = report_to_plan(rep2, "x", "P-0001", target_paths.contracts, records_three, CFG, target_repo, target_paths.records)
+    assert r2.problems == []
+
+
+def test_plan_review_prints_interfaces(target_repo, target_paths, records_three):
+    rep = report(_with(contract("First"), _ifc("produces", "foo", "foo(a) -> int")))
+    r = report_to_plan(rep, "x", "P-0001", target_paths.contracts, records_three, CFG, target_repo, target_paths.records)
+    assert "  interfaces:\n    produces: foo(a) -> int" in render_plan_review(r, load_tiers())
+
+
+def test_planner_schema_requires_interfaces_and_spec_sentences():
+    from ateam.roles import PLANNER_SCHEMA, PLANNER_SPEC, REVIEWER_SPEC
+
+    items = PLANNER_SCHEMA["properties"]["contracts"]["items"]
+    assert "interfaces" in items["required"]
+    i = items["properties"]["interfaces"]["items"]
+    assert i["additionalProperties"] is False and i["required"] == ["kind", "name", "signature", "note"]
+    assert i["properties"]["kind"]["enum"] == ["produces", "consumes"]
+    assert "must match the producing contract's signature exactly" in PLANNER_SPEC.system_prompt
+    assert "every consumed interface is produced by an earlier contract" in REVIEWER_SPEC.system_prompt
