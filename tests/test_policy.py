@@ -1362,3 +1362,182 @@ async def test_decide_exception_outside_bash_is_a_denial(policy_build, monkeypat
 @pytest.mark.xfail(strict=True, reason="run-time residual: the command word comes from an expansion at run time")
 def test_build_runtime_cd_residual(policy_build):
     assert policy_build.command_allowed("c=cd; $c /tmp") == (False, CD_WORKTREE_REASON)
+
+
+# ---- final review fix wave (2026-10-26). Every row is a parser disagreement found by review and evaluated with the
+# policy functions; nothing here was run in a shell.
+
+def _write_reason(seg: str) -> str:
+    return f"INVESTIGATE may not write, run other programs or change state; {seg.strip()[:40]!r} is not allowed"
+
+
+# Items 1 and 15: per-program option rules read the decoded words (quotes and escapes removed), not the raw text.
+INVESTIGATE_DECODED_OPTION_DENY = [
+    "sort '-o' out.txt README.md",
+    "sort \\-o out.txt README.md",
+    "sort -o'out' README.md",
+    "sort \"-uo\" out.txt README.md",
+    "sort '--output=out.txt' README.md",
+    "sort --compress-program=./x README.md",
+    "sort '--compress-program' ./x README.md",
+    "git diff '--output=out.txt'",
+    "git diff \\--output=out.txt",
+    "git diff '--output' out.txt",
+    "rg '--pre=sh' pattern script.sh",
+    "rg '--pre' sh pattern script.sh",
+    "rg \\--pre-glob='*' --pre=sh pattern",
+    "find . '-exec' sh script.sh ';'",
+    "find . -e'xec' sh script.sh ';'",
+    "find . '-execdir' sh script.sh ';'",
+    "find . '-ok' sh script.sh ';'",
+    "find . '-okdir' sh script.sh ';'",
+    "find . '-fprint' out.txt",
+    "find . '-fprint0' out.txt",
+    "find . '-fprintf' out.txt '%p'",
+    "find . '-fls' out.txt",
+    "git grep '-O' x",
+    "git grep '-Oless' x",
+    "git grep '--open-files-in-pager' x",
+    "tree '-o' out.txt",
+    "du '-o' out.txt",
+    "file -C -m x",
+    "file '-C' -m x",
+    "uniq in.txt 'out.txt'",
+    "uniq in.txt o\\ut.txt",
+    "git branch -a '-D' x",
+    "git branch --list '-m' x y",
+]
+
+
+@pytest.mark.parametrize("cmd", INVESTIGATE_DECODED_OPTION_DENY)
+def test_investigate_option_rules_read_decoded_words(policy_investigate, cmd):
+    assert policy_investigate.command_allowed(cmd) == (False, _write_reason(cmd)), cmd
+
+
+def test_investigate_escaped_find_delete_meets_the_every_role_rule(policy_investigate):
+    assert policy_investigate.command_allowed("find . -de\\lete") == (False, FIND_DELETE_REASON)
+
+
+GIT_DASH_C_REASON = "INVESTIGATE may not pass git -c"
+PAGER_REASON = "INVESTIGATE may not set pagers, editors or diff drivers"
+
+
+# Found while fixing item 1: --config-env sets a git config key from an environment variable, like -c; and the pager
+# rule read only the masked text, so a quote inside the key hid it.
+@pytest.mark.parametrize("cmd,reason", [
+    ("git --config-env=core.fsmonit''or=SHELL status", GIT_DASH_C_REASON),
+    ("git -C src --config-env=x=SHELL log", GIT_DASH_C_REASON),
+    ("git --config-env x=SHELL log", GIT_DASH_C_REASON),
+    ("git --config-env=core.pag''er=SHELL log", GIT_DASH_C_REASON),
+])
+def test_investigate_git_config_from_decoded_words(policy_investigate, cmd, reason):
+    assert policy_investigate.command_allowed(cmd) == (False, reason), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "find src -name '*.py' -o -name '*.md'",   # find's -o is OR, not an output flag
+    "grep -o greet src/app.py",                 # grep's -o prints only the match
+    "ls -o src",
+    "sort -n -k2 src/app.py",
+    "uniq 'src/app.py'",
+    "file -b src/app.py",
+    "git diff --stat",
+    "rg -n 'pre' src",
+    "git grep -n greet",
+])
+def test_investigate_decoded_option_lookalikes_allowed(policy_investigate, cmd):
+    ok, reason = policy_investigate.command_allowed(cmd)
+    assert ok, (cmd, reason)
+
+
+# Items 2 and 14: bash ends an ANSI-C string at its first NUL, so $'rm\0ignored' x runs rm x.
+@pytest.mark.parametrize("role", ["policy_build", "policy_test", "policy_investigate"])
+@pytest.mark.parametrize("cmd", [
+    "$'rm\\0ignored' x",
+    "$'rm\\00' x",
+    "$'rm\\x00y' x",
+    "$'rm\\x0' x",
+    "$'rm\\c@z' x",
+    "$'rm\\u0000z' x",
+    "$'r\\0x'm x",
+])
+def test_nul_ends_an_ansi_c_word(request, role, cmd):
+    pol = request.getfixturevalue(role)
+    assert pol.command_allowed(cmd) == (False, RM_REASON), cmd
+
+
+def test_nul_truncation_matches_bash_for_a_short_word(policy_build):
+    from ateam.runner.policy import _lex
+
+    assert _lex("$'r\\0' x").segments[0].words == ["r", "x"]   # bash runs `r x`: not rm
+    assert policy_build.command_allowed("$'r\\0' x")[0]
+    assert _lex("$'rm\\0ignored' x").segments[0].words == ["rm", "x"]
+
+
+# Item 13: find -exec/-execdir/-ok/-okdir and xargs run the words that follow them as a command.
+FIND_DELETE_REASON = "find -delete is not allowed for workers; cleanup happens at integration"
+DESTRUCTIVE_XARGS = r"destructive command matched '\\bxargs\\b[^\\n;&|]*\\brm\\b'"
+DESTRUCTIVE_FIND = r"destructive command matched '\\bfind\\b[^\\n;&|]*(?:-delete\\b|-exec\\s+rm\\b)'"
+
+FIND_XARGS_RM_ROWS = [
+    ("find . -execdir rm {} \\;", RM_REASON),
+    ("find . -exec 'rm' {} \\;", RM_REASON),
+    ("ls | xargs 'r'm -f", RM_REASON),
+    ("find . -ok rm {} \\;", RM_REASON),
+    ("find . -okdir /bin/rm {} +", RM_REASON),
+    ("find . -name x -exec sh -c 'rm \"$1\"' _ {} \\;", RM_REASON),
+    ("ls | xargs -I{} sh -c 'r''m {}'", RM_REASON),
+    ("ls | xargs -n 1 -P 2 \\r\\m", RM_REASON),
+    ("ls | xargs -- 'r'\"m\"", RM_REASON),
+    ("ls | xargs rm", DESTRUCTIVE_XARGS),    # the text regexes stay as the first net
+    ("find . -delete", DESTRUCTIVE_FIND),
+    ("find . '-delete'", DESTRUCTIVE_FIND),
+    ("find . -de\\lete", FIND_DELETE_REASON),
+]
+
+
+@pytest.mark.parametrize("role", ["policy_build", "policy_test"])
+@pytest.mark.parametrize("cmd,reason", FIND_XARGS_RM_ROWS)
+def test_find_and_xargs_rm_read_from_decoded_words(request, role, cmd, reason):
+    pol = request.getfixturevalue(role)
+    assert pol.command_allowed(cmd) == (False, reason), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "find src -name '*.py' -exec grep -l greet {} +",
+    "find src -type f | xargs grep -l greet",
+    "ls | xargs -n1 echo",
+    "find src -name '*.pyc' -print",
+])
+def test_find_and_xargs_lookalikes_allowed(policy_build, cmd):
+    ok, reason = policy_build.command_allowed(cmd)
+    assert ok, (cmd, reason)
+
+
+# Item 30: macOS wrappers run the command that follows their options.
+@pytest.mark.parametrize("role", ["policy_build", "policy_test"])
+@pytest.mark.parametrize("cmd", [
+    "caffeinate rm x",
+    "caffeinate -i -t 5 rm x",
+    "caffeinate -w 123 rm x",
+    "arch -arm64 rm x",
+    "arch -x86_64 rm x",
+    "arch -arch arm64 rm x",
+    "arch -e A=1 -arm64 rm x",
+    "/usr/bin/arch -arm64 rm x",
+    "script -q /dev/null rm x",
+    "script -q out.txt rm x",
+    "/usr/bin/script -a -t 0 out.txt rm x",
+    "script -c 'rm x' out.txt",
+    "script -q -c 'ls; rm x' out.txt",
+])
+def test_macos_wrappers_do_not_hide_rm(request, role, cmd):
+    pol = request.getfixturevalue(role)
+    assert pol.command_allowed(cmd) == (False, RM_REASON), cmd
+
+
+@pytest.mark.parametrize("cmd", ["caffeinate -i make", "arch -arm64 make", "script -q /dev/null ls", "script out.txt"])
+def test_macos_wrapper_lookalikes_allowed(policy_build, cmd):
+    ok, reason = policy_build.command_allowed(cmd)
+    assert ok, (cmd, reason)
+

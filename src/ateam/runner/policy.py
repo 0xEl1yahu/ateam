@@ -66,7 +66,7 @@ _READ_PREFIX = re.compile(
     r"^\s*(?:cat|head|tail|less|more|wc|grep|rg|ls|stat|file|diff|sort|uniq|cut|awk|find|tree|du|sed\s+-n|git\s+(?:diff|show|log|blame|status|ls-files|grep|branch|stash\s+(?:list|show)))\b"
 )
 _GIT_GLOBAL_OPTS = re.compile(r"^(\s*git)(?:\s+(?:-[cC]\s*\S+|--?\S+))+(\s+)")
-_WRAPPERS = {"command", "env", "exec", "nice", "nohup", "time", "builtin", "timeout", "stdbuf"}
+_WRAPPERS = {"command", "env", "exec", "nice", "nohup", "time", "builtin", "timeout", "stdbuf", "caffeinate", "arch", "script"}
 # Wrapper options whose argument is the next word (`nice -n 5 rm`), and positional arguments before the command.
 _WRAPPER_ARG_OPTS = {
     "nice": {"-n", "--adjustment"},
@@ -75,8 +75,11 @@ _WRAPPER_ARG_OPTS = {
     "exec": {"-a"},
     "timeout": {"-s", "--signal", "-k", "--kill-after"},
     "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
+    "caffeinate": {"-t", "-w"},
+    "arch": {"-arch", "-e", "-d"},
+    "script": {"-t", "-T", "-F", "-I", "-O", "-B", "-E", "-m", "-o"},
 }
-_WRAPPER_POSITIONAL = {"timeout": 1}
+_WRAPPER_POSITIONAL = {"timeout": 1, "script": 1}   # script [options] [file [command ...]]
 _SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "mksh"}
 _NESTING_LIMIT = 8   # nested $( ` ${ <( and eval / shell -c bodies are followed this deep; deeper is denied
 _COMPOUND_START = {"{", "if", "while", "until", "for", "case", "select", "[[", "(("}
@@ -85,6 +88,7 @@ _CD = re.compile(r"^\s*(?:cd|pushd)\b")
 CD_WORKTREE_REASON = "workers may cd only to an absolute path inside the worktree or its scratch directory"  # every role; see Policy._cd_target
 NESTING_REASON = "command nests substitutions, brace expansions, eval or shell -c too deeply to check"
 ANALYSE_REASON = "command could not be analysed; simplify it"
+FIND_DELETE_REASON = "find -delete is not allowed for workers; cleanup happens at integration"
 
 
 class _TooComplex(Exception):
@@ -125,7 +129,8 @@ def _skip_prefix(words: list[str]) -> int:
 
 
 def _ansi_c(body: str) -> str:
-    """The value of the text between $' and ' (the escapes that matter for reading a command word)."""
+    """The value of the text between $' and ' (the escapes that matter for reading a command word). Bash keeps the
+    value as a C string, so it ends at the first NUL (backslash 0, x00, c@ or u0000): $'rm<NUL>ignored' is rm."""
     out: list[str] = []
     i = 0
     while i < len(body):
@@ -147,7 +152,7 @@ def _ansi_c(body: str) -> str:
             out.append(chr(ord(body[i + 2]) & 0x1F)); i += 3
         else:
             out.append(c + e); i += 2
-    return "".join(out)
+    return "".join(out).split("\0", 1)[0]
 
 
 @dataclass
@@ -784,6 +789,9 @@ def _command_words(words: list[str]) -> list[str]:
                 if split is not None:
                     segs = _lex(split).segments
                     return _command_words((segs[0].words if segs else []) + words[i:])
+                if name == "script" and (opt in ("-c", "--command") or opt.startswith("--command=")):
+                    code = opt.split("=", 1)[1] if "=" in opt else (words[i] if i < len(words) else "")
+                    return ["sh", "-c", code]   # script -c runs its argument as shell code
                 if opt in _WRAPPER_ARG_OPTS.get(name, ()):
                     i += 1
             i += _WRAPPER_POSITIONAL.get(name, 0)
@@ -829,6 +837,41 @@ def _inner_command(words: list[str]) -> str | None:
     return cw[j] if dash_c and j < len(cw) else None
 
 
+_FIND_RUNS = {"-exec", "-execdir", "-ok", "-okdir"}
+_FIND_WRITES = {"-delete", "-fprint", "-fprint0", "-fprintf", "-fls"}
+_XARGS_ARG_OPTS = {"-E", "-I", "-J", "-L", "-n", "-P", "-R", "-S", "-s", "-d", "-a", "--arg-file", "--delimiter",
+                   "--max-lines", "--max-args", "--max-procs", "--max-chars", "--replace", "--eof", "--process-slot-var"}
+
+
+def _runs_words(words: list[str]) -> list[list[str]]:
+    """The commands a find (each -exec/-execdir/-ok/-okdir up to its ; or +) or an xargs (the words after its options)
+    runs, as decoded words; [] for any other command."""
+    cw = _command_words(words)
+    name = cw[0].rsplit("/", 1)[-1] if cw else ""
+    groups: list[list[str]] = []
+    if name == "find":
+        i = 1
+        while i < len(cw):
+            if cw[i] in _FIND_RUNS:
+                j = i + 1
+                while j < len(cw) and cw[j] not in (";", "+"):
+                    j += 1
+                groups.append(cw[i + 1 : j])
+                i = j
+            i += 1
+    elif name == "xargs":
+        i = 1
+        while i < len(cw) and cw[i].startswith("-"):
+            opt = cw[i]; i += 1
+            if opt == "--":
+                break
+            if opt in _XARGS_ARG_OPTS:
+                i += 1
+        if i < len(cw):
+            groups.append(cw[i:])
+    return [g for g in groups if g]
+
+
 def _cd_args(words: list[str]) -> list[str] | None:
     """The arguments of a cd or pushd that this simple command runs, else None (not a cd)."""
     cw = _command_words(words)
@@ -870,6 +913,61 @@ def _uniq_writes(segment: str) -> bool:
         if not t.startswith("-") or t == "-":
             positional.append(t)
     return len(positional) >= 2
+
+
+def _git_split(words: list[str]) -> tuple[list[str], list[str]]:
+    """git's global options and the rest (verb and its arguments) of a decoded `git ...` command."""
+    k = 1
+    while k < len(words) and words[k].startswith("-"):
+        k += 2 if words[k] in ("-c", "-C", "--config-env", "--git-dir", "--work-tree", "--namespace") else 1
+    return words[1:k], words[k:]
+
+
+def _git_config_option(words: list[str]) -> bool:
+    """A decoded `git` command that sets configuration through -c or --config-env."""
+    if not words or words[0].rsplit("/", 1)[-1] != "git":
+        return False
+    opts, _ = _git_split(words)
+    return any(o.startswith("-c") or o.startswith("--config-env") for o in opts)
+
+
+def _option_writes(words: list[str]) -> bool:
+    """The per-program option rules on decoded words (quotes and escapes removed, boundaries kept): output files,
+    pre-processors, pagers, -exec forms and compilers that write or run other programs."""
+    if not words:
+        return False
+    name, args = words[0].rsplit("/", 1)[-1], words[1:]
+    if any(a.startswith("--output") or a in ("-fprint", "-fprint0", "-fprintf", "-fls") for a in args):
+        return True
+    if name == "find":
+        return any(a in _FIND_RUNS or a in _FIND_WRITES for a in args)
+    if name == "rg":
+        return any(a.startswith("--pre") for a in args)
+    if name in ("tree", "du"):
+        return any(re.match(r"-[A-Za-z]*o", a) for a in args if not a.startswith("--"))
+    if name == "sort":
+        return any(a.startswith("--compress-program") or (not a.startswith("--") and re.match(r"-[A-Za-z]*o", a)) for a in args)
+    if name == "file":
+        return any(a.startswith("--compile") or (not a.startswith("--") and re.match(r"-[A-Za-z]*C", a)) for a in args)
+    if name == "uniq":
+        positional, skip = [], False
+        for a in args:
+            if skip:
+                skip = False
+            elif a in ("-f", "-s", "-w"):
+                skip = True
+            elif not a.startswith("-") or a == "-":
+                positional.append(a)
+        return len(positional) >= 2
+    if name == "git":
+        _, rest = _git_split(words)
+        verb, vargs = (rest[0], rest[1:]) if rest else ("", [])
+        if verb == "grep":
+            return any(a.startswith("--open-files-in-pager") or (not a.startswith("--") and re.match(r"-[A-Za-z]*O", a)) for a in vargs)
+        if verb == "branch":
+            return any(a in ("-d", "-D", "-m", "-M", "-c", "-C", "-f", "--force", "--delete", "--move", "--copy") for a in vargs) \
+                or not all(a.startswith("-") for a in vargs)
+    return False
 
 
 def _git_branch_read_only(segment: str) -> bool:
@@ -1059,10 +1157,13 @@ class Policy:
         for seg in segments:
             out.append(seg)
             inner = _inner_command(seg.words)
+            runs = _runs_words(seg.words)
+            if (inner is not None or runs) and depth >= _NESTING_LIMIT:
+                raise _TooComplex
             if inner is not None:
-                if depth >= _NESTING_LIMIT:
-                    raise _TooComplex
                 out.extend(self._all_segments(_lex(inner).segments, depth + 1))
+            for words in runs:   # find -exec ... ; and xargs CMD run CMD as a simple command
+                out.extend(self._all_segments([_Segment(" ".join(words), words)], depth + 1))
         return out
 
     def command_allowed(self, cmd: str) -> tuple[bool, str]:
@@ -1117,6 +1218,9 @@ class Policy:
                 rest = rest.replace(sp, " ")
             if _is_rm(words):
                 return False, "rm is not allowed for workers; use `git rm` for tracked files, cleanup happens at integration"
+            cw = _command_words(words)
+            if cw and cw[0].rsplit("/", 1)[-1] == "find" and "-delete" in cw:
+                return False, FIND_DELETE_REASON
             if _PROTECTED_MENTION.search(rest):
                 seg = rest
                 if _CD.match(seg):
@@ -1139,7 +1243,7 @@ class Policy:
                     continue   # a plain cd, judged above; any other spelling still meets the allow-list
                 if _ENV_PREFIX.match(seg):
                     return False, f"INVESTIGATE may not set environment variables for a command; {seg.strip()[:40]!r}"
-                if _GIT_DASH_C.match(seg):
+                if _GIT_DASH_C.match(seg) or _git_config_option(s.words):
                     return False, "INVESTIGATE may not pass git -c"
                 norm = _normalise_git(seg)
                 if not (any(_starts_with_prefix(norm, p) for p in INVESTIGATE_ALLOWED_PREFIXES) and _allow_listed(s.words)):
@@ -1147,8 +1251,10 @@ class Policy:
                     if seg.split()[:1] and seg.split()[0] in _READ_TOOL_HINT_WORDS:
                         reason += "; use the Read tool with offset and limit to read a line range"
                     return False, reason
-                if (_WRITE_OPS.search(norm) or _FIND_EXEC.match(norm) or _RG_PRE.match(norm) or _GIT_GREP_PAGER.match(norm)
-                        or _OUTPUT_FLAG_CMDS.match(norm) or _uniq_writes(norm) or not _git_branch_read_only(norm)):
+                # decoded words first; the text regexes stay as a second net
+                if (_option_writes(s.words) or _WRITE_OPS.search(norm) or _FIND_EXEC.match(norm) or _RG_PRE.match(norm)
+                        or _GIT_GREP_PAGER.match(norm) or _OUTPUT_FLAG_CMDS.match(norm) or _uniq_writes(norm)
+                        or not _git_branch_read_only(norm)):
                     return False, f"INVESTIGATE may not write, run other programs or change state; {seg.strip()[:40]!r} is not allowed"
         return True, ""
 
