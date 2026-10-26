@@ -2025,3 +2025,35 @@ def test_refresh_skips_unfrozen_contracts_and_honours_the_plan_filter(monkeypatc
     assert r.exit_code == 0 and "nothing to refresh" in r.output and "C-0003" not in r.output
     r = run("contracts", "refresh", "P-0009", "--target", str(cli_target))
     assert r.exit_code == 1 and "unknown plan P-0009" in r.output
+
+
+# ---- reject an approved plan that has not started (owner, 2026-10-26)
+
+def test_reject_an_approved_plan_that_has_not_started(monkeypatch, cli_target):
+    from ateam.plans.store import load_plans
+    p = _approved_predecessor(monkeypatch, cli_target)
+    head = GitRepo(p.intent).head()
+    r = run("reject", "P-0001", "start fresh", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    plan = load_plans(p.plans)["P-0001"]
+    assert plan.status == "plan_rejected" and plan.history[-1].why == "start fresh"
+    cs = load_contracts(p.contracts)
+    assert cs["C-0002"].status == "superseded" == cs["C-0003"].status
+    db = _db(cli_target)
+    assert db.feature_status("P-0001") == "plan_rejected"
+    assert db.contract_status("C-0002") == "superseded" == db.contract_status("C-0003")
+    g = GitRepo(p.intent)
+    assert g.is_clean() and g.run("rev-parse", "HEAD~1").strip() == head
+    assert all(x in g.run("show", "--name-only", "--format=", "HEAD") for x in ("P-0001", "C-0002", "C-0003"))
+    assert r.output.index("C-0002 -> superseded") < r.output.index("P-0001 -> plan_rejected")
+    w = tmp = cli_target.parent / "wt-rej"; GitRepo(cli_target).worktree_add(w, "wt-rej", "main")
+    assert run("worker", "run", "C-0002", "--role", "build", "--cwd", str(tmp), "--target", str(cli_target)).exit_code == 4
+
+
+def test_reject_refuses_an_approved_plan_that_has_started(monkeypatch, cli_target):
+    p = _approved_predecessor(monkeypatch, cli_target)
+    _db(cli_target).start_attempt("C-0002", "build", "light", "haiku", {})
+    before = _intent_state(p, cli_target)
+    r = run("reject", "P-0001", "start fresh", "--target", str(cli_target))
+    assert r.exit_code == 1 and "P-0001 cannot be rejected (C-0002 has an attempt)" in r.output
+    assert _intent_state(p, cli_target) == before

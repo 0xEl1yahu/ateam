@@ -15,7 +15,7 @@ FEATURE_TRANSITIONS: dict[str | None, set[str]] = {
     "requested": {"investigating"},
     "investigating": {"plan_proposed", "plan_covered"},
     "plan_proposed": {"plan_approved", "plan_rejected", "superseded"},
-    "plan_approved": {"executing", "superseded"},   # superseded only before any of its contracts has started
+    "plan_approved": {"executing", "superseded", "plan_rejected"},   # superseded or rejected only before any of its contracts has started
     "executing": {"paused", "integrating"},
     "paused": {"executing", "abandoned"},
     "integrating": {"merge_proposed", "paused"},             # paused: a conflict, a setup failure or failed final checks
@@ -207,24 +207,30 @@ class StateDB:
                 self.conn.execute("DELETE FROM meta WHERE key=?", (key,))
 
     def supersede(self, plan_id: str, plan_from: str, contract_steps: dict[str, str], by: str, reason: str) -> None:
-        """Supersede a plan and its contracts in one transaction. `plan_from` and each value of `contract_steps` are the
-        statuses seen before the intent commit; nothing is written if the store no longer agrees or a step is invalid."""
-        steps = [("feature", plan_id, plan_from), *(("contract", cid, frm) for cid, frm in contract_steps.items())]
-        for kind, id, frm in steps:
+        """Supersede a plan and its contracts in one transaction (see retire)."""
+        self.retire(plan_id, plan_from, contract_steps, by, reason, to="superseded")
+
+    def retire(self, plan_id: str, plan_from: str, contract_steps: dict[str, str], by: str, reason: str,
+               to: str = "superseded") -> None:
+        """Move a plan to `to` and its contracts to superseded in one transaction. `plan_from` and each value of
+        `contract_steps` are the statuses seen before the intent commit; nothing is written if the store no longer
+        agrees or a step is invalid."""
+        steps = [("feature", plan_id, plan_from, to), *(("contract", cid, frm, "superseded") for cid, frm in contract_steps.items())]
+        for kind, id, frm, dest in steps:
             current = self.feature_status(id) if kind == "feature" else self.contract_status(id)
             table = FEATURE_TRANSITIONS if kind == "feature" else CONTRACT_TRANSITIONS
-            if current != frm or "superseded" not in table.get(current, set()):
-                raise InvalidTransition(f"{kind} {id}: {current} -> superseded is not allowed (expected {frm})")
+            if current != frm or dest not in table.get(current, set()):
+                raise InvalidTransition(f"{kind} {id}: {current} -> {dest} is not allowed (expected {frm})")
         with self.conn:
-            for kind, id, frm in reversed(steps):   # contracts first, the feature last
+            for kind, id, frm, dest in reversed(steps):   # contracts first, the feature last
                 self.conn.execute(
                     "INSERT INTO transitions (kind, id, from_status, to_status, by, reason, at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (kind, id, frm, "superseded", by, reason, _now()),
+                    (kind, id, frm, dest, by, reason, _now()),
                 )
                 if kind == "feature":
-                    self.conn.execute("UPDATE features SET status=?, updated_at=? WHERE feature_id=?", ("superseded", _now(), id))
+                    self.conn.execute("UPDATE features SET status=?, updated_at=? WHERE feature_id=?", (dest, _now(), id))
                 else:
-                    self.conn.execute("UPDATE contracts SET status=?, updated_at=? WHERE contract_id=?", ("superseded", _now(), id))
+                    self.conn.execute("UPDATE contracts SET status=?, updated_at=? WHERE contract_id=?", (dest, _now(), id))
 
     def work_traces(self, contract_id: str) -> list[str]:
         """What the store holds that shows work started on a contract. Freezing leaves no trace; anything else does."""

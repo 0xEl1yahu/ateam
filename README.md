@@ -54,7 +54,7 @@ ateam init [--max-candidates 12] [--tier careful]   # discover and propose recor
 ateam records review [--all]                   # approve as requirement/observation, reject with reason, skip
 ateam plan "<request>" [--tier careful] [--replaces P-0001] [--no-review]   # propose contracts and a plan, review it with a second session; may end as plan_covered
 ateam approve P-0001 [--tier C-0002=careful] [--tier C-0002:investigate=light] [--skip-records]   # marks a replaced plan (and an approved one's contracts) superseded
-ateam reject P-0001 "reason"                   # a proposed plan or a merge proposal
+ateam reject P-0001 "reason"                   # a proposed plan, a merge proposal, or an approved plan that has not started
 ateam contracts refresh [P-0001]               # draft -> ready once every dependency is verified; stops on drift
 ateam integrate P-0001                         # integration branch, merges, full checks, merge proposal (0 / 1 / 3 / 4)
 ateam merge P-0001                             # fast-forward the target in your checkout; never pushes (0 / 1 / 4)

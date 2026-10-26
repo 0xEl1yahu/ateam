@@ -724,8 +724,9 @@ def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, force
 @click.argument("reason")
 @TARGET_OPTION
 def reject(plan_id: str, reason: str, target: Path) -> None:
-    """Reject a proposed plan (its contracts stay draft and are never frozen) or a merge proposal (the integration
-    branch and the target are left as they are)."""
+    """Reject a proposed plan (its contracts stay draft and are never frozen), a merge proposal (the integration
+    branch and the target are left as they are), or an approved plan none of whose work has started (its contracts
+    are superseded and never run)."""
     from datetime import UTC, datetime
 
     from ateam.plans.model import PlanHistoryEntry, PlanStatus
@@ -737,10 +738,13 @@ def reject(plan_id: str, reason: str, target: Path) -> None:
         _fail(f"unknown plan {plan_id}")
     plan_ = plans_[plan_id]
     stored = ctx.db.feature_status(plan_id)
+    if plan_.status == PlanStatus.plan_approved:
+        _reject_approved(ctx, plan_, reason)
+        return
     if plan_.status not in (PlanStatus.plan_proposed, PlanStatus.merge_proposed) or (
             plan_.status == PlanStatus.merge_proposed and stored != "merge_proposed"):
         _fail(f"{plan_id} is {plan_.status} in its file and {stored} in the state store; "
-              "only plan_proposed or merge_proposed plans can be rejected")
+              "only plan_proposed, merge_proposed or unstarted approved plans can be rejected")
     try:
         require_clean(ctx.paths)
     except IntentError as e:
@@ -752,6 +756,42 @@ def reject(plan_id: str, reason: str, target: Path) -> None:
     commit_intent_files(ctx.paths, f"ateam: reject plan {plan_id}", [save_plan(ctx.paths.plans, plan_)])
     ctx.db.transition("feature", plan_id, "plan_rejected", by="owner", reason=reason)
     click.echo(f"{plan_id} -> plan_rejected")
+
+
+def _reject_approved(ctx: Context, plan_, reason: str) -> None:
+    """An approved plan that has not started (owner, 2026-10-26): the plan file, its contracts as superseded, one intent
+    commit, then the store in one transaction."""
+    from datetime import UTC, datetime
+
+    from ateam.contracts.model import ContractStatus
+    from ateam.contracts.store import load_contracts, save_contract
+    from ateam.plans.model import PlanHistoryEntry, PlanStatus
+    from ateam.plans.store import save_plan
+    from ateam.state.db import InvalidTransition
+
+    cs = load_contracts(ctx.paths.contracts)
+    why = _started_reason(ctx, plan_, cs)
+    if why:
+        _fail(f"{plan_.id} cannot be rejected ({why}); only an approved plan that has not started can be rejected")
+    try:
+        require_clean(ctx.paths)
+    except IntentError as e:
+        _fail(str(e))
+    steps = {cid: ctx.db.contract_status(cid) for cid in _plan_contract_ids(ctx, plan_)}
+    files = [save_plan(ctx.paths.plans, plan_.model_copy(update={
+        "status": PlanStatus.plan_rejected,
+        "history": [*plan_.history, PlanHistoryEntry(at=datetime.now(UTC), by="owner", to=PlanStatus.plan_rejected, why=reason)],
+    }))]
+    files += [save_contract(ctx.paths.contracts, cs[cid].model_copy(update={"status": ContractStatus.superseded})) for cid in steps]
+    commit_intent_files(ctx.paths, f"ateam: reject plan {plan_.id}", files)
+    try:
+        ctx.db.retire(plan_.id, "plan_approved", steps, by="owner", reason=reason, to="plan_rejected")
+    except InvalidTransition as e:
+        _fail(f"the intent repo says {', '.join([plan_.id, *steps])} are rejected but the state store was not changed: {e}. "
+              "Investigate before running any of them.")
+    for cid in steps:
+        click.echo(f"{cid} -> superseded")
+    click.echo(f"{plan_.id} -> plan_rejected")
 
 
 @main.command()

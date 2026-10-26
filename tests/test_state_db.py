@@ -173,7 +173,7 @@ def test_feature_transitions_include_covered_and_superseded():
 
 # Owner, 2026-10-26: an approved plan that has not started can be superseded, and so can its draft and ready contracts.
 def test_approved_feature_can_be_superseded_and_superseded_is_terminal():
-    assert FEATURE_TRANSITIONS["plan_approved"] == {"executing", "superseded"}
+    assert FEATURE_TRANSITIONS["plan_approved"] == {"executing", "superseded", "plan_rejected"}
     assert CONTRACT_TRANSITIONS["draft"] == {"ready", "superseded"} and CONTRACT_TRANSITIONS["ready"] == {"building", "superseded"}
     assert CONTRACT_TRANSITIONS["superseded"] == set()
     for started in ("building", "verifying", "failed", "paused", "verified", "integrated", None):
@@ -241,3 +241,14 @@ def test_work_traces_names_every_kind_of_trace(tmp_path):
 def test_integration_edges():
     assert FEATURE_TRANSITIONS["integrating"] == {"merge_proposed", "paused"}
     assert FEATURE_TRANSITIONS["merge_proposed"] == {"merged", "plan_rejected", "integrating"}
+
+
+# Owner, 2026-10-26: an approved plan that has not started can be rejected; its contracts are superseded with it.
+def test_reject_unstarted_approved_plan_edge_and_retire(tmp_path):
+    assert FEATURE_TRANSITIONS["plan_approved"] == {"executing", "superseded", "plan_rejected"}
+    db = fresh(tmp_path)
+    _approved(db)
+    db.retire("P-0001", "plan_approved", {"C-0002": "ready", "C-0003": "draft"}, by="owner", reason="start fresh", to="plan_rejected")
+    assert db.feature_status("P-0001") == "plan_rejected"
+    assert db.contract_status("C-0002") == "superseded" == db.contract_status("C-0003")
+    assert db.transitions("feature", "P-0001")[-1]["reason"] == "start fresh"

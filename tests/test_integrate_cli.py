@@ -61,6 +61,6 @@ def test_reject_merge_proposed_plan(verified):
     assert load_contracts(verified.paths.contracts)["C-0001"].status == "integrated"
 
 
-def test_reject_still_refuses_an_approved_plan(approved):
-    r = run("reject", "P-0001", "no", "--target", str(approved.root))
-    assert r.exit_code == 1 and "only plan_proposed or merge_proposed plans can be rejected" in r.output
+def test_reject_still_refuses_an_approved_plan_that_has_started(verified):
+    r = run("reject", "P-0001", "no", "--target", str(verified.root))
+    assert r.exit_code == 1 and "P-0001 cannot be rejected (C-0001 has a contract transition)" in r.output
