@@ -4,7 +4,7 @@ Date: 2026-10-25. Status: draft for the owner's first hands-on test.
 
 This walks the pass-one slice end to end on a scratch repository, then tells you how to point ATeam at a real one. Every step says what you should see. Where behaviour differs, that is a finding worth noting.
 
-What exists today: the private intent repo, discovery (`ateam init`), the planner (`ateam plan` and `ateam approve`), records and contracts, briefs, a single clean-room worker run, the policy gate, the tree and scope check, and telemetry. What does not exist yet: the scheduler, the verifier that runs checks plus the TEST role as a gate, integration and merge approval, event logs and the tmux viewer.
+What exists today: the private intent repo, discovery (`ateam init`), the planner (`ateam plan` and `ateam approve`), records and contracts, briefs, a single clean-room worker run, the policy gate, the tree and scope check, and telemetry. Since 2026-10-26 `ateam contracts refresh`, `ateam integrate` and `ateam merge` carry a verified plan to the target branch (see the README, step 5). What does not exist yet: the scheduler, pause and resume, the verifier that runs checks plus the TEST role as a gate, event logs and the tmux viewer.
 
 ## 0. Setup (two minutes)
 

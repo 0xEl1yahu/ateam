@@ -724,7 +724,8 @@ def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, force
 @click.argument("reason")
 @TARGET_OPTION
 def reject(plan_id: str, reason: str, target: Path) -> None:
-    """Reject a proposed plan. Its contracts stay draft and are never frozen."""
+    """Reject a proposed plan (its contracts stay draft and are never frozen) or a merge proposal (the integration
+    branch and the target are left as they are)."""
     from datetime import UTC, datetime
 
     from ateam.plans.model import PlanHistoryEntry, PlanStatus
@@ -735,8 +736,11 @@ def reject(plan_id: str, reason: str, target: Path) -> None:
     if plan_id not in plans_:
         _fail(f"unknown plan {plan_id}")
     plan_ = plans_[plan_id]
-    if plan_.status != PlanStatus.plan_proposed:
-        _fail(f"{plan_id} is {plan_.status}; only plan_proposed plans can be rejected")
+    stored = ctx.db.feature_status(plan_id)
+    if plan_.status not in (PlanStatus.plan_proposed, PlanStatus.merge_proposed) or (
+            plan_.status == PlanStatus.merge_proposed and stored != "merge_proposed"):
+        _fail(f"{plan_id} is {plan_.status} in its file and {stored} in the state store; "
+              "only plan_proposed or merge_proposed plans can be rejected")
     try:
         require_clean(ctx.paths)
     except IntentError as e:
@@ -748,6 +752,59 @@ def reject(plan_id: str, reason: str, target: Path) -> None:
     commit_intent_files(ctx.paths, f"ateam: reject plan {plan_id}", [save_plan(ctx.paths.plans, plan_)])
     ctx.db.transition("feature", plan_id, "plan_rejected", by="owner", reason=reason)
     click.echo(f"{plan_id} -> plan_rejected")
+
+
+@main.command()
+@click.argument("plan_id")
+@TARGET_OPTION
+def integrate(plan_id: str, target: Path) -> None:
+    """Merge a plan's verified contracts onto ateam/<plan-id>, run the full checks there and propose the merge.
+
+    Exit 0 merge_proposed, 1 checks or setup failed (paused), 3 merge conflict (paused), 4 refused."""
+    from ateam.gitops import GitError
+    from ateam.integrate import IntegrateRefused
+    from ateam.integrate import integrate as run_integrate
+
+    ctx = _context(target)
+    try:
+        res = run_integrate(ctx, plan_id, echo=click.echo)
+    except IntegrateRefused as e:
+        _fail(str(e), code=4)
+    except (GitError, IntentError) as e:
+        _fail(f"git failed during integration: {e}. Re-run ateam integrate {plan_id} once it is fixed; "
+              "completed steps are kept")
+    for m in res.messages:
+        click.echo(m)
+    if res.outcome == "merge_proposed":
+        click.echo(f"Review {res.proposal}, then: ateam merge {plan_id}   (or: ateam reject {plan_id} \"reason\")")
+        sys.exit(0)
+    sys.exit(3 if res.outcome == "conflict" else 1)
+
+
+@main.command("merge")
+@click.argument("plan_id")
+@TARGET_OPTION
+def merge_cmd(plan_id: str, target: Path) -> None:
+    """Fast-forward the target branch to the proposed integration tip, in your checkout. Nothing is pushed.
+
+    Exit 0 merged, 1 fast-forward impossible (the target moved), 4 refused."""
+    from ateam.gitops import GitError
+    from ateam.merge import FastForwardImpossible, MergeRefused, merge_plan
+
+    ctx = _context(target)
+    try:
+        res = merge_plan(ctx, plan_id)
+    except FastForwardImpossible as e:
+        _fail(str(e), code=1)
+    except MergeRefused as e:
+        _fail(str(e), code=4)
+    except (GitError, IntentError) as e:
+        _fail(f"git failed during the merge: {e}")
+    if res.old_head == res.new_head:
+        click.echo(f"{res.target_branch} already at {res.new_head[:12]}")
+    else:
+        click.echo(f"{res.target_branch} fast-forwarded to {res.new_head[:12]} (from {res.old_head[:12]})")
+    click.echo(f"{plan_id} -> merged. Nothing was pushed.")
 
 
 @main.group()
