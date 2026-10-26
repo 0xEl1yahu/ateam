@@ -1,6 +1,6 @@
 # Pause, investigate and resume: design
 
-Date: 2026-10-26. Status: draft for owner approval. Builds on `ateam run` (the scheduler, plan `docs/superpowers/plans/2026-10-26-scheduler.md`) and amends the binding harness design (`docs/superpowers/specs/2026-10-24-ateam-harness-design.md`).
+Date: 2026-10-26. Status: approved by the owner 2026-10-26; decisions 11-13 added at plan review the same day. Builds on `ateam run` (the scheduler, plan `docs/superpowers/plans/2026-10-26-scheduler.md`) and amends the binding harness design (`docs/superpowers/specs/2026-10-24-ateam-harness-design.md`).
 
 ## Intent
 
@@ -23,7 +23,6 @@ This design gives a pause a way out that keeps the owner in charge. When a run g
 - `serialize_checks`, the rebase BUILD after a merge conflict, INVESTIGATE before BUILD for uncertain contracts, downstream revalidation, and native session resume by ID. They stay recorded deviations.
 - Investigating a pause that happens during final integration (`integrating -> paused`).
 - Abandoning a plan (`paused -> abandoned`). The transition exists; a command for it is separate work.
-- Mutual exclusion of `ateam plan`/`approve`/`reject` with `ateam run`. Decided by the owner on 2026-10-26 and built as its own change before this one; this design assumes it.
 
 ## Anti-goals (failure even if it works)
 
@@ -45,6 +44,9 @@ This design gives a pause a way out that keeps the owner in charge. When a run g
 8. **Resume does not gate on the pause reason.** It applies the existing rule that every unfinished contract must bind (frozen, unchanged since the freeze, runnable, no record drift). The owner running `resume` is the judgment that the cause is dealt with.
 9. **Instructions are tied to the contract they were written for.** Each records the contract's frozen hash at the time; after a re-freeze changes the hash, the instruction stays in the file for history but is no longer delivered.
 10. **Pause investigations run in the paused contract's worktree**, read-only, with the full snapshot (HEAD, every ref, the stash list, dirty paths and their content, and the intent repo), not narrowed. A change discards the findings as `tamper` and the pause stands. This amends the rule that read-only investigations run in the owner's checkout (CLAUDE.md rule 6 and the spec's carve-out), for pause investigations only.
+11. **A worker may read its own worktree under ATeam's home.** Scheduler worktrees live at `<home>/worktrees/<cid>`, and the home-read guard denied a worker its own files there. A path that resolves inside the worker's own worktree is not "ATeam's home". Nothing else under the home becomes readable: not other worktrees, not the integration worktree, not the intent repo, the state store or other scratch directories.
+12. **Resume refreshes only the contracts a pause record lists.** After `owner_stopped` none are refreshed, since interrupted attempts already do not count. A plan paused without a record refreshes none, and resume says so.
+13. **Planning and running exclude each other.** While a run holds the lock, every owner command that commits to the intent repo refuses (`init`, `plan`, `approve`, `reject`, the `records` lifecycle commands, `contracts freeze`, `merge`, `intent pull`, `resume`, and a direct `stop`). While a planning session is live, `run`, `resume` and a direct `stop` refuse. The commands the scheduler runs as children are not guarded.
 
 ## Calls made by the assistant (owner to check)
 
@@ -57,7 +59,8 @@ This design gives a pause a way out that keeps the owner in charge. When a run g
 - **Investigations run at `careful`**, following the owner's standing rule that investigations default to `careful`, with the cap reserved against `run_budget_usd` like any session. If the reservation does not fit, the investigation does not run and the pause says so.
 - **One investigation per paused contract.** A pause with no contract (final integration) is not investigated.
 - **`ateam resume` resumes and runs.** It records any instruction, flips the plan back to `executing`, and continues in the same process as `ateam run` would. `--no-run` stops after the state change.
-- **`ateam stop` works through the store**, not signals: it records a stop request the running scheduler polls in its main loop. With no live run, it pauses an `executing` plan directly.
+- **`ateam stop` works through the store**, not signals: it records a stop request the running scheduler polls in its main loop. The scheduler then interrupts only the child sessions it launched, by pid. It never signals a process group, because a stale lock's reused pid, or a run started from a script, would put unrelated processes in that group. With no live run, `stop` pauses an `executing` plan directly while holding the run lock.
+- **Refusals that are not drift do not report drift (#17).** Record drift pauses with `records_drifted`. Any other contract that no longer binds (a hand edit after freeze, a file/store mismatch) pauses with `verification_unresolvable`. A refusal from the run's own environment pauses with `environment_failure`.
 - **An instruction names its contract when there is a choice.** With one paused contract, `--note` and `--adopt` apply to it. With several, `--adopt` adopts each contract's own suggestion, and `--note` needs `--contract C-xxxx` (repeatable). After `owner_stopped`, no contract is paused, so `--note` needs `--contract`.
 - **Resume after a non-conflict integration pause** (setup failure, failed final checks) re-runs integration; instructions are refused there, since no contract is paused.
 
@@ -133,7 +136,7 @@ A verify refusal caused by record drift classifies as `records_drifted`. A verif
 - Pause reasons enum: add `owner_stopped`.
 - Replace the deviation "a paused plan is refused by `ateam run`, naming its reason, instead of being resumed" with this design; the other scheduler deviations stand, and add "resume refuses a merge-conflict pause until the rebase BUILD exists".
 - Amend the in-place investigation carve-out (spec "Decisions made by the owner", CLAUDE.md rule 6): pause investigations run read-only in the paused contract's worktree with the full snapshot.
-- Record decisions 1-10 under "Decisions made by the owner" and the calls under "Calls made by the assistant".
+- Record decisions 1-13 under "Decisions made by the owner" and the calls under "Calls made by the assistant".
 
 ## Verification the builder must plan
 
