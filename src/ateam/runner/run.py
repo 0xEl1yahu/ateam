@@ -150,9 +150,10 @@ def default_base(git_worktree: GitRepo, target_branch: str) -> str:
         return git_worktree.head()
 
 
-def prepare_scratch(paths: TargetPaths, contract_id: str) -> Path:
-    """The worker's scratch directory, under ATeam's home, never inside the worktree or the target."""
-    scratch = paths.scratch_root / contract_id
+def prepare_scratch(paths: TargetPaths, contract_id: str, role: Role = Role.build) -> Path:
+    """The worker's scratch directory, under ATeam's home, never inside the worktree or the target. TEST has its
+    own (`<id>-test`, at the same depth), so it never reads the BUILD handoff from disk."""
+    scratch = paths.scratch_root / (f"{contract_id}-test" if role is Role.test else contract_id)
     scratch.mkdir(parents=True, exist_ok=True)
     return scratch
 
@@ -174,10 +175,11 @@ async def run_contract_attempt(
         tier, tier_name = tiers[tier_override][role], tier_override
     else:
         tier, tier_name = resolve(contract, role, tiers), contract.allocation.tier[role.value]
-    scratch = prepare_scratch(paths, contract.id)
+    scratch = prepare_scratch(paths, contract.id, role)
     policy = build_policy(worktree, role, contract, config, records, scratch_dir=scratch)
     selected = [records[ref.id] for ref in contract.records if ref.id in records]
-    prev_raw = db.latest_checkpoint(contract.id)
+    # A BUILD retry reads BUILD's own notes; TEST sees facts only (its brief drops notes).
+    prev_raw = db.latest_checkpoint(contract.id, role="build") if role is Role.build else db.latest_checkpoint(contract.id)
     prev = Checkpoint.from_dict(prev_raw) if prev_raw else None
     brief_text = render_brief(assemble_brief(contract, selected, prev, role, scratch_dir=scratch))
     predicted = {k: contract.allocation.model_dump()[k] for k in ("complexity", "risk", "uncertainty")}

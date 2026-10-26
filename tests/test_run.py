@@ -307,3 +307,77 @@ def test_ensure_setup_times_out(target_repo, ateam_home, tmp_path, monkeypatch):
 def test_setup_timeout_is_ten_minutes():
     from ateam.runner.run import SETUP_TIMEOUT_S
     assert SETUP_TIMEOUT_S == 600
+
+
+# ---- TEST gets its own scratch; BUILD retries read BUILD notes (plan 2026-10-26-scheduler, task 2)
+
+def test_test_role_scratch_is_separate_from_build(target_paths):
+    from ateam.roles import Role
+    from ateam.runner.run import prepare_scratch
+    build = prepare_scratch(target_paths, "C-0001")
+    test = prepare_scratch(target_paths, "C-0001", Role.test)
+    assert build == target_paths.scratch_root / "C-0001" and test == target_paths.scratch_root / "C-0001-test"
+    assert test.is_dir() and test.parent == build.parent      # same depth: build_policy's home derivation holds
+    assert prepare_scratch(target_paths, "C-0001", Role.investigate) == build
+
+
+def _attempt_harness(monkeypatch, target_repo, target_paths, sample_contract, records_three):
+    from ateam.contracts.select import freeze
+    from ateam.paths import home_dir
+    from ateam.runner import run as run_mod
+    from ateam.state.db import StateDB
+
+    async def fake_query(prompt, options):
+        yield _result()
+
+    seen: dict[str, list] = {"scratch": [], "prev": []}
+    real_policy, real_brief = run_mod.build_policy, run_mod.assemble_brief
+
+    def spy_policy(*a, **kw):
+        seen["scratch"].append(kw["scratch_dir"]); return real_policy(*a, **kw)
+
+    def spy_brief(contract, selected, prev, role, **kw):
+        seen["prev"].append(prev); return real_brief(contract, selected, prev, role, **kw)
+
+    monkeypatch.setattr("ateam.runner.run.query", fake_query)
+    monkeypatch.setattr(run_mod, "build_policy", spy_policy)
+    monkeypatch.setattr(run_mod, "assemble_brief", spy_brief)
+    db = StateDB(home_dir(target_repo) / "state.db"); db.init_schema()
+    contract = freeze(sample_contract, [records_three["R-0001"]])
+    db.upsert_contract(contract.id, contract.plan, contract.status, contract.content_hash())
+    return run_mod, db, contract, seen
+
+
+async def _attempt(run_mod, target_repo, target_paths, contract, records_three, db, role):
+    from ateam.config import TargetConfig
+    from ateam.gitops import GitRepo
+    from ateam.tiers import load_tiers
+    git = GitRepo(target_repo)
+    return await run_mod.run_contract_attempt(
+        paths=target_paths, config=TargetConfig(), git_worktree=git, worktree=target_repo, base=git.head(),
+        contract=contract, records=records_three, role=role, tiers=load_tiers(), db=db)
+
+
+@pytest.mark.asyncio
+async def test_test_attempt_never_sees_build_handoff(monkeypatch, target_repo, target_paths, sample_contract, records_three):
+    from ateam.roles import Role
+    run_mod, db, contract, seen = _attempt_harness(monkeypatch, target_repo, target_paths, sample_contract, records_three)
+    build_scratch = target_paths.scratch_root / contract.id
+    build_scratch.mkdir(parents=True, exist_ok=True)
+    (build_scratch / "handoff.yaml").write_text("progress: built it my way\n")
+    res, tree, scope, cp = await _attempt(run_mod, target_repo, target_paths, contract, records_three, db, Role.test)
+    assert seen["scratch"] == [target_paths.scratch_root / f"{contract.id}-test"]
+    assert cp.notes is None
+
+
+@pytest.mark.asyncio
+async def test_build_retry_brief_uses_build_notes(monkeypatch, target_repo, target_paths, sample_contract, records_three):
+    from ateam.roles import Role
+    run_mod, db, contract, seen = _attempt_harness(monkeypatch, target_repo, target_paths, sample_contract, records_three)
+    build_scratch = target_paths.scratch_root / contract.id
+    build_scratch.mkdir(parents=True, exist_ok=True)
+    (build_scratch / "handoff.yaml").write_text("progress: half done\n")
+    await _attempt(run_mod, target_repo, target_paths, contract, records_three, db, Role.build)
+    await _attempt(run_mod, target_repo, target_paths, contract, records_three, db, Role.test)
+    await _attempt(run_mod, target_repo, target_paths, contract, records_three, db, Role.build)
+    assert seen["prev"][2] is not None and seen["prev"][2].notes == {"progress": "half done"}

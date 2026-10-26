@@ -25,6 +25,7 @@ class TargetConfig(BaseModel):
     serialize_checks: bool = False
     protected_paths: list[str] = Field(default_factory=lambda: [".claude/**"])
     max_workers: int = 2
+    run_budget_usd: float = 10.0   # `ateam run` stops launching sessions before this would be exceeded (owner, 2026-10-26)
     global_record_cap: int = 5
     tiers: dict[str, dict] = Field(default_factory=dict)
     brief_docs: list[str] = Field(default_factory=list)  # target-relative files included in investigation briefs

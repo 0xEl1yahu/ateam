@@ -82,6 +82,7 @@ class StateDB:
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA busy_timeout=10000")   # worker processes and the scheduler write attempts concurrently
 
     # -- schema -------------------------------------------------------------
 
@@ -303,6 +304,25 @@ class StateDB:
         ).fetchone()
         return dict(row) if row else None
 
+    def attempts_for(self, contract_id: str, role: str | None = None) -> list[dict[str, Any]]:
+        sql, args = "SELECT * FROM attempts WHERE contract_id=?", [contract_id]
+        if role is not None:
+            sql, args = sql + " AND role=?", [*args, role]
+        return [dict(r) for r in self.conn.execute(sql + " ORDER BY attempt_id", args)]
+
+    def open_attempts(self, contract_ids: list[str]) -> list[dict[str, Any]]:
+        """Attempts of these contracts that never finished (a killed or interrupted session)."""
+        marks = ",".join("?" * len(contract_ids)) or "NULL"
+        rows = self.conn.execute(
+            f"SELECT * FROM attempts WHERE finished_at IS NULL AND contract_id IN ({marks}) ORDER BY attempt_id", contract_ids)
+        return [dict(r) for r in rows]
+
+    def interrupt_attempt(self, attempt_id: int) -> None:
+        """Close an unfinished attempt as interrupted; a finished one is left as it is."""
+        with self.conn:
+            self.conn.execute("UPDATE attempts SET finished_at=?, outcome='interrupted', failure_class=NULL "
+                              "WHERE attempt_id=? AND finished_at IS NULL", (_now(), attempt_id))
+
     def telemetry_rows(self) -> list[dict[str, Any]]:
         return [dict(r) for r in self.conn.execute("SELECT * FROM attempts ORDER BY attempt_id")]
 
@@ -315,16 +335,25 @@ class StateDB:
                 (contract_id, attempt_id, json.dumps(facts, default=str), _now()),
             )
 
-    def latest_checkpoint(self, contract_id: str) -> dict[str, Any] | None:
-        row = self.conn.execute(
-            "SELECT facts FROM checkpoints WHERE contract_id=? ORDER BY seq DESC LIMIT 1", (contract_id,)
-        ).fetchone()
+    def latest_checkpoint(self, contract_id: str, role: str | None = None) -> dict[str, Any] | None:
+        """The latest checkpoint of a contract, or of the attempts of one role (joined through attempt_id)."""
+        if role is None:
+            row = self.conn.execute(
+                "SELECT facts FROM checkpoints WHERE contract_id=? ORDER BY seq DESC LIMIT 1", (contract_id,)
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT c.facts FROM checkpoints c JOIN attempts a ON a.attempt_id = c.attempt_id "
+                "WHERE c.contract_id=? AND a.role=? ORDER BY c.seq DESC LIMIT 1", (contract_id, role),
+            ).fetchone()
         return json.loads(row["facts"]) if row else None
 
     # -- run lock -----------------------------------------------------------
 
     def acquire_run_lock(self, plan_id: str) -> bool:
-        """True when this plan holds the single run lock. Exclusive across processes via the singleton row."""
+        """True when this process holds the single run lock for this plan. Exclusive across processes via the
+        singleton row; a row held by another pid, or by an unknown one, is never taken over (a stale lock after
+        kill -9 is removed by hand until doctor exists; owner, 2026-10-26)."""
         import os
 
         try:
@@ -335,7 +364,12 @@ class StateDB:
                 )
             return True
         except sqlite3.IntegrityError:
-            return self.run_lock_holder() == plan_id
+            info = self.run_lock_info()
+            return info is not None and info["plan_id"] == plan_id and info["pid"] == os.getpid()
+
+    def run_lock_info(self) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT plan_id, pid, acquired_at FROM run_lock LIMIT 1").fetchone()
+        return dict(row) if row else None
 
     def release_run_lock(self, plan_id: str) -> None:
         with self.conn:

@@ -2249,3 +2249,139 @@ def test_the_planning_marker_exists_before_the_plan_is_investigating(monkeypatch
     _patch_investigation(monkeypatch, _canned_plan())
     assert run("plan", "add a health function", "--target", str(cli_target)).exit_code == 0
     assert seen["marker"] is not None
+
+
+def test_brief_uses_role_scratch(cli_target):
+    r = run("brief", "C-0001", "--role", "test", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert "C-0001-test" in r.output
+    assert "C-0001-test" not in run("brief", "C-0001", "--role", "build", "--target", str(cli_target)).output
+
+
+# ---- result files and verify --base (plan 2026-10-26-scheduler, task 3)
+
+def _read(path):
+    import json
+    return json.loads(path.read_text())
+
+
+def test_worker_run_result_file(monkeypatch, cli_target, tmp_path):
+    from ateam.config import load_config, save_config
+    out = tmp_path / "r.json"
+    # not binding: exit 4
+    wt = tmp_path / "wt-r"; GitRepo(cli_target).worktree_add(wt, "wt-r", "main")
+    r = run("worker", "run", "C-0001", "--role", "build", "--cwd", str(wt), "--result-file", str(out), "--target", str(cli_target))
+    assert r.exit_code == 4 and _read(out)["outcome"] == "not_binding" and _read(out)["code"] == 4
+    # completed
+    _frozen_target(cli_target)
+    _fake_attempt(monkeypatch, _MET)
+    r = run("worker", "run", "C-0001", "--role", "test", "--cwd", str(wt), "--result-file", str(out), "--target", str(cli_target))
+    d = _read(out)
+    assert r.exit_code == 0 and d["outcome"] == "completed" and d["test_outcome"] == "completed" and d["subtype"] == "success"
+    # TEST failed verdict: exit 5
+    _fake_attempt(monkeypatch, _NOT_MET)
+    r = run("worker", "run", "C-0001", "--role", "test", "--cwd", str(wt), "--result-file", str(out), "--target", str(cli_target))
+    assert r.exit_code == 5 and _read(out)["test_outcome"] == "failed" and _read(out)["test_class"] == "implementation"
+    # setup failure
+    paths = TargetPaths.from_root(cli_target)
+    cfg = load_config(paths); cfg.setup = ["false"]; save_config(paths, cfg)
+    wt2 = tmp_path / "wt-r2"; GitRepo(cli_target).worktree_add(wt2, "wt-r2", "main")
+    r = run("worker", "run", "C-0001", "--role", "build", "--cwd", str(wt2), "--result-file", str(out), "--target", str(cli_target))
+    assert r.exit_code == 1 and _read(out)["outcome"] == "setup_failed" and "setup failed" in _read(out)["error"]
+
+
+def test_verify_base_scopes_against_the_given_commit(cli_target, tmp_path):
+    wt = _verify_setup(cli_target, tmp_path, [("unit", "true")])
+    g = GitRepo(wt)
+    (wt / "docs").mkdir(); (wt / "docs" / "dep.md").write_text("from a merged dependency\n")   # outside C-0001's paths
+    g.run("add", "-A"); g.run("commit", "-q", "-m", "dependency merged into the integration tip")
+    base = g.head()
+    _do_work(wt)
+    r = run("verify", "C-0001", "--cwd", str(wt), "--base", base, "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+
+
+def test_verify_without_base_counts_the_dependency_as_out_of_scope(cli_target, tmp_path):
+    wt = _verify_setup(cli_target, tmp_path, [("unit", "true")])
+    g = GitRepo(wt)
+    (wt / "docs").mkdir(); (wt / "docs" / "dep.md").write_text("from a merged dependency\n")
+    g.run("add", "-A"); g.run("commit", "-q", "-m", "dependency")
+    _do_work(wt)
+    r = run("verify", "C-0001", "--cwd", str(wt), "--target", str(cli_target))
+    assert r.exit_code == 1 and "docs/dep.md" in r.output
+
+
+def test_verify_result_file_marks_refusals_and_verdicts(cli_target, tmp_path):
+    out = tmp_path / "v.json"
+    wt = _verify_setup(cli_target, tmp_path, [("unit", "true")])
+    (wt / "src" / "api" / "x.py").write_text("DIRTY = 1\n")      # uncommitted work: a refusal, not a failure
+    r = run("verify", "C-0001", "--cwd", str(wt), "--result-file", str(out), "--target", str(cli_target))
+    d = _read(out)
+    assert r.exit_code == 1 and d["status"] == "refused" and d["failure_class"] is None and "uncommitted" in d["reasons"][0]
+    GitRepo(wt).run("checkout", "--", "src/api/x.py")
+    _do_work(wt)
+    r = run("verify", "C-0001", "--cwd", str(wt), "--result-file", str(out), "--target", str(cli_target))
+    assert r.exit_code == 0 and _read(out) == {"code": 0, "status": "verified", "failure_class": None, "reasons": []}
+
+
+def test_refresh_result_file(monkeypatch, cli_target, tmp_path):
+    out = tmp_path / "f.json"
+    p = _approved_predecessor(monkeypatch, cli_target)
+    _mark_verified(p, cli_target, "C-0002")
+    r = run("contracts", "refresh", "--result-file", str(out), "--target", str(cli_target))
+    assert r.exit_code == 0 and _read(out) == {"code": 0, "promoted": ["C-0003"], "drifted": []}
+
+
+def test_result_file_records_an_interrupt(tmp_path):
+    import json
+    from ateam.cli import _Result
+    out = tmp_path / "i.json"
+    with pytest.raises(KeyboardInterrupt):
+        with _Result(out, {"outcome": "refused", "status": "refused"}):
+            raise KeyboardInterrupt
+    assert json.loads(out.read_text()) == {"code": 130, "outcome": "interrupted", "status": "interrupted"}
+
+
+# ---- final review fixes (scheduler branch)
+
+def test_worker_run_result_file_reports_a_tampered_session(monkeypatch, cli_target, tmp_path):
+    from types import SimpleNamespace
+    from ateam.runner.run import WorkerResult
+    _frozen_target(cli_target)
+    out = tmp_path / "t.json"
+
+    async def tampered(**kw):
+        db = kw["db"]
+        a = db.start_attempt("C-0001", "build", "light", "haiku", {})
+        db.finish_attempt(a, "tamper", "tamper", 1, 1, 0.2, 1, 1.0, "s")
+        res = WorkerResult("success", False, "completed", "s", 1, 0.2, {}, {}, {"summary": "x"}, [], [], None, 0.1)
+        return res, SimpleNamespace(changed_vs_base=[]), SimpleNamespace(ok=True, outside=[], dirty=[]), None
+
+    monkeypatch.setattr("ateam.runner.run.run_contract_attempt", tampered)
+    wt = tmp_path / "wt-t"; GitRepo(cli_target).worktree_add(wt, "wt-t", "main")
+    run("worker", "run", "C-0001", "--role", "build", "--cwd", str(wt), "--result-file", str(out), "--target", str(cli_target))
+    assert _read(out)["outcome"] == "tamper"
+
+
+def test_result_file_reports_a_crash_as_failed_with_unknown_cost(tmp_path):
+    import json
+    from ateam.cli import _Result
+    out = tmp_path / "c.json"
+    with pytest.raises(RuntimeError):
+        with _Result(out, {"outcome": "refused", "status": "refused", "failure_class": None, "error": None, "cost_usd": 0.0}):
+            raise RuntimeError("tree_state exploded")
+    d = json.loads(out.read_text())
+    assert d["code"] == 1 and d["outcome"] == "failed" == d["status"] and d["failure_class"] == "environment"
+    assert "tree_state exploded" in d["error"] and d["cost_usd"] is None
+
+
+def test_release_own_run_lock_leaves_another_holder_alone(cli_target):
+    from ateam.cli import _release_own_run_lock
+    db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
+    assert db.acquire_run_lock("P-0001")
+    _release_own_run_lock(cli_target, "P-0001")
+    assert db.run_lock_info() is None
+    with db.conn:
+        db.conn.execute("INSERT INTO run_lock (singleton, plan_id, acquired_at, pid) VALUES (1, 'P-0001', 'then', 1)")
+    _release_own_run_lock(cli_target, "P-0001")
+    assert db.run_lock_info()["pid"] == 1
