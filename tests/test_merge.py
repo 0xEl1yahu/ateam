@@ -107,3 +107,20 @@ def test_rerun_after_interruption_completes_without_ref_change(proposed, monkeyp
     res, ctx = _merge(proposed.root)
     assert res.new_head == res.old_head == proposed.tip and owner.run("reflog", "-n", "1", "main") == reflog
     assert ctx.db.feature_status("P-0001") == "merged"
+
+
+def test_refuses_a_target_reset_behind_the_proposal_and_integrate_reproposes(verified):
+    from ateam.merge import MergeRefused
+    owner = GitRepo(verified.root)
+    h0 = owner.head()
+    h1 = _commit_on_main(verified.root, "docs/early.md", "early\n")
+    res, out, _ = _integrate(verified.root)
+    assert res.outcome == "merge_proposed"
+    owner.run("reset", "-q", "--hard", h0)                     # the owner drops h1 after the proposal
+    with pytest.raises(MergeRefused, match=f"main is at {h0[:12]}.*made against {h1[:12]}.*ateam integrate P-0001"):
+        _merge(verified.root)
+    assert owner.head() == h0
+    again, out, _ = _integrate(verified.root)                  # proposes again against h0; the diff now shows h1
+    assert again.outcome == "merge_proposed" and "docs/early.md" in again.proposal.read_text()
+    result, _ = _merge(verified.root)
+    assert result.new_head == again.tip

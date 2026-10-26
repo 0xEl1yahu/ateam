@@ -32,7 +32,7 @@ def _bullets(lines: list[str]) -> str:
 
 def render_proposal(
     header: ProposalHeader, *, diff_stat: str, contracts: list[dict], records: list[str], risks: list[str],
-    telemetry: list[dict],
+    telemetry: list[dict], final_checks: list[dict] = (),
 ) -> str:
     evidence = []
     for c in contracts:
@@ -48,6 +48,8 @@ def render_proposal(
         f"# Merge proposal {header.plan_id}\n\n"
         f"`ateam merge {header.plan_id}` fast-forwards {header.target_branch} to {header.branch} at {header.tip}.\n\n"
         f"## Diff summary\n\n```\n{diff_stat.rstrip() or 'no changes'}\n```\n\n"
+        f"## Final checks on the integration tip\n\n"
+        + _bullets([f"{k['name']}: {'passed' if k.get('passed') else 'FAILED'}" for k in final_checks]) + "\n\n"
         f"## Evidence per contract\n\n" + ("\n\n".join(evidence) or "none") + "\n\n"
         f"## Records\n\n{_bullets(records)}\n\n"
         f"## Unresolved risks\n\n{_bullets(risks)}\n\n"

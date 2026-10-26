@@ -256,3 +256,82 @@ def test_setup_failure_pauses(verified):
     assert res.outcome == "setup_failed"
     assert ctx.db.transitions("feature", "P-0001")[-1]["reason"].startswith("environment_failure: setup failed")
     assert ctx.db.feature_status("P-0001") == "paused"
+
+
+# ---- final review fixes
+
+def _interrupt_final_checks(monkeypatch, root):
+    import ateam.verify as v
+
+    def boom(*a, **kw):
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as m:
+        m.setattr(v, "run_checks", boom)
+        with pytest.raises(KeyboardInterrupt):
+            _integrate(root)
+
+
+def test_recreated_branch_without_integrated_work_is_refused(verified, monkeypatch):
+    from ateam.integrate import IntegrateRefused, integration_worktree
+    _interrupt_final_checks(monkeypatch, verified.root)
+    owner = GitRepo(verified.root)
+    owner.run("worktree", "remove", "--force", str(integration_worktree(verified.paths, "P-0001")))
+    owner.run("branch", "-D", "ateam/P-0001")
+    with pytest.raises(IntegrateRefused, match="C-0001 is integrated but its verified head .* is not on ateam/P-0001"):
+        _integrate(verified.root)
+
+
+def test_reset_integration_worktree_is_refused(verified, monkeypatch):
+    from ateam.integrate import IntegrateRefused, integration_worktree
+    _interrupt_final_checks(monkeypatch, verified.root)
+    wt = GitRepo(integration_worktree(verified.paths, "P-0001"))
+    wt.run("reset", "-q", "--hard", GitRepo(verified.root).rev_parse("main"))
+    with pytest.raises(IntegrateRefused, match="C-0001 is integrated but its verified head"):
+        _integrate(verified.root)
+
+
+def test_unproposed_commits_on_the_branch_are_reproposed(verified):
+    from ateam.integrate import integration_worktree
+    first, _, _ = _integrate(verified.root)
+    wt = GitRepo(integration_worktree(verified.paths, "P-0001"))
+    (wt.root / "fix.txt").write_text("owner fix\n"); wt.run("add", "-A"); wt.run("commit", "-q", "-m", "owner fix")
+    res, out, ctx = _integrate(verified.root)
+    assert res.outcome == "merge_proposed" and res.tip == wt.head() != first.tip
+    assert parse_header(GitRepo(verified.paths.intent).show_file("HEAD", proposal_relpath("P-0001"))).tip == wt.head()
+    assert "ateam/P-0001 has commits the proposal does not cover" in ctx.db.transitions("feature", "P-0001")[-2]["reason"]
+
+
+def test_parallel_intent_commit_during_checks_is_a_retry_not_a_pause(verified, monkeypatch):
+    import ateam.verify as v
+    from ateam.integrate import IntegrateRefused
+    real = v.run_checks
+
+    def with_parallel_commit(*a, **kw):
+        f = verified.paths.intent / "notes.md"; f.write_text("someone else\n")
+        commit_intent(verified.paths, "parallel", ["notes.md"])
+        return real(*a, **kw)
+
+    with monkeypatch.context() as m:
+        m.setattr(v, "run_checks", with_parallel_commit)
+        with pytest.raises(IntegrateRefused) as e:
+            _integrate(verified.root)
+    message = str(e.value).lower()
+    assert "committed during the final checks" in message and "re-run ateam integrate p-0001" in message
+    ctx = Context(verified.root)
+    assert ctx.db.feature_status("P-0001") == "integrating" and load_plans(verified.paths.plans)["P-0001"].status == "integrating"
+    res, out, _ = _integrate(verified.root)
+    assert res.outcome == "merge_proposed"
+
+
+def test_check_that_edits_the_worktree_still_pauses_as_tamper(verified):
+    _set_config(verified.paths, checks=[NamedCheck(name="unit", cmd="true"), NamedCheck(name="sneaky", cmd="echo x >> src/a/a.py")])
+    res, out, ctx = _integrate(verified.root)
+    assert res.outcome == "checks_failed"
+    assert ctx.db.transitions("feature", "P-0001")[-1]["reason"] == "verification_unresolvable: tamper: worktree tracked files changed"
+
+
+def test_proposal_shows_record_status_and_final_check_results(verified):
+    res, _, _ = _integrate(verified.root)
+    text = res.proposal.read_text()
+    assert "## Final checks on the integration tip" in text and "- unit: passed" in text

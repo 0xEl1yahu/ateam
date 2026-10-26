@@ -28,11 +28,14 @@ from ateam.paths import TargetPaths, home_dir
 from ateam.plans.model import Plan
 from ateam.plans.ops import dependency_order, plan_contract_ids, set_plan_status
 from ateam.plans.store import load_plans
-from ateam.proposal import ProposalHeader, proposal_relpath, render_proposal
+from ateam.proposal import ProposalError, ProposalHeader, parse_header, proposal_relpath, render_proposal
 from ateam.records.store import load_records
 from ateam.runner.run import SetupError, ensure_setup
 
 WALK = ["plan_approved", "executing", "integrating", "merge_proposed"]
+# Movement outside the integration worktree during the final checks: something else committed in parallel. The run is
+# refused for a retry instead of pausing the plan (owner, 2026-10-26); tamper inside the worktree still pauses.
+RETRY_TAMPER = {"intent repo HEAD moved", "intent repo files changed", "owner checkout HEAD moved"}
 
 
 class IntegrateRefused(Exception):
@@ -54,6 +57,20 @@ def integration_branch(plan_id: str) -> str:
 
 def integration_worktree(paths: TargetPaths, plan_id: str) -> Path:
     return home_dir(paths.root) / "worktrees" / plan_id
+
+
+def proposal_covers(git: GitRepo, header: ProposalHeader, target_tip: str) -> bool:
+    """The target is where the proposal saw it, or has moved forward along the proposed history only: everything a
+    fast-forward to header.tip adds was in the reviewed diff (owner, 2026-10-26)."""
+    return target_tip == header.target_tip or (
+        git.is_ancestor(header.target_tip, target_tip) and git.is_ancestor(target_tip, header.tip))
+
+
+def committed_header(paths: TargetPaths, plan_id: str) -> ProposalHeader:
+    try:
+        return parse_header(intent_git(paths).show_file("HEAD", proposal_relpath(plan_id)))
+    except (GitError, ProposalError) as e:
+        raise IntegrateRefused(f"no usable committed merge proposal for {plan_id}: {e}") from None
 
 
 def check_set(config: TargetConfig, contracts: list[Contract]) -> list[NamedCheck]:
@@ -92,13 +109,19 @@ def integrate(ctx, plan_id: str, echo: Callable[[str], None]) -> IntegrateResult
 
     target_tip = owner.rev_parse(config.target_branch)
     if store == "merge_proposed":
-        tip = owner.rev_parse(branch)
-        if owner.is_ancestor(target_tip, tip):
+        try:
+            tip = owner.rev_parse(branch)
+        except GitError:
+            raise IntegrateRefused(f"{branch} is gone; reject {plan_id} or restore the branch at the proposed tip") from None
+        header = committed_header(paths, plan_id)
+        if header.tip == tip and proposal_covers(owner, header, target_tip):
+            _require_heads(db, owner, cids, tip, branch)
             return IntegrateResult("merge_proposed", plan_id, tip, paths.intent / proposal_relpath(plan_id),
                                    [f"already proposed; {config.target_branch} has not moved"])
-        plan = set_plan_status(paths, db, plan, ["integrating"], by="integrate",
-                               why=f"{config.target_branch} moved to {target_tip[:12]} after the proposal")
-        echo(f"{plan_id} -> integrating ({config.target_branch} moved since the proposal)")
+        why = (f"{branch} has commits the proposal does not cover" if header.tip != tip
+               else f"{config.target_branch} moved to {target_tip[:12]} after the proposal")
+        plan = set_plan_status(paths, db, plan, ["integrating"], by="integrate", why=why)
+        echo(f"{plan_id} -> integrating ({why})")
     elif store != "integrating":
         plan = set_plan_status(paths, db, plan, WALK[WALK.index(store) + 1:WALK.index("integrating") + 1], by="integrate")
         echo(f"{plan_id} -> integrating")
@@ -126,6 +149,7 @@ def integrate(ctx, plan_id: str, echo: Callable[[str], None]) -> IntegrateResult
         db.transition("contract", cid, "integrated", by="integrate", reason=f"merged {merge}")
         echo(f"{cid} -> integrated ({merge[:12]})")
 
+    _require_heads(db, wt, cids, "HEAD", branch)
     if not wt.is_ancestor(target_tip, "HEAD"):
         try:
             wt.merge_no_ff(target_tip, f"ateam: merge {config.target_branch} into {branch}")
@@ -137,7 +161,7 @@ def integrate(ctx, plan_id: str, echo: Callable[[str], None]) -> IntegrateResult
     intent = intent_git(paths)
 
     def fingerprint() -> str:
-        h = hashlib.sha256("".join(db.fingerprint(c) for c in cids).encode())
+        h = hashlib.sha256("".join(db.fingerprint(c, records=False) for c in cids).encode())
         h.update(json.dumps(db.transitions("feature", plan_id), default=str).encode())
         return h.hexdigest()
 
@@ -154,6 +178,9 @@ def integrate(ctx, plan_id: str, echo: Callable[[str], None]) -> IntegrateResult
         echo(line)
     for t in tamper:
         echo(f"  tamper: {t}")
+    if tamper and set(tamper) <= RETRY_TAMPER:
+        raise IntegrateRefused(f"something else committed during the final checks ({'; '.join(tamper)}); nothing was "
+                               f"paused. Re-run ateam integrate {plan_id} when nothing else is running")
     failed = [r.name for r in results if not r.passed]
     if failed or tamper:
         detail = "; ".join([*(f"{n} failed" for n in failed), *(f"tamper: {t}" for t in tamper)])
@@ -164,10 +191,10 @@ def integrate(ctx, plan_id: str, echo: Callable[[str], None]) -> IntegrateResult
         ProposalHeader(plan_id, branch, tip, config.target_branch, target_tip),
         diff_stat=owner.diff_stat(target_tip, tip),
         contracts=[_evidence(db, cs[c]) for c in dependency_order({c: cs[c] for c in cids})],
-        records=[*(f"{rid} (proposed by {plan_id})" for rid in plan.proposed_records),
-                 *(f"{ref.id} (bound by {c})" for c in cids for ref in cs[c].records)],
+        records=_records(paths, plan, cs, cids),
         risks=_risks(db, plan, cs, cids, warnings),
         telemetry=[a for a in db.telemetry_rows() if a["contract_id"] in cids],
+        final_checks=[r.fact() for r in results],
     )
     proposal = paths.intent / proposal_relpath(plan_id)
     proposal.parent.mkdir(parents=True, exist_ok=True)
@@ -279,10 +306,30 @@ def _pause(paths, db, plan: Plan, outcome, why: str, messages: list[str], echo) 
     return IntegrateResult(outcome, plan.id, messages=[why, *messages])
 
 
+def _require_heads(db, git: GitRepo, cids: list[str], rev: str, branch: str) -> None:
+    """Every contract's verified head is on `rev`: a recreated or reset branch never proposes without the work."""
+    for cid in cids:
+        head = db.latest_checkpoint(cid)["head"]
+        if not git.is_ancestor(head, rev):
+            raise IntegrateRefused(f"{cid} is integrated but its verified head {head[:12]} is not on {branch}; the branch "
+                                   "was recreated or reset. Restore it, or reject the plan")
+
+
+def _records(paths, plan: Plan, cs, cids) -> list[str]:
+    recs = load_records(paths.records)
+    status = lambda rid: str(recs[rid].status) if rid in recs else "missing"   # noqa: E731
+    bound: dict[str, list[str]] = {}
+    for cid in cids:
+        for ref in cs[cid].records:
+            bound.setdefault(ref.id, []).append(cid)
+    return [*(f"{rid} {status(rid)} (proposed by {plan.id})" for rid in plan.proposed_records),
+            *(f"{rid} {status(rid)} (bound by {', '.join(by)})" for rid, by in sorted(bound.items()))]
+
+
 def _evidence(db, c: Contract) -> dict:
     cp = db.latest_checkpoint(c.id) or {}
-    reason = (db.transitions("contract", c.id) or [{}])[-1].get("reason") or ""
-    return {"id": c.id, "title": c.title, "merge": reason.removeprefix("merged ") or "unknown",
+    merged = [t["reason"] for t in db.transitions("contract", c.id) if (t.get("reason") or "").startswith("merged ")]
+    return {"id": c.id, "title": c.title, "merge": merged[-1].removeprefix("merged ") if merged else "recorded after an interruption",
             "checks": cp.get("checks", []), "warnings": cp.get("warnings", [])}
 
 

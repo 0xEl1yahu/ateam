@@ -239,9 +239,10 @@ class StateDB:
             traces.append("a verify marker")
         return traces
 
-    def fingerprint(self, contract_id: str) -> str:
-        """A hash of everything the store holds about one contract, plus every record hash, as committed (writes by
-        other connections included). Other contracts' rows are left out, so parallel work does not change it."""
+    def fingerprint(self, contract_id: str, records: bool = True) -> str:
+        """A hash of everything the store holds about one contract, plus every record hash unless `records` is False,
+        as committed (writes by other connections included). Other contracts' rows are left out, so parallel work
+        does not change it."""
         import hashlib
 
         queries = [
@@ -250,8 +251,9 @@ class StateDB:
             ("SELECT * FROM checkpoints WHERE contract_id=? ORDER BY seq", (contract_id,)),
             ("SELECT * FROM attempts WHERE contract_id=? ORDER BY attempt_id", (contract_id,)),
             ("SELECT * FROM meta WHERE key LIKE 'verify-%:' || ? ORDER BY key", (contract_id,)),
-            ("SELECT record_id, hash FROM record_hashes ORDER BY record_id", ()),
         ]
+        if records:
+            queries.append(("SELECT record_id, hash FROM record_hashes ORDER BY record_id", ()))
         h = hashlib.sha256()
         for sql, args in queries:
             for row in self.conn.execute(sql, args):

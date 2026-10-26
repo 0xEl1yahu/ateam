@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ateam.gitops import GitError
-from ateam.integrate import integration_branch
+from ateam.integrate import integration_branch, proposal_covers
 from ateam.intent import IntentError, intent_git, require_clean
 from ateam.plans.ops import set_plan_status
 from ateam.plans.store import load_plans
@@ -75,6 +75,10 @@ def merge_plan(ctx, plan_id: str) -> MergeResult:
             raise FastForwardImpossible(
                 f"{target} moved to {old[:12]} since the proposal; {tip[:12]} does not descend from it, so a fast-forward "
                 f"is impossible. Run ateam integrate {plan_id} to merge it in and propose again")
+        if not proposal_covers(owner, header, old):
+            raise MergeRefused(
+                f"{target} is at {old[:12]}, but the proposal was made against {header.target_tip[:12]}; a fast-forward "
+                f"would add commits the reviewed diff does not show. Run ateam integrate {plan_id} to propose again")
         owner.merge_ff_only(tip)
     set_plan_status(paths, db, plan, ["merged"], by="merge", why=f"{target} fast-forwarded to {tip}")
     return MergeResult(plan_id, target, old, owner.head())
