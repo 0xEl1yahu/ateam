@@ -25,6 +25,8 @@ class PlanStatus(StrEnum):
     merge_proposed = "merge_proposed"
     merged = "merged"
     abandoned = "abandoned"
+    plan_covered = "plan_covered"
+    superseded = "superseded"
 
 
 class PlanHistoryEntry(BaseModel):
@@ -43,6 +45,8 @@ class Plan(BaseModel):
     proposed_records: list[str] = Field(default_factory=list)
     unknowns: list[str] = Field(default_factory=list)
     depends_on_plans: list[str] = Field(default_factory=list)
+    covered_by: list[str] = Field(default_factory=list)
+    replaces: str | None = None
     files_read: list[str] = Field(default_factory=list)
     out_of_scope: list[str] = Field(default_factory=list)
     verification_approach: str = ""

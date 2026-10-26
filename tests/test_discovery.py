@@ -74,3 +74,25 @@ def test_bad_enum_empty_evidence_blank_statement_and_batch_duplicates_are_droppe
     reasons = [why for _, why in r.dropped]
     assert any("origin" in w or "invalid" in w for w in reasons) and any("statement" in w for w in reasons)
     assert any("evidence" in w for w in reasons) and any("duplicate" in w for w in reasons)
+
+
+def test_pending_path_record_is_kept_when_a_contract_declares_it(target_repo, target_paths):
+    c = cand(paths=["src/ateam/integrator.py"])
+    r = candidates_to_records([c], [], {}, target_repo, target_paths.records, cap_global=3, declared_paths=["src/ateam/integrator.py"])
+    assert len(r.proposed) == 1 and not r.dropped
+    assert r.proposed[0].rationale.endswith("(pending: path declared by this plan)")
+    assert any("src/ateam/integrator.py" in n and "pending" in n for n in r.notes)
+
+
+def test_pending_path_glob_matching_a_declared_path_is_kept(target_repo, target_paths):
+    c = cand(paths=["src/ateam/new/**"])
+    r = candidates_to_records([c], [], {}, target_repo, target_paths.records, cap_global=3, declared_paths=["src/ateam/new/mod.py"])
+    assert len(r.proposed) == 1 and not r.dropped
+
+
+def test_pending_path_record_is_dropped_without_a_declaring_contract(target_repo, target_paths):
+    c = cand(paths=["src/ateam/integrator.py"])
+    r = candidates_to_records([c], [], {}, target_repo, target_paths.records, cap_global=3, declared_paths=["src/other.py"])
+    assert r.proposed == [] and len(r.dropped) == 1 and "dead glob" in r.dropped[0][1]
+    r = candidates_to_records([c], [], {}, target_repo, target_paths.records, cap_global=3)
+    assert r.proposed == [] and len(r.dropped) == 1

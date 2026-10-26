@@ -23,6 +23,8 @@ FEATURE_TRANSITIONS: dict[str | None, set[str]] = {
     "plan_rejected": set(),
     "merged": set(),
     "abandoned": set(),
+    "plan_covered": set(),   # terminal; the transition into it is wired with the CLI
+    "superseded": set(),     # terminal; likewise
 }
 
 CONTRACT_TRANSITIONS: dict[str | None, set[str]] = {

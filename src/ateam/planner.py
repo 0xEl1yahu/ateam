@@ -6,6 +6,7 @@ Allocation corrections the rubric requires are applied and recorded as notes, ne
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -39,6 +40,7 @@ class PlanResult:
     proposed: DiscoveryResult
     problems: list[str] = field(default_factory=list)
     bound_preview: dict[str, list[str]] = field(default_factory=dict)
+    covered: bool = False
 
 
 def _has_cycle(raw: list[dict]) -> bool:
@@ -65,13 +67,26 @@ def _has_cycle(raw: list[dict]) -> bool:
 def report_to_plan(
     report: dict, request: str, plan_id: str, contracts_dir: Path, records: dict[str, Record], config: TargetConfig,
     repo_root: Path, records_dir: Path, by: str = "ateam-plan",
-    tiers: dict | None = None, existing_plans: dict[str, Plan] | None = None,
+    tiers: dict | None = None, existing_plans: dict[str, Plan] | None = None, replaces: str | None = None,
 ) -> PlanResult:
     raw = list(report.get("contracts") or [])
     fatal: list[str] = []
     notes: list[str] = []
     known_checks = {c.name: c for c in config.checks}
     if not raw:
+        dead_states = (PlanStatus.plan_rejected, PlanStatus.plan_covered, PlanStatus.superseded, PlanStatus.abandoned)
+        live = {pid for pid, p in (existing_plans or {}).items() if p.status not in dead_states and pid != replaces}
+        named = list(dict.fromkeys(report.get("depends_on_plans") or []))
+        if named and all(d in live and d != plan_id for d in named):
+            plan = Plan(
+                id=plan_id, title=(report.get("title") or request)[:80], request=request, status=PlanStatus.plan_covered,
+                covered_by=named, unknowns=list(report.get("unknowns") or []), files_read=list(report.get("files_read") or []),
+                out_of_scope=list(report.get("out_of_scope") or []), verification_approach=report.get("verification_approach") or "",
+                replaces=replaces, history=[PlanHistoryEntry(at=datetime.now(UTC), by=by, to=PlanStatus.plan_covered)],
+            )
+            if report.get("notes"):
+                notes.append(str(report["notes"]))
+            return PlanResult(plan=plan, contracts=[], proposed=DiscoveryResult(unknowns=list(plan.unknowns)), problems=notes, covered=True)
         fatal.append("the plan has no contracts")
     for i, c in enumerate(raw):
         title = c.get("title") or f"contract #{i}"
@@ -103,6 +118,11 @@ def report_to_plan(
             depends_on_plans.append(dep)
             if dep not in existing_plans:
                 notes.append(f"depends_on_plans names unknown plan {dep}")
+
+    mentioned = re.findall(r"P-\d{4}", " ".join([*(report.get("unknowns") or []), str(report.get("notes") or "")]))
+    for pid in dict.fromkeys(mentioned):
+        if pid in existing_plans and pid not in depends_on_plans and pid != plan_id:
+            notes.append(f"unknowns mention {pid}, which is not in depends_on_plans")
 
     start = int(next_contract_id(contracts_dir).split("-")[1])
     ids = [f"C-{start + i:04d}" for i in range(len(raw))]
@@ -155,7 +175,9 @@ def report_to_plan(
     proposed = candidates_to_records(
         list(report.get("proposed_records") or []), list(report.get("unknowns") or []), records, repo_root, records_dir,
         cap_global=config.global_record_cap, by=by,
+        declared_paths=[p for c in contracts for p in c.paths],
     )
+    notes.extend(proposed.notes)
     graph = RecordGraph(records)
     bound_preview = {c.id: [r.id for r in select_records(c.paths, graph, repo_root)] for c in contracts}
     plan = Plan(
@@ -171,6 +193,18 @@ def report_to_plan(
 def render_plan_review(result: PlanResult, tiers) -> str:
     p = result.plan
     lines = [f"Plan {p.id}: {p.title}", f"Request: {p.request}", ""]
+    if result.covered:
+        lines.append(f"{p.id} covered by {', '.join(p.covered_by)}; no contracts written")
+        lines.append("")
+        if p.unknowns:
+            lines.append("Open questions:")
+            lines.extend(f"  - {u}" for u in p.unknowns)
+            lines.append("")
+        if result.problems:
+            lines.append("Planner's note:")
+            lines.extend(f"  - {n}" for n in result.problems)
+            lines.append("")
+        return "\n".join(lines).rstrip()
     for c in result.contracts:
         a = c.allocation
         lines.append(f"{c.id}  {c.title}")
