@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -88,6 +91,39 @@ def build_policy(
     )
 
 
+class SetupError(Exception):
+    """A config.setup command failed; nothing is recorded, so the next run tries again."""
+
+    def __init__(self, cmd: str, returncode: int, output: str) -> None:
+        super().__init__(f"setup failed: {cmd} (exit {returncode})")
+        self.cmd = cmd
+        self.returncode = returncode
+        self.output = output
+
+
+def ensure_setup(worktree: Path, config: TargetConfig, db: StateDB, on_command=None) -> list[str]:
+    """Run config.setup once per worktree; return the commands run ([] when already done or none configured)."""
+    key = f"setup:{worktree.resolve()}"
+    if not config.setup or db.get_meta(key):
+        return []
+    env = {**os.environ, **config.env}
+    for cmd in config.setup:
+        if on_command:
+            on_command(cmd)
+        proc = subprocess.run(cmd, shell=True, cwd=worktree, env=env, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise SetupError(cmd, proc.returncode, (proc.stdout or "") + (proc.stderr or ""))
+    db.set_meta(key, datetime.now(timezone.utc).isoformat())
+    return list(config.setup)
+
+
+def classify_test_report(report: dict) -> tuple[str, str | None]:
+    """Outcome and failure class of a TEST attempt. Only not_met fails it; cannot_determine alone stays completed."""
+    if not any(v.get("verdict") == "not_met" for v in report.get("verdicts", [])):
+        return "completed", None
+    return "failed", ("requirements" if report.get("requirements_unclear") else "implementation")
+
+
 def default_base(git_worktree: GitRepo, target_branch: str) -> str:
     """The commit the worktree forked from: merge-base with the target branch, else HEAD."""
     try:
@@ -153,5 +189,7 @@ async def run_contract_attempt(
     else:
         outcome = "completed" if res.report and scope.ok else ("scope_breach" if res.report else "failed")
         failure_class = None
+        if role is Role.test and res.report and scope.ok:
+            outcome, failure_class = classify_test_report(res.report)
     db.finish_attempt(attempt_id, outcome, failure_class, tokens_in, tokens_out, res.cost_usd, res.num_turns, res.wall_s, res.session_id)
     return res, tree, scope, cp

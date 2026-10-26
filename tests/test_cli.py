@@ -781,3 +781,27 @@ def test_approve_supersedes_the_replaced_plan(monkeypatch, cli_target):
     files = g.run("show", "--name-only", "--format=", "HEAD")
     assert "P-0001" in files and "P-0002" in files
     assert "superseded" in run("plans", "list", "--target", str(cli_target)).output
+
+
+# ---- setup before the first attempt
+
+def test_worker_run_runs_setup_before_the_attempt_and_stops_on_failure(monkeypatch, cli_target, tmp_path):
+    from ateam.config import load_config, save_config
+    from ateam.paths import TargetPaths
+
+    _frozen_target(cli_target)
+    paths = TargetPaths.from_root(cli_target)
+    cfg = load_config(paths)
+    cfg.setup = ["false"]
+    save_config(paths, cfg)
+    wt = tmp_path / "wt-setup"; GitRepo(cli_target).worktree_add(wt, "wt-setup", "main")
+
+    async def no_attempt(**kw):
+        raise AssertionError("run_contract_attempt must not run after a failed setup")
+
+    monkeypatch.setattr("ateam.runner.run.run_contract_attempt", no_attempt)
+    r = run("worker", "run", "C-0001", "--role", "build", "--cwd", str(wt), "--target", str(cli_target))
+    assert r.exit_code == 1 and "setup failed: false" in r.output and "Traceback" not in r.output
+    db = StateDB(home_dir(cli_target) / "state.db")
+    assert db.latest_attempt("C-0001") is None
+    assert db.get_meta(f"setup:{wt.resolve()}") is None

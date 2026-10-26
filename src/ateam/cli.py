@@ -962,7 +962,7 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
     from ateam.contracts.store import load_contracts
     from ateam.records.store import load_records
     from ateam.roles import Role
-    from ateam.runner.run import default_base, run_contract_attempt
+    from ateam.runner.run import SetupError, default_base, ensure_setup, run_contract_attempt
     from ateam.tiers import load_tiers
 
     from ateam.gitops import GitError
@@ -992,6 +992,10 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
     if tier and tier not in tiers:
         _fail(f"unknown tier {tier!r}; known: {', '.join(tiers)}")
     try:
+        ensure_setup(worktree, ctx.config, ctx.db, on_command=lambda c: click.echo(f"setup: {c}"))
+    except SetupError as e:
+        _fail(f"setup failed: {e.cmd} (exit {e.returncode})\n{e.output}")
+    try:
         res, tree, scope, cp = asyncio.run(run_contract_attempt(
             paths=ctx.paths, config=ctx.config, git_worktree=wt_git, worktree=worktree,
             base=base or default_base(wt_git, ctx.config.target_branch),
@@ -1008,6 +1012,11 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
     if res.error:
         click.echo(f"error: {res.error}")
     click.echo(f"scope ok={scope.ok} outside={scope.outside} dirty={scope.dirty} changed={tree.changed_vs_base}")
+    if Role(role) is Role.test and res.report and scope.ok:
+        from ateam.runner.run import classify_test_report
+
+        test_outcome, test_class = classify_test_report(res.report)
+        click.echo(f"classification: {test_outcome}/{test_class or '-'}")
     click.echo(json.dumps(res.report, indent=2) if res.report else "no structured report")
     sys.exit(0 if (res.report and scope.ok) else (3 if res.report else 1))
 

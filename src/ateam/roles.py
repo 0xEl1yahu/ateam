@@ -134,8 +134,9 @@ TEST_SCHEMA = {
             },
         },
         "notes": {"type": "string"},
+        "requirements_unclear": {"type": "boolean"},
     },
-    "required": ["verdicts", "notes"],
+    "required": ["verdicts", "notes", "requirements_unclear"],
 }
 
 ROLE_SPECS: dict[Role, RoleSpec] = {
@@ -170,6 +171,8 @@ ROLE_SPECS: dict[Role, RoleSpec] = {
             "contract, independently of whoever built it. You may run checks and tests and write scratch files "
             "only in your scratch directory (the one holding the handoff file). You never edit source or the contract's named tests. For every criterion "
             "return met, not_met or cannot_determine with concrete evidence. A builder's claims are not evidence. "
+            "Set requirements_unclear to true when a criterion cannot be judged fairly because the contract itself is "
+            "ambiguous or contradictory; say which criterion and why in notes. Leave it false when the code is simply wrong. "
             + COMMON
         ),
         report_schema=TEST_SCHEMA,
