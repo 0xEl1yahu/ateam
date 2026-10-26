@@ -13,7 +13,7 @@ SCHEMA_VERSION = 1
 FEATURE_TRANSITIONS: dict[str | None, set[str]] = {
     None: {"requested"},
     "requested": {"investigating"},
-    "investigating": {"plan_proposed", "plan_covered"},
+    "investigating": {"plan_proposed", "plan_covered", "plan_rejected"},   # plan_rejected: interrupted, or an unusable report
     "plan_proposed": {"plan_approved", "plan_rejected", "superseded"},
     "plan_approved": {"executing", "superseded", "plan_rejected"},   # superseded or rejected only before any of its contracts has started
     "executing": {"paused", "integrating"},
@@ -151,6 +151,9 @@ class StateDB:
     def feature_status(self, feature_id: str) -> str | None:
         row = self.conn.execute("SELECT status FROM features WHERE feature_id=?", (feature_id,)).fetchone()
         return row["status"] if row else None
+
+    def features_with_status(self, status: str) -> list[str]:
+        return [r["feature_id"] for r in self.conn.execute("SELECT feature_id FROM features WHERE status=? ORDER BY feature_id", (status,))]
 
     def max_feature_id(self) -> str | None:
         row = self.conn.execute("SELECT MAX(feature_id) AS m FROM features").fetchone()

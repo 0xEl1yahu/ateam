@@ -2109,3 +2109,52 @@ def test_review_no_report_retains_terminal_and_transport_details(monkeypatch, cl
     notes = _stored_plan(cli_target).review.notes
     assert all(part in notes for part in ("error_max_turns", "max_turns", "TransportError: disconnected"))
     assert notes in result.output
+
+
+# ---- interrupted planning is recorded, never stranded at investigating (owner, 2026-10-26)
+
+def test_plan_interrupted_before_the_plan_is_written_is_rejected(monkeypatch, cli_target):
+    from ateam.plans.store import load_plans
+    from ateam.runner import investigate as inv_mod
+
+    async def ctrl_c(**kw):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("ateam.cli.run_investigation", ctrl_c, raising=False)
+    monkeypatch.setattr(inv_mod, "run_investigation", ctrl_c)
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 130, r.output
+    p = TargetPaths.from_root(cli_target)
+    plan = load_plans(p.plans)["P-0001"]
+    assert plan.status == "plan_rejected" and plan.history[-1].why == "interrupted"
+    assert _db(cli_target).feature_status("P-0001") == "plan_rejected" and GitRepo(p.intent).is_clean()
+
+
+def _investigating(cli_target, fid, marker=None):
+    db = _db(cli_target)
+    db.transition("feature", fid, "requested", by="owner", reason="an earlier request")
+    db.transition("feature", fid, "investigating", by="ateam")
+    if marker is not None:
+        db.set_meta(f"planning:{fid}", str(marker))
+
+
+def test_plan_cleans_up_a_stale_investigating_plan(monkeypatch, cli_target):
+    from ateam.plans.store import load_plans
+    _investigating(cli_target, "P-0001")                 # a killed process: no live marker
+    _patch_investigation(monkeypatch, _canned_plan())
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert "P-0001 -> plan_rejected (interrupted, found stale)" in r.output
+    plans = load_plans(TargetPaths.from_root(cli_target).plans)
+    assert plans["P-0001"].status == "plan_rejected" and plans["P-0001"].request == "an earlier request"
+    assert plans["P-0002"].status == "plan_proposed"
+    assert _db(cli_target).feature_status("P-0001") == "plan_rejected"
+
+
+def test_plan_leaves_a_live_planning_session_alone(monkeypatch, cli_target):
+    import os
+    _investigating(cli_target, "P-0001", marker=os.getpid())   # another terminal still planning
+    _patch_investigation(monkeypatch, _canned_plan())
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert _db(cli_target).feature_status("P-0001") == "investigating" and "found stale" not in r.output

@@ -252,3 +252,12 @@ def test_reject_unstarted_approved_plan_edge_and_retire(tmp_path):
     assert db.feature_status("P-0001") == "plan_rejected"
     assert db.contract_status("C-0002") == "superseded" == db.contract_status("C-0003")
     assert db.transitions("feature", "P-0001")[-1]["reason"] == "start fresh"
+
+
+def test_investigating_can_be_rejected_and_features_are_listed_by_status(tmp_path):
+    db = fresh(tmp_path)
+    assert "plan_rejected" in FEATURE_TRANSITIONS["investigating"]
+    for fid in ("P-0001", "P-0002"):
+        db.transition("feature", fid, "requested", by="t"); db.transition("feature", fid, "investigating", by="t")
+    db.transition("feature", "P-0002", "plan_rejected", by="t", reason="interrupted")
+    assert db.features_with_status("investigating") == ["P-0001"] and db.feature_status("P-0002") == "plan_rejected"
