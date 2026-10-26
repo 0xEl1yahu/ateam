@@ -39,7 +39,7 @@ def test_no_checkpoint_and_render(sample_contract, records_three):
 
 import re
 
-from ateam.brief import RULES_SCOPE_NOTE, assemble_investigation_brief
+from ateam.brief import PLAN_INDEX_CAP, RULES_SCOPE_NOTE, assemble_investigation_brief
 from ateam.config import NamedCheck, TargetConfig
 from ateam.contracts.model import Contract
 from ateam.plans.model import Plan, PlanStatus
@@ -93,7 +93,8 @@ def test_plans_section_lists_contracts_with_paths(target_repo, tmp_path, sample_
     text = _inv(target_repo, tmp_path, plans={"P-0001": plan}, contracts={"C-0001": sample_contract})
     sec = text.split("## Existing plans and contracts")[1].split("## Request")[0]
     assert "P-0001 plan_proposed  Reading state" in sec
-    assert "  C-0001 draft  Expose reading state through the books API  [src/api/**, tests/api/test_books.py]" in sec
+    assert "  C-0001 draft  Expose reading state through the books API" in sec
+    assert "    paths: src/api/**, tests/api/test_books.py" in sec
 
 
 def test_discovery_kind_has_limits_not_request(target_repo, tmp_path):
@@ -177,3 +178,41 @@ def test_rules_section_opens_with_scope_note(target_repo, tmp_path):
     assert RULES_SCOPE_NOTE == ("These are the target's instructions for whoever develops it. They govern how work on the "
                                 "target is done; they are not requirements of the Request.")
     assert text.count(RULES_SCOPE_NOTE) == 1 and empty.count(RULES_SCOPE_NOTE) == 1
+
+
+def _idx(text):
+    return text.split("## Existing plans and contracts")[1].split("## Request")[0]
+
+
+def _plan_with_unknowns():
+    return Plan(id="P-0001", title="Reading state", request="r", status=PlanStatus.plan_proposed, contracts=["C-0001"],
+                unknowns=["Is the column\n## Injected\nnullable?", "Who owns migrations?"],
+                verification_approach="Run the API tests and then compare the response shape against the stored fixtures by hand.")
+
+
+def test_plan_index_lists_acceptance_unknowns_and_excludes(target_repo, tmp_path, sample_contract):
+    plan = _plan_with_unknowns()
+    text = _inv(target_repo, tmp_path, plans={plan.id: plan}, contracts={sample_contract.id: sample_contract})
+    sec = _idx(text)
+    assert f"  {sample_contract.id} draft  {sample_contract.title}" in sec
+    assert f"    A1: {sample_contract.acceptance[0].statement}" in sec
+    assert f"    A3: {sample_contract.acceptance[1].statement}" in sec
+    assert "  unknowns:" in sec and "Who owns migrations?" in sec
+    assert "Is the column ## Injected nullable?" in sec
+    assert "  verification: " + plan.verification_approach[:80] in sec
+    assert plan.verification_approach[:81] not in sec
+    assert _headings(text) == _HEADINGS_PLANNING
+    text2 = _inv(target_repo, tmp_path, plans={plan.id: plan}, contracts={sample_contract.id: sample_contract}, exclude_plans={plan.id})
+    sec2 = _idx(text2)
+    assert plan.id not in sec2 and sample_contract.id not in sec2
+
+
+def test_plan_index_caps_each_plan(target_repo, tmp_path, sample_contract):
+    big = sample_contract.model_copy(update={"acceptance": [
+        sample_contract.acceptance[0].model_copy(update={"statement": "x" * (PLAN_INDEX_CAP + 500)})]})
+    p1 = _plan_with_unknowns()
+    p2 = Plan(id="P-0002", title="Small", request="r")
+    text = _inv(target_repo, tmp_path, plans={"P-0001": p1, "P-0002": p2}, contracts={"C-0001": big})
+    sec = _idx(text)
+    assert sec.count("[truncated at 2500 characters]") == 1
+    assert "P-0002 requested  Small" in sec

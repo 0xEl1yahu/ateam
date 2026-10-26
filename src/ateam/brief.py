@@ -147,17 +147,34 @@ def _record_lines(records: dict[str, Record], status: str) -> str:
     return "\n".join(f"- {r.id} {r.kind} [{', '.join(r.binds.paths) or 'global'}] {_one_line(r.statement)}" for r in rs)
 
 
-def _plans(plans: dict[str, Plan], contracts: dict[str, Contract]) -> str:
-    if not plans:
+PLAN_INDEX_CAP = 2500
+
+
+def _plan_block(p: Plan, contracts: dict[str, Contract]) -> str:
+    lines = [f"{p.id} {p.status}  {_one_line(p.title)}"]
+    if p.unknowns:
+        lines.append("  unknowns:")
+        lines += [f"    - {_one_line(u)}" for u in p.unknowns]
+    if p.verification_approach.strip():
+        lines.append("  verification: " + _one_line(p.verification_approach)[:80])
+    for cid in p.contracts:
+        c = contracts.get(cid)
+        if c is None:
+            continue
+        lines.append(f"  {c.id} {c.status}  {_one_line(c.title)}")
+        lines.append(f"    paths: {', '.join(c.paths)}")
+        lines += [f"    {a.id}: {_one_line(a.statement)}" for a in c.acceptance]
+    text = "\n".join(lines)
+    if len(text) > PLAN_INDEX_CAP:
+        text = text[:PLAN_INDEX_CAP] + f"\n[truncated at {PLAN_INDEX_CAP} characters]"
+    return text
+
+
+def _plans(plans: dict[str, Plan], contracts: dict[str, Contract], exclude: set[str] = frozenset()) -> str:
+    shown = sorted((p for p in plans.values() if p.id not in exclude), key=lambda p: p.id)
+    if not shown:
         return "none"
-    lines: list[str] = []
-    for p in sorted(plans.values(), key=lambda p: p.id):
-        lines.append(f"{p.id} {p.status}  {_one_line(p.title)}")
-        for cid in p.contracts:
-            c = contracts.get(cid)
-            if c is not None:
-                lines.append(f"  {c.id} {c.status}  {_one_line(c.title)}  [{', '.join(c.paths)}]")
-    return "\n".join(lines)
+    return "\n".join(_plan_block(p, contracts) for p in shown)
 
 
 def _demote_headings(text: str, levels: int = 2) -> str:
@@ -176,6 +193,7 @@ def assemble_investigation_brief(
     scratch_dir: Path,
     request: str | None = None,
     max_candidates: int | None = None,
+    exclude_plans: set[str] = frozenset(),
 ) -> str:
     """The brief an INVESTIGATE session starts with: the target's rules, records, plan index, checks and handoff path."""
     sections = [
@@ -187,7 +205,7 @@ def assemble_investigation_brief(
             + "\n\nProposed, not yet approved (not binding; do not re-propose):\n"
             + _record_lines(records, "proposed"),
         ),
-        ("Existing plans and contracts", _plans(plans, contracts)),
+        ("Existing plans and contracts", _plans(plans, contracts, exclude_plans)),
     ]
     if kind == "planning":
         sections.append(("Request", _demote_headings((request or "").strip())))
