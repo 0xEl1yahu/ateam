@@ -2189,3 +2189,48 @@ def test_result_file_records_an_interrupt(tmp_path):
         with _Result(out, {"outcome": "refused", "status": "refused"}):
             raise KeyboardInterrupt
     assert json.loads(out.read_text()) == {"code": 130, "outcome": "interrupted", "status": "interrupted"}
+
+
+# ---- final review fixes (scheduler branch)
+
+def test_worker_run_result_file_reports_a_tampered_session(monkeypatch, cli_target, tmp_path):
+    from types import SimpleNamespace
+    from ateam.runner.run import WorkerResult
+    _frozen_target(cli_target)
+    out = tmp_path / "t.json"
+
+    async def tampered(**kw):
+        db = kw["db"]
+        a = db.start_attempt("C-0001", "build", "light", "haiku", {})
+        db.finish_attempt(a, "tamper", "tamper", 1, 1, 0.2, 1, 1.0, "s")
+        res = WorkerResult("success", False, "completed", "s", 1, 0.2, {}, {}, {"summary": "x"}, [], [], None, 0.1)
+        return res, SimpleNamespace(changed_vs_base=[]), SimpleNamespace(ok=True, outside=[], dirty=[]), None
+
+    monkeypatch.setattr("ateam.runner.run.run_contract_attempt", tampered)
+    wt = tmp_path / "wt-t"; GitRepo(cli_target).worktree_add(wt, "wt-t", "main")
+    run("worker", "run", "C-0001", "--role", "build", "--cwd", str(wt), "--result-file", str(out), "--target", str(cli_target))
+    assert _read(out)["outcome"] == "tamper"
+
+
+def test_result_file_reports_a_crash_as_failed_with_unknown_cost(tmp_path):
+    import json
+    from ateam.cli import _Result
+    out = tmp_path / "c.json"
+    with pytest.raises(RuntimeError):
+        with _Result(out, {"outcome": "refused", "status": "refused", "failure_class": None, "error": None, "cost_usd": 0.0}):
+            raise RuntimeError("tree_state exploded")
+    d = json.loads(out.read_text())
+    assert d["code"] == 1 and d["outcome"] == "failed" == d["status"] and d["failure_class"] == "environment"
+    assert "tree_state exploded" in d["error"] and d["cost_usd"] is None
+
+
+def test_release_own_run_lock_leaves_another_holder_alone(cli_target):
+    from ateam.cli import _release_own_run_lock
+    db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
+    assert db.acquire_run_lock("P-0001")
+    _release_own_run_lock(cli_target, "P-0001")
+    assert db.run_lock_info() is None
+    with db.conn:
+        db.conn.execute("INSERT INTO run_lock (singleton, plan_id, acquired_at, pid) VALUES (1, 'P-0001', 'then', 1)")
+    _release_own_run_lock(cli_target, "P-0001")
+    assert db.run_lock_info()["pid"] == 1

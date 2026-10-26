@@ -12,6 +12,7 @@ at most config.run_budget_usd on sessions. `ateam run` never merges into the tar
 from __future__ import annotations
 
 import json
+import os
 import queue
 import subprocess
 import sys
@@ -19,22 +20,23 @@ import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
 from ateam.contracts.select import drift
 from ateam.contracts.store import load_contracts
 from ateam.gitops import GitRepo, MergeConflict
-from ateam.integrate import (IntegrateRefused, integrate, integration_branch, integration_worktree, merge_contract,
-                             prepare_integration, reconcile_contracts, reconcile_feature)
+from ateam.integrate import (IntegrateRefused, integration_branch, integration_worktree, merge_contract, prepare_integration,
+                             reconcile_contracts, reconcile_feature)
 from ateam.intent import IntentError, require_clean
 from ateam.paths import home_dir
 from ateam.plans.ops import dependency_order, plan_contract_ids, set_plan_status
 from ateam.plans.store import load_plans
 from ateam.records.store import load_records
-from ateam.retry import StepOutcome, classify, decide
+from ateam.retry import StepOutcome, classify, decide, next_tier
 from ateam.roles import Role
-from ateam.tiers import load_tiers
+from ateam.tiers import at_least, load_tiers
 from ateam.worktrees import WorktreeError, contract_worktree
 
 LIVE = ("plan_approved", "executing", "integrating")
@@ -50,7 +52,7 @@ class RunRefused(Exception):
 @dataclass
 class RunSummary:
     plan_id: str
-    outcome: Literal["merge_proposed", "paused", "stalled", "interrupted", "rerun", "dry_run"]
+    outcome: Literal["merge_proposed", "paused", "stalled", "budget", "interrupted", "rerun", "dry_run"]
     contracts: dict[str, str]
     spent_usd: float
     attempts: int
@@ -108,22 +110,31 @@ class LockedEcho:
 
 class Budget:
     """Spend of this run, with each launched session's tier cap reserved until it reports its cost: the run never
-    launches a session whose cap would take it past the limit."""
+    launches a session whose cap would take it past the limit. A reservation that does not fit waits while other
+    sessions are in flight (their settled cost is usually far below their cap) and gives up only when nothing else
+    is reserved."""
 
     def __init__(self, limit: float) -> None:
-        self.limit, self.spent, self._reserved, self._lock = limit, 0.0, 0.0, threading.Lock()
+        self.limit, self.spent, self._reserved = limit, 0.0, 0.0
+        self._cond = threading.Condition()
 
-    def reserve(self, usd: float) -> bool:
-        with self._lock:
-            if self.spent + self._reserved + usd > self.limit + 1e-9:
-                return False
-            self._reserved += usd
-            return True
+    def reserve(self, usd: float, halt: threading.Event) -> Literal["ok", "exhausted", "halted"]:
+        with self._cond:
+            while True:
+                if halt.is_set():
+                    return "halted"
+                if self.spent + self._reserved + usd <= self.limit + 1e-9:
+                    self._reserved += usd
+                    return "ok"
+                if self._reserved <= 1e-9:
+                    return "exhausted"
+                self._cond.wait(0.1)
 
     def settle(self, reserved: float, actual: float) -> None:
-        with self._lock:
+        with self._cond:
             self._reserved -= reserved
             self.spent += actual
+            self._cond.notify_all()
 
 
 def ateam_argv() -> list[str]:
@@ -165,7 +176,7 @@ def run_child(argv: list[str], result_file: Path) -> dict:
 @dataclass
 class _Outcome:
     cid: str
-    kind: Literal["done", "pause", "interrupted", "halted", "error"]
+    kind: Literal["done", "pause", "budget", "interrupted", "halted", "error"]
     reason: str | None = None
     detail: str | None = None
     exc: BaseException | None = None
@@ -263,7 +274,9 @@ def _dry_run(ctx, plan_id: str, cs, cids: list[str], say) -> RunSummary:
         c = cs[cid]
         b, t = c.allocation.tier["build"], c.allocation.tier["test"]
         bs, ts = tiers[b][Role.build], tiers[t][Role.test]
-        worst = c.budget.attempts * (bs.usd + ts.usd)
+        up = next_tier(b) or b                       # worst case: one escalation after the first attempt
+        later = tiers[up][Role.build].usd + tiers[at_least(up, t)][Role.test].usd
+        worst = (bs.usd + ts.usd) + (c.budget.attempts - 1) * later
         total += worst
         say(f"  {cid}: build {b} ({bs.model}), test {t} ({ts.model}), up to {c.budget.attempts} attempt(s), worst ${worst:.2f}")
     say(f"worst case ${total:.2f}; run budget ${ctx.config.run_budget_usd:.2f}")
@@ -279,7 +292,8 @@ class _Run:
         self.tiers = load_tiers(ctx.config.tiers)
         self.sessions = 0
         self._counter, self._counter_lock = 0, threading.Lock()
-        self.runs_dir = home_dir(ctx.paths.root) / "runs" / plan_id
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        self.runs_dir = home_dir(ctx.paths.root) / "runs" / plan_id / f"{stamp}-{os.getpid()}"   # never reused across runs
         self.runs_dir.mkdir(parents=True, exist_ok=True)
 
     # -- the main loop -------------------------------------------------------
@@ -303,6 +317,7 @@ class _Run:
         settled: set[str] = set()
         pauses: list[_Outcome] = []
         errors: list[_Outcome] = []
+        budget_stops: list[_Outcome] = []
         cs = load_contracts(ctx.paths.contracts)
         order = dependency_order({c: cs[c] for c in self.cids})
         while True:
@@ -315,13 +330,15 @@ class _Run:
                         pauses.append(o)
                     elif o.kind == "error":
                         errors.append(o)
+                    elif o.kind == "budget":
+                        budget_stops.append(o)
             except queue.Empty:
                 pass
-            if errors or pauses or self.stop.is_set():
+            if errors or pauses or budget_stops or self.stop.is_set():
                 self.halt.set()
             if not self.halt.is_set():
                 free = ctx.config.max_workers - len(running)
-                for cid in [c for c in order if c not in running and c not in settled and db.contract_status(c) in RUNNABLE][:max(free, 0)]:
+                for cid in [c for c in order if c not in running and c not in settled and self._startable(db, cs, c)][:max(free, 0)]:
                     t = threading.Thread(target=self._pipeline_thread, args=(cid,), name=f"ateam-run-{cid}", daemon=True)
                     running[cid] = t
                     t.start()
@@ -336,6 +353,11 @@ class _Run:
             self._close_open_attempts()
             self.say(f"{self.plan_id}: interrupted; worktrees are kept and a re-run continues")
             return self._summary("interrupted", statuses, ["interrupted"])
+        if budget_stops and not pauses:
+            message = budget_stops[0].detail
+            self.say(f"{self.plan_id}: stopped at the run budget ({message}); the plan stays executing; "
+                     "re-run with a larger run_budget_usd to continue")
+            return self._summary("budget", statuses, [message])
         if pauses:
             first = pauses[0]
             why = f"{first.reason}: {first.detail}"
@@ -344,16 +366,28 @@ class _Run:
             self.say(f"{self.plan_id} -> paused ({why})")
             return self._summary("paused", statuses, [why])
         if all(s == "integrated" for s in statuses.values()):
-            try:
-                res = integrate(ctx, self.plan_id, self.say)
-            except IntegrateRefused as e:
-                return self._summary("rerun", statuses, [str(e)])
-            outcome = "merge_proposed" if res.outcome == "merge_proposed" else "paused"
-            return self._summary(outcome, {cid: db.contract_status(cid) for cid in self.cids}, res.messages, res.proposal)
+            rf = self._result_path("final", "integrate")   # its own session, so Ctrl-C cannot fail its setup
+            r = self.child([*ateam_argv(), "integrate", self.plan_id, "--result-file", str(rf), "--target", str(ctx.paths.root)], rf)
+            reasons = list(r.get("reasons") or ([r["error"]] if r.get("error") else []))
+            outcome = {"merge_proposed": "merge_proposed", "refused": "rerun"}.get(r.get("outcome"), "paused")
+            if outcome == "paused" and r.get("outcome") == "failed":
+                outcome = "rerun"   # integrate failed without recording a pause; re-run it
+            for m in reasons:
+                self.say(m)
+            proposal = Path(r["proposal"]) if r.get("proposal") else None
+            return self._summary(outcome, {cid: db.contract_status(cid) for cid in self.cids}, reasons, proposal)
         blockers = [f"{cid} ({s})" for cid, s in statuses.items() if s != "integrated"]
         message = "nothing more can run; unfinished: " + ", ".join(blockers)
         self.say(f"{self.plan_id}: stalled; {message}")
         return self._summary("stalled", statuses, [message])
+
+    def _startable(self, db, cs, cid: str) -> bool:
+        """Ready or failed contracts start only when every in-plan dependency is integrated, so a dependent is never
+        cut before its dependency's merge; a verified contract (stopped before its merge) is merged at once."""
+        status = db.contract_status(cid)
+        if status == "verified":
+            return True
+        return status in ("ready", "failed") and all(db.contract_status(d) == "integrated" for d in cs[cid].depends_on if d in self.cids)
 
     def _summary(self, outcome, statuses, messages, proposal=None) -> RunSummary:
         self.say(f"summary: {outcome}; {self.sessions} session(s), ${self.budget.spent:.2f} spent; "
@@ -389,20 +423,20 @@ class _Run:
             except WorktreeError as e:
                 return _Outcome(cid, "pause", "environment_failure", f"{cid}: {e}")
         frozen = c.allocation.tier["build"]
-        builds = db.attempts_for(cid, role="build")
+        builds = self._counted_builds(db, cid)
         tier = builds[-1]["tier"] if builds and builds[-1]["tier"] in self.tiers else frozen
         escalated = any(a["tier"] != frozen for a in builds)
         allowed = c.budget.attempts
         prompt: str | None = None
         while True:
-            used = len(db.attempts_for(cid, role="build"))
+            used = len(self._counted_builds(db, cid))
             if self.halt.is_set():
                 return _Outcome(cid, "halted")
             if used >= allowed:
                 return _Outcome(cid, "pause", "budget_exhausted", f"{cid} has used all {allowed} BUILD attempts")
             r = self._session(ctx, cid, "build", w, tier if tier != frozen else None, prompt, self.tiers[tier][Role.build].usd)
-            if r is None:
-                return self._budget_pause(cid, "build")
+            if isinstance(r, _Outcome):
+                return r
             if r.get("outcome") == "interrupted" or self.stop.is_set():
                 return _Outcome(cid, "interrupted")
             used += 1
@@ -415,59 +449,86 @@ class _Run:
                 prompt = _retry_prompt(c, f"the BUILD attempt ended {o.outcome}" + (f": {r['error']}" if r.get("error") else ""))
                 continue
 
-            if self.halt.is_set():
-                return _Outcome(cid, "halted")
-            test_tier = c.allocation.tier["test"]
-            r = self._session(ctx, cid, "test", w, None, None, self.tiers[test_tier][Role.test].usd)
-            if r is None:
-                return self._budget_pause(cid, "test")
-            if r.get("outcome") == "interrupted" or self.stop.is_set():
-                return _Outcome(cid, "interrupted")
-            o = StepOutcome("test", int(r.get("code", 1)), r.get("outcome") or "failed", subtype=r.get("subtype"),
-                            test_class=r.get("test_class"))
-            d = decide(classify(o), used, allowed, tier, escalated, None)
-            if d.action == "pause":
-                return _Outcome(cid, "pause", d.reason, f"{cid} test {r.get('test_outcome') or o.outcome}")
-            if d.action == "retry":
-                prompt = _retry_prompt(c, "the TEST worker judged these criteria not met:\n" + _unmet(r.get("report")))
+            # TEST never runs below BUILD (spec, Allocation), including after an escalation
+            test_tier = at_least(tier, c.allocation.tier["test"])
+            retry_build = False
+            for stage_used in range(allowed + 1):
+                if self.halt.is_set():
+                    return _Outcome(cid, "halted")
+                r = self._session(ctx, cid, "test", w, test_tier if test_tier != c.allocation.tier["test"] else None, None,
+                                  self.tiers[test_tier][Role.test].usd)
+                if isinstance(r, _Outcome):
+                    return r
+                if r.get("outcome") == "interrupted" or self.stop.is_set():
+                    return _Outcome(cid, "interrupted")
+                o = StepOutcome("test", int(r.get("code", 1)), r.get("outcome") or "failed", subtype=r.get("subtype"),
+                                test_class=r.get("test_class"))
+                d = decide(classify(o), used, allowed, tier, escalated, None, stage="test", stage_used=stage_used + 1)
+                if d.action == "retry_stage":
+                    continue
+                if d.action == "pause":
+                    return _Outcome(cid, "pause", d.reason, f"{cid} test {r.get('test_outcome') or o.outcome}")
+                if d.action == "retry":
+                    prompt = _retry_prompt(c, "the TEST worker judged these criteria not met:\n" + _unmet(r.get("report")))
+                    retry_build = True
+                break
+            if retry_build:
                 continue
 
-            if self.halt.is_set():
-                return _Outcome(cid, "halted")
-            with self.gate.exclusive():
-                rf = self._result_path(cid, "verify")
-                v = self.child([*ateam_argv(), "verify", cid, "--cwd", str(w.path), "--base", w.base, "--result-file", str(rf),
-                                "--target", str(ctx.paths.root)], rf)
-            self.say(f"{cid} verify {v.get('status')}" + (f" ({v['failure_class']})" if v.get("failure_class") else ""))
-            o = StepOutcome("verify", int(v.get("code", 1)), v.get("status") or "failed", verify_status=v.get("status"),
-                            failure_class=v.get("failure_class"))
-            d = decide(classify(o), used, allowed, tier, escalated, None)
-            if d.action == "pause":
-                return _Outcome(cid, "pause", d.reason, f"{cid} verify {v.get('status')}: " + "; ".join(v.get("reasons") or []))
-            if d.action == "retry":
-                prompt = _retry_prompt(c, "verify failed: " + "; ".join(v.get("reasons") or ["no reason given"]))
+            for stage_used in range(allowed + 1):
+                if self.halt.is_set():
+                    return _Outcome(cid, "halted")
+                with self.gate.exclusive():
+                    rf = self._result_path(cid, "verify")
+                    v = self.child([*ateam_argv(), "verify", cid, "--cwd", str(w.path), "--base", w.base, "--result-file", str(rf),
+                                    "--target", str(ctx.paths.root)], rf)
+                self.say(f"{cid} verify {v.get('status')}" + (f" ({v['failure_class']})" if v.get("failure_class") else ""))
+                o = StepOutcome("verify", int(v.get("code", 1)), v.get("status") or "failed", verify_status=v.get("status"),
+                                failure_class=v.get("failure_class"))
+                d = decide(classify(o), used, allowed, tier, escalated, None, stage="verify", stage_used=stage_used + 1)
+                if d.action == "retry_stage":
+                    continue
+                if d.action == "pause":
+                    return _Outcome(cid, "pause", d.reason, f"{cid} verify {v.get('status')}: " + "; ".join(v.get("reasons") or []))
+                if d.action == "retry":
+                    prompt = _retry_prompt(c, "verify failed: " + "; ".join(v.get("reasons") or ["no reason given"]))
+                    retry_build = True
+                break
+            if retry_build:
                 continue
+            if db.contract_status(cid) != "verified":   # the store, not the child's report, decides what is merged
+                return _Outcome(cid, "pause", "environment_failure",
+                                f"{cid} verify reported verified but the state store says {db.contract_status(cid)}")
             return self._merge(ctx, cid)
 
-    def _session(self, ctx, cid: str, role: str, w, tier: str | None, prompt: str | None, usd: float) -> dict | None:
-        if not self.budget.reserve(usd):
+    def _counted_builds(self, db, cid: str) -> list[dict]:
+        """BUILD attempts that count toward budget.attempts: an interrupted one does not (owner, 2026-10-26)."""
+        return [a for a in db.attempts_for(cid, role="build") if a.get("outcome") != "interrupted"]
+
+    def _session(self, ctx, cid: str, role: str, w, tier: str | None, prompt: str | None, usd: float) -> dict | _Outcome:
+        verdict = self.budget.reserve(usd, self.halt)
+        if verdict == "halted":
+            return _Outcome(cid, "halted")
+        if verdict == "exhausted":
             self.halt.set()
-            return None
+            return _Outcome(cid, "budget", None, f"run budget ${self.budget.limit:.2f} would be exceeded by {cid} {role} "
+                                                 f"(spent ${self.budget.spent:.2f}, cap ${usd:.2f})")
         actual = usd
         try:
             with self.gate.shared():
-                self.sessions += 1
+                if self.halt.is_set():   # stop or a pause arrived while this session waited at the gate
+                    actual = 0.0
+                    return _Outcome(cid, "halted")
+                with self._counter_lock:
+                    self.sessions += 1
                 r = self.launch(ctx.paths.root, cid, role, w.path, w.base, tier, prompt, self._result_path(cid, role))
-            actual = float(r.get("cost_usd") or 0.0)
+            cost = r.get("cost_usd")
+            actual = usd if cost is None else float(cost)   # unknown cost (a crash) counts the whole cap
         finally:
             self.budget.settle(usd, actual)
         self.say(f"{cid} {role} {r.get('outcome')} ${actual:.2f}" + (f" tier {tier}" if tier else "")
                  + (f" (log {r['log']})" if r.get("code") not in (0, None) and r.get("log") else ""))
         return r
-
-    def _budget_pause(self, cid: str, role: str) -> _Outcome:
-        return _Outcome(cid, "pause", "budget_exhausted",
-                        f"run budget ${self.budget.limit:.2f} would be exceeded by {cid} {role} (spent ${self.budget.spent:.2f})")
 
     def _merge(self, ctx, cid: str) -> _Outcome:
         with self.gate.exclusive():

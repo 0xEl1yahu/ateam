@@ -156,7 +156,8 @@ def test_dry_run_writes_nothing_and_shows_worst_case(plan3):
     assert s.outcome == "dry_run" and fake.calls == []
     assert "wave 1: C-0001, C-0003" in text and "wave 2: C-0002" in text
     attempts = load_contracts(plan3.paths.contracts)["C-0001"].budget.attempts   # the planner's light-tier budget
-    assert f"worst case ${3 * attempts * 2.0:.2f}" in text and "run budget $10.00" in text   # 3 contracts x attempts x ($1 build + $1 test)
+    per_contract = (1.0 + 1.0) + (attempts - 1) * (2.0 + 2.0)   # first attempt light, the rest escalated to standard
+    assert f"worst case ${3 * per_contract:.2f}" in text and "run budget $10.00" in text
     assert GitRepo(plan3.paths.intent).head() == intent_head and not GitRepo(plan3.root).branch_exists("ateam/P-0001")
     assert all(_db(plan3).attempts_for(c) == [] for c in NAMES) and _db(plan3).feature_status("P-0001") == "plan_approved"
 
@@ -185,6 +186,7 @@ def test_error_max_turns_escalates_once(plan3):
     s, out = _run(plan3, fake)
     assert s.outcome == "merge_proposed", out
     assert fake.tiers("C-0001") == [None, "standard"], fake.calls
+    assert fake.tiers("C-0001", role="test") == ["standard"]          # TEST never below BUILD
     prompts = [c[3] for c in fake.calls if c[:2] == ("C-0001", "build")]
     assert prompts[0] is None and prompts[1], fake.calls   # the retry carries a prompt
 
@@ -204,12 +206,19 @@ def test_failed_test_verdict_retries_build_with_the_evidence(plan3):
     assert "A1" in retry_prompt and "a() returns None" in retry_prompt
 
 
-def test_budget_stops_launching_and_pauses(plan3):
-    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=2, run_budget_usd=1.5)
+def test_budget_stop_leaves_the_plan_executing(plan3):
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=2, run_budget_usd=1.2)
     fake = FakeWorkers(delay=0.2)
     s, out = _run(plan3, fake)
-    assert s.outcome == "paused" and _last_reason(plan3).startswith("budget_exhausted")
-    assert len(fake.calls) == 1        # light caps are $1 each: one session fits, a second would not
+    assert s.outcome == "budget" and _db(plan3).feature_status("P-0001") == "executing"   # owner, 2026-10-26
+    assert len(fake.calls) == 3        # $1 caps, $0.10 spent each: a session fits while spend + $1 <= $1.20 (0, 0.1, 0.2)
+    assert s.spent_usd <= 1.2 and any("run budget" in m for m in s.messages)
+
+
+def test_an_in_flight_reservation_does_not_stop_the_run(plan3):
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=2, run_budget_usd=2.0)
+    s, out = _run(plan3, FakeWorkers(delay=0.2))
+    assert s.outcome == "merge_proposed", out      # two $1 caps in flight wait for each other instead of stopping
 
 
 def test_merge_conflict_pauses_environment_failure_contract_verified(plan3):
@@ -243,7 +252,8 @@ def test_stop_interrupts_closes_attempts_and_rerun_continues(plan3):
     assert db.feature_status("P-0001") == "executing" and db.run_lock_info() is None
     base = db.get_meta("base:C-0001")
     s2, out2 = _run(plan3, FakeWorkers())
-    assert s2.outcome == "merge_proposed", out2 and _db(plan3).get_meta("base:C-0001") == base
+    assert s2.outcome == "merge_proposed", out2
+    assert _db(plan3).get_meta("base:C-0001") == base
 
 
 def test_rerun_by_state(plan3):
@@ -279,7 +289,8 @@ def test_crash_between_contract_commit_and_store_is_reconciled(plan3, monkeypatc
     assert load_contracts(plan3.paths.contracts)["C-0003"].status == "integrated" and _db(plan3).contract_status("C-0003") == "verified"
     assert _db(plan3).run_lock_info() is None
     s, out = _run(plan3, FakeWorkers())
-    assert s.outcome == "merge_proposed", out and any("reconciled: C-0003" in line for line in out)
+    assert s.outcome == "merge_proposed", out
+    assert any("reconciled: C-0003" in line for line in out)
 
 
 def test_stall_names_blockers(plan3):
@@ -293,3 +304,116 @@ def test_stall_names_blockers(plan3):
     commit_intent(plan3.paths, "b paused", ["contracts"])
     s, out = _run(plan3, FakeWorkers())
     assert s.outcome == "stalled" and "C-0002 (paused)" in " ".join(s.messages)
+
+
+# ---- final review fixes
+
+def test_interrupted_attempts_do_not_count(plan3):
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    for _ in range(2):                           # light contracts allow 2 BUILD attempts
+        stop = threading.Event()
+
+        def ctrl_c(fake, cid, role, worktree, n, stop=stop):
+            stop.set()
+            return {"code": 130, "outcome": "interrupted", "commit": False}
+
+        assert _run(plan3, FakeWorkers({("C-0001", "build", 0): ctrl_c}), stop=stop)[0].outcome == "interrupted"
+    s, out = _run(plan3, FakeWorkers())
+    assert s.outcome == "merge_proposed", out
+
+
+def test_no_session_starts_after_stop_while_waiting_at_the_gate(plan3):
+    from ateam.scheduler import run_child
+    stop = threading.Event()
+    stamp = {}
+
+    def child(argv, result_file):
+        if "verify" in argv and "C-0001" in argv and not stop.is_set():
+            stop.set(); stamp["at"] = time.monotonic()
+        return run_child(argv, result_file)
+
+    fake = FakeWorkers(delay=0.3)
+    s, out = _run(plan3, fake, stop=stop, child=child)
+    assert s.outcome == "interrupted"
+    assert all(t0 < stamp["at"] for _cid, _role, t0, *_ in fake.intervals)   # nothing launched after Ctrl-C
+
+
+def test_dependent_waits_for_its_dependency_to_be_integrated(plan3, monkeypatch):
+    import ateam.scheduler as sch
+    from ateam.integrate import merge_contract as real_merge
+
+    def crash_before_merge(ctx, wt, plan_id, cid, echo):
+        if cid == "C-0001":
+            raise RuntimeError("killed between verify and merge")
+        return real_merge(ctx, wt, plan_id, cid, echo)
+
+    with monkeypatch.context() as m:
+        m.setattr(sch, "merge_contract", crash_before_merge)
+        with pytest.raises(RuntimeError):
+            _run(plan3, FakeWorkers())
+    assert _db(plan3).contract_status("C-0001") == "verified"
+
+    def slow_merge(ctx, wt, plan_id, cid, echo):
+        time.sleep(0.5 if cid == "C-0001" else 0)
+        return real_merge(ctx, wt, plan_id, cid, echo)
+
+    with monkeypatch.context() as m:
+        m.setattr(sch, "merge_contract", slow_merge)
+        s, out = _run(plan3, FakeWorkers())
+    assert s.outcome == "merge_proposed", out
+    assert (home_dir(plan3.root) / "worktrees" / "C-0002" / "src" / "a" / "a.py").is_file()
+
+
+def test_a_verified_result_without_the_store_agreeing_is_not_merged(plan3):
+    from ateam.scheduler import run_child
+
+    def lying_verify(argv, result_file):
+        if "verify" in argv:
+            return {"code": 0, "status": "verified", "failure_class": None, "reasons": []}
+        return run_child(argv, result_file)
+
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    s, out = _run(plan3, FakeWorkers(), child=lying_verify)
+    assert s.outcome == "paused" and _last_reason(plan3).startswith("environment_failure: C-0001 verify reported verified")
+    assert _db(plan3).contract_status("C-0001") == "ready"
+
+
+def test_each_run_writes_its_own_result_directory(plan3):
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    stop = threading.Event()
+
+    def ctrl_c(fake, cid, role, worktree, n):
+        stop.set(); return {"code": 130, "outcome": "interrupted", "commit": False}
+
+    _run(plan3, FakeWorkers({("C-0001", "build", 0): ctrl_c}), stop=stop)
+    _run(plan3, FakeWorkers())
+    runs = [d for d in (home_dir(plan3.root) / "runs" / "P-0001").iterdir() if d.is_dir()]
+    assert len(runs) == 2
+
+
+def test_final_integrate_runs_as_a_child(plan3):
+    from ateam.scheduler import run_child
+    seen = []
+
+    def spy(argv, result_file):
+        seen.append(argv)
+        return run_child(argv, result_file)
+
+    s, out = _run(plan3, FakeWorkers(), child=spy)
+    assert s.outcome == "merge_proposed", out
+    assert any("integrate" in a for a in seen)
+    assert s.proposal is not None and s.proposal.is_file()
+
+
+def test_tampered_session_pauses_verification_unresolvable(plan3):
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    s, out = _run(plan3, FakeWorkers({("C-0001", "build"): {"outcome": "tamper"}}))
+    assert s.outcome == "paused" and _last_reason(plan3).startswith("verification_unresolvable: C-0001")
+
+
+def test_environment_failure_at_test_retries_test_not_build(plan3):
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    fake = FakeWorkers({("C-0001", "test", 0): {"code": 1, "outcome": "failed", "subtype": None, "error": "transport"}})
+    s, out = _run(plan3, fake)
+    assert s.outcome == "merge_proposed", out
+    assert len(fake.tiers("C-0001")) == 1 and len(fake.tiers("C-0001", role="test")) == 2

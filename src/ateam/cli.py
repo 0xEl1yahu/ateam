@@ -89,6 +89,14 @@ class _Result:
             if isinstance(exc, KeyboardInterrupt):   # Ctrl-C: never to be read as a refusal (owner, 2026-10-26)
                 data["code"] = 130
                 data.update({k: "interrupted" for k in ("outcome", "status") if k in data})
+            elif exc is not None and not isinstance(exc, SystemExit):   # a crash is a failure, not a refusal
+                data.update({k: "failed" for k in ("outcome", "status") if k in data})
+                if "failure_class" in data:
+                    data["failure_class"] = "environment"
+                if "error" in data:
+                    data["error"] = f"{type(exc).__name__}: {exc}"
+                if "cost_usd" in data:
+                    data["cost_usd"] = None   # unknown: the scheduler counts the session's whole cap
             if _LAST_FAIL and "reasons" in data and not data["reasons"]:
                 data["reasons"] = list(_LAST_FAIL)
             if _LAST_FAIL and "error" in data and data["error"] is None:
@@ -838,8 +846,9 @@ def _reject_approved(ctx: Context, plan_, reason: str) -> None:
 
 @main.command()
 @click.argument("plan_id")
+@RESULT_FILE_OPTION
 @TARGET_OPTION
-def integrate(plan_id: str, target: Path) -> None:
+def integrate(plan_id: str, result_file: Path | None, target: Path) -> None:
     """Merge a plan's verified contracts onto ateam/<plan-id>, run the full checks there and propose the merge.
 
     Exit 0 merge_proposed, 1 checks or setup failed (paused), 3 merge conflict (paused), 4 refused."""
@@ -847,20 +856,34 @@ def integrate(plan_id: str, target: Path) -> None:
     from ateam.integrate import IntegrateRefused
     from ateam.integrate import integrate as run_integrate
 
-    ctx = _context(target)
-    try:
-        res = run_integrate(ctx, plan_id, echo=click.echo)
-    except IntegrateRefused as e:
-        _fail(str(e), code=4)
-    except (GitError, IntentError) as e:
-        _fail(f"git failed during integration: {e}. Re-run ateam integrate {plan_id} once it is fixed; "
-              "completed steps are kept")
-    for m in res.messages:
-        click.echo(m)
-    if res.outcome == "merge_proposed":
-        click.echo(f"Review {res.proposal}, then: ateam merge {plan_id}   (or: ateam reject {plan_id} \"reason\")")
-        sys.exit(0)
-    sys.exit(3 if res.outcome == "conflict" else 1)
+    with _Result(result_file, {"outcome": "refused", "proposal": None, "reasons": []}) as out:
+        ctx = _context(target)
+        try:
+            res = run_integrate(ctx, plan_id, echo=click.echo)
+        except IntegrateRefused as e:
+            _fail(str(e), code=4)
+        except (GitError, IntentError) as e:
+            out["outcome"] = "failed"
+            _fail(f"git failed during integration: {e}. Re-run ateam integrate {plan_id} once it is fixed; "
+                  "completed steps are kept")
+        out.update(outcome=res.outcome, proposal=str(res.proposal) if res.proposal else None, reasons=list(res.messages))
+        for m in res.messages:
+            click.echo(m)
+        if res.outcome == "merge_proposed":
+            click.echo(f"Review {res.proposal}, then: ateam merge {plan_id}   (or: ateam reject {plan_id} \"reason\")")
+            sys.exit(0)
+        sys.exit(3 if res.outcome == "conflict" else 1)
+
+
+def _release_own_run_lock(target: Path, plan_id: str) -> None:
+    """Release the run lock only when this process holds it for this plan (a second Ctrl-C; owner, 2026-10-26)."""
+    import os
+
+    db = StateDB(home_dir(target) / "state.db")
+    db.init_schema()
+    info = db.run_lock_info()
+    if info and info["plan_id"] == plan_id and info["pid"] == os.getpid():
+        db.release_run_lock(plan_id)
 
 
 def _interrupt_handler(stop, say):
@@ -882,7 +905,7 @@ def _interrupt_handler(stop, say):
 def run_cmd(plan_id: str, dry_run: bool, target: Path) -> None:
     """Execute an approved plan until the merge gate or a pause. Never merges into the target branch.
 
-    Exit 0 merge_proposed (or a dry run), 1 paused or stalled, 4 refused or a re-run is needed, 130 interrupted."""
+    Exit 0 merge_proposed (or a dry run), 1 paused, stalled or out of run budget, 4 refused or a re-run is needed, 130 interrupted."""
     import signal
     import threading
 
@@ -906,6 +929,9 @@ def run_cmd(plan_id: str, dry_run: bool, target: Path) -> None:
     try:
         while worker.is_alive():
             worker.join(0.2)
+    except SystemExit:
+        _release_own_run_lock(target, plan_id)   # the scheduler thread dies with us; its finally never runs
+        raise
     finally:
         if in_main:
             signal.signal(signal.SIGINT, previous)
@@ -920,7 +946,7 @@ def run_cmd(plan_id: str, dry_run: bool, target: Path) -> None:
     if summary.outcome == "merge_proposed":
         click.echo(f"{plan_id} -> merge_proposed. Review {summary.proposal}, then: ateam merge {plan_id}   "
                    f"(or: ateam reject {plan_id} \"reason\")")
-    sys.exit({"merge_proposed": 0, "dry_run": 0, "paused": 1, "stalled": 1, "rerun": 4, "interrupted": 130}[summary.outcome])
+    sys.exit({"merge_proposed": 0, "dry_run": 0, "paused": 1, "stalled": 1, "budget": 1, "rerun": 4, "interrupted": 130}[summary.outcome])
 
 
 @main.command("merge")
@@ -1540,6 +1566,10 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
         click.echo(f"scope ok={scope.ok} outside={scope.outside} dirty={scope.dirty} changed={tree.changed_vs_base}")
         code = 0 if (res.report and scope.ok) else (3 if res.report else 1)
         out["outcome"] = {0: "completed", 3: "scope_breach", 1: "failed"}[code]
+        last = ctx.db.latest_attempt(contract_id)
+        if last and last.get("outcome") == "tamper":
+            out["outcome"] = "tamper"   # the intent repo changed during the session (layer 4)
+            click.echo("tamper: the intent repo changed during the session")
         if Role(role) is Role.test and res.report and scope.ok:
             from ateam.runner.run import classify_test_report
 

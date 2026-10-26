@@ -36,7 +36,7 @@ class StepOutcome:
 
 @dataclass(frozen=True)
 class Decision:
-    action: Literal["continue", "retry", "pause"]
+    action: Literal["continue", "retry", "retry_stage", "pause"]   # retry: a fresh BUILD; retry_stage: the same stage again
     tier: str
     reason: str | None
 
@@ -54,6 +54,8 @@ def classify(o: StepOutcome) -> str:
         if o.verify_status == "refused":
             return "refused"
         return {"tamper": "tamper", "environment": "environment"}.get(o.failure_class or "", "implementation")
+    if o.outcome == "tamper":
+        return "tamper"
     if o.outcome == "not_binding" or o.code == 4:
         return "not_binding"
     if o.outcome == "setup_failed":
@@ -70,11 +72,15 @@ def classify(o: StepOutcome) -> str:
 
 
 def decide(cls: str, build_attempts_used: int, attempts_allowed: int, tier: str, escalated: bool,
-           last_subtype: str | None) -> Decision:
+           last_subtype: str | None, stage: str = "build", stage_used: int = 0) -> Decision:
+    """An environment failure at TEST or verify retries that stage, up to attempts_allowed times, without a new BUILD
+    (owner, 2026-10-26); every other failure after BUILD is a fresh BUILD attempt."""
     if cls == "ok":
         return Decision("continue", tier, None)
     if cls in _PAUSE_NOW:
         return Decision("pause", tier, _PAUSE_NOW[cls])
+    if cls == "environment" and stage in ("test", "verify"):
+        return Decision("pause", tier, "environment_failure") if stage_used >= attempts_allowed else Decision("retry_stage", tier, None)
     if build_attempts_used >= attempts_allowed:
         return Decision("pause", tier, _EXHAUSTED.get(cls, "budget_exhausted"))
     up = next_tier(tier)

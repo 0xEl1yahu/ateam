@@ -63,3 +63,15 @@ def test_pause_reasons_are_the_spec_enum():
     for cls in ("implementation", "environment", "scope_breach", "requirements", "refused", "tamper", "not_binding"):
         d = decide(cls, 3, 3, "standard", False, None)
         assert d.action == "pause" and d.reason in PAUSE_REASONS
+
+
+def test_environment_at_test_or_verify_retries_that_stage():
+    assert decide("environment", 1, 2, "light", False, None, stage="test", stage_used=0) == Decision("retry_stage", "light", None)
+    assert decide("environment", 1, 2, "light", False, None, stage="verify", stage_used=1) == Decision("retry_stage", "light", None)
+    assert decide("environment", 1, 2, "light", False, None, stage="test", stage_used=2) == Decision("pause", "light", "environment_failure")
+    assert decide("implementation", 1, 2, "light", False, None, stage="test", stage_used=0).action == "retry"   # back to BUILD
+
+
+def test_a_tampered_session_classifies_as_tamper():
+    assert classify(StepOutcome("build", 0, "tamper")) == "tamper"
+    assert classify(StepOutcome("test", 0, "tamper")) == "tamper"
