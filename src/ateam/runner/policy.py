@@ -50,7 +50,6 @@ _MUTATORS = re.compile(
 )
 # Anything that writes at all, for roles that may not write (INVESTIGATE). `-o` is handled per command below.
 _WRITE_OPS = re.compile(r"(?:>>?|<<|\s--output\b|\s-fprint(?:0|f)?\b|\s-fls\b)|" + _MUTATORS.pattern)
-_SUBSTITUTION = re.compile(r"\$\(|`|<\(|>\(")
 _ENV_PREFIX = re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_]*=\S*\s+\S")
 _FIND_EXEC = re.compile(r"^\s*find\b.*\s-(?:exec|execdir|ok|okdir|delete)\b")
 _RG_PRE = re.compile(r"^\s*rg\b.*\s--pre(?:-glob)?\b")
@@ -58,7 +57,6 @@ _GIT_GREP_PAGER = re.compile(r"^\s*git\s+grep\b.*\s(?:-O\S*|--open-files-in-page
 _GIT_DASH_C = re.compile(r"^\s*git\s+(?:(?:-C\s*\S+|--no-pager|--git-dir=\S+|--work-tree=\S+)\s+)*-c\b")
 _OUTPUT_FLAG_CMDS = re.compile(r"^\s*(?:tree|du)\b.*(?:\s-o\S*|\s--output\b)|^\s*sort\b.*(?:\s-[A-Za-z]*o(?:\S*)?(?:\s|$)|\s--output\b)")
 _PAGER = re.compile(r"(?i)core\.pager|\bpager\.|GIT_PAGER|GIT_EXTERNAL_DIFF|GIT_EDITOR|\bLESSOPEN\b")
-_SINGLE_QUOTED = re.compile(r"'[^']*'")
 _WILDCARD = re.compile(r"[*?\[{]")
 _REDIRECT_TARGET = re.compile(r">>?\s*(\S+)")
 _READ_PREFIX = re.compile(
@@ -72,190 +70,499 @@ _CD_WORKTREE_REASON = "INVESTIGATE may cd only to a directory inside the worktre
 _GIT_BRANCH = re.compile(r"^\s*git\s+branch\b(?P<rest>.*)$")
 
 
-_COMMENT_AFTER = set(";&|()")
+# ---- the lexer ---------------------------------------------------------------------------------------------------
+# One walk over the command that follows bash's grammar for where commands begin and end (bash manual: Quoting,
+# Comments, Here Documents, Lists, Pipelines, Compound Commands, Command Substitution, Arithmetic Expansion).
+# Line continuations are removed as the walk reads characters, exactly where bash removes them: everywhere except
+# inside '...', $'...', comments and the bodies of here-documents whose delimiter is quoted.
+
+_RESERVED_LEADING = {"!", "{", "}", "if", "then", "else", "elif", "fi", "do", "done", "while", "until", "time", "coproc"}
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=")
+_FD_WORD = re.compile(r"^(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})$")
+_ANSI_C_SIMPLE = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v",
+                  "\\": "\\", "'": "'", '"': '"', "?": "?"}
+_LIST_OPS = (";;&", ";;", ";&", ";", "&&", "&", "||", "|&", "|")
+_REDIRECT_OPS = (">>", ">|", ">&", "<&", "<>", ">", "<")
 
 
-def _comment_starts(prev: str) -> bool:
-    """A # begins a comment at the start of a word: first character, or after whitespace, ; & | ( or )."""
-    return prev == "" or prev.isspace() or prev in _COMMENT_AFTER
-
-
-def _join_continuations(cmd: str) -> str:
-    """Delete every backslash-newline that bash deletes: everywhere except inside single quotes and $'...'.
-
-    This is the one place that handles line continuations; later passes never see them."""
+def _ansi_c(body: str) -> str:
+    """The value of the text between $' and ' (the escapes that matter for reading a command word)."""
     out: list[str] = []
-    quote: str | None = None   # "'", '"' or "$'"
-    dollars = 0                # consecutive $ just emitted; an odd count leaves one unpaired before a quote
     i = 0
-    while i < len(cmd):
-        ch = cmd[i]
-        if ch == "\\" and quote not in ("'",):
-            nxt = cmd[i + 1 : i + 2]
-            if nxt == "\n" and quote != "$'":
+    while i < len(body):
+        c = body[i]
+        if c != "\\" or i + 1 >= len(body):
+            out.append(c); i += 1
+            continue
+        e = body[i + 1]
+        m = None
+        if e in _ANSI_C_SIMPLE:
+            out.append(_ANSI_C_SIMPLE[e]); i += 2
+        elif e == "x" and (m := re.match(r"[0-9A-Fa-f]{1,2}", body[i + 2 :])):
+            out.append(chr(int(m.group(), 16))); i += 2 + len(m.group())
+        elif e in "uU" and (m := re.match(r"[0-9A-Fa-f]{1,%d}" % (4 if e == "u" else 8), body[i + 2 :])):
+            out.append(chr(min(int(m.group(), 16), 0x10FFFF))); i += 2 + len(m.group())
+        elif e in "01234567" and (m := re.match(r"[0-7]{1,3}", body[i + 1 :])):
+            out.append(chr(int(m.group(), 8) & 0xFF)); i += 1 + len(m.group())
+        elif e == "c" and i + 2 < len(body):
+            out.append(chr(ord(body[i + 2]) & 0x1F)); i += 3
+        else:
+            out.append(c + e); i += 2
+    return "".join(out)
+
+
+@dataclass
+class _Segment:
+    """One simple command: its text (continuations, comments and heredoc bodies removed) and its words after
+    quote removal, without redirections and here-document delimiters."""
+    text: str
+    words: list[str]
+
+
+@dataclass
+class _Lexed:
+    joined: str               # the command with bash's line continuations removed; comments and heredoc bodies kept
+    stripped: str             # joined without heredoc bodies
+    masked: str               # joined with every '...' and $'...' replaced by ''
+    segments: list[_Segment]  # simple commands in order, including those inside substitutions
+    substitution: bool        # $( ), $(( )), ` `, <( ) or >( ) that bash would expand (not in '...', comments or quoted bodies)
+
+
+class _Lexer:
+    def __init__(self, s: str) -> None:
+        self.s, self.n = s, len(s)
+        self.removed: set[int] = set()                  # index of the backslash of each removed backslash-newline
+        self.comments: list[tuple[int, int]] = []
+        self.bodies: list[tuple[int, int]] = []         # heredoc body plus terminator line
+        self.single: list[tuple[int, int]] = []         # '...' and $'...' including the quotes
+        self.items: list[tuple[int, int, list[str]] | _Segment] = []
+        self.substitution = False
+        self.newlines = 0                               # newline tokens read at any depth
+
+    # -- characters ---------------------------------------------------------------------------------------------
+
+    def _skip(self, i: int) -> int:
+        """The next index at or after i once line continuations are removed (bash removes them as it reads)."""
+        while self.s.startswith("\\\n", i):
+            self.removed.add(i)
+            i += 2
+        return i
+
+    def _match(self, i: int, text: str) -> int | None:
+        """End index if the characters from i spell text, line continuations between them removed."""
+        for ch in text:
+            i = self._skip(i)
+            if self.s[i : i + 1] != ch:
+                return None
+            i += 1
+        return i
+
+    # -- quoting and expansions ---------------------------------------------------------------------------------
+
+    def _ansi_end(self, i: int) -> int:
+        """Index after the ' that closes a $'...' whose text starts at i (backslash escapes the next character)."""
+        while i < self.n:
+            if self.s[i] == "\\":
+                i += 2
+            elif self.s[i] == "'":
+                return i + 1
+            else:
+                i += 1
+        return self.n
+
+    def _dquote(self, i: int, val: list[str], expand: bool = True) -> int:
+        """Read the inside of "..." from i; return the index after the closing quote."""
+        s, n = self.s, self.n
+        while i < n:
+            i = self._skip(i)
+            if i >= n:
+                break
+            c = s[i]
+            if c == "\\":
+                nxt = s[i + 1 : i + 2]
+                if nxt in ("$", "`", '"', "\\"):
+                    val.append(nxt); i += 2
+                else:
+                    val.append(c); i += 1
+                continue
+            if c == '"':
+                return i + 1
+            if expand and c == "`":
+                j = self._backtick(i + 1); val.append(s[i:j]); i = j
+                continue
+            if expand and c == "$":
+                j = self._dollar(i, in_dquote=True)
+                if j is not None:
+                    val.append(s[i:j]); i = j
+                    continue
+            val.append(c); i += 1
+        return n
+
+    def _dollar(self, i: int, in_dquote: bool = False) -> int | None:
+        """End index of the $-expansion at i that can hold commands ($( ), $(( )), ${ }, $[ ]), else None."""
+        j = self._match(i, "$((")
+        if j is not None:
+            end = self._arith(j, "))")
+            if end is not None:
+                self.substitution = True   # kept as before: INVESTIGATE never had $(( )); allowing it is the owner's call
+                return end
+        j = self._match(i, "$(")
+        if j is not None:
+            self.substitution = True
+            return self._list(j, stop=True)
+        j = self._match(i, "${")
+        if j is not None:
+            return self._braced(j, in_dquote)
+        j = self._match(i, "$[")
+        if j is not None:
+            end = self._arith(j, "]")
+            return self.n if end is None else end
+        return None
+
+    def _arith(self, i: int, close: str) -> int | None:
+        """Index after the close of an arithmetic expression starting at i; None when it is not one (bash then
+        reads $(( as a command substitution holding a subshell). Inside, << is a shift, never a heredoc."""
+        s, n = self.s, self.n
+        depth = 0
+        opener = "(" if close == "))" else "["
+        while i < n:
+            i = self._skip(i)
+            if i >= n:
+                break
+            c = s[i]
+            if c == "\\":
+                i += 2
+            elif c == '"':
+                i = self._dquote(i + 1, [])
+            elif c == "`":
+                i = self._backtick(i + 1)
+            elif c == "$" and (j := self._dollar(i)) is not None:
+                i = j
+            elif c == opener:
+                depth += 1; i += 1
+            elif c == close[0]:
+                if depth:
+                    depth -= 1; i += 1
+                elif close == "]":
+                    return i + 1
+                else:
+                    return self._match(i, "))")
+            else:
+                i += 1
+        return None
+
+    def _braced(self, i: int, in_dquote: bool) -> int:
+        """Index after the } that closes a ${ whose text starts at i."""
+        s, n = self.s, self.n
+        while i < n:
+            i = self._skip(i)
+            if i >= n:
+                break
+            c = s[i]
+            if c == "\\":
+                i += 2
+            elif c == "}":
+                return i + 1
+            elif c == "'" and not in_dquote:
+                j = s.find("'", i + 1)
+                i = n if j < 0 else j + 1
+            elif c == '"':
+                i = self._dquote(i + 1, [])
+            elif c == "`":
+                i = self._backtick(i + 1)
+            elif c == "$" and (j := self._dollar(i, in_dquote)) is not None:
+                i = j
+            else:
+                i += 1
+        return n
+
+    def _backtick(self, i: int) -> int:
+        """Index after the closing backtick of `...` whose text starts at i. The text, with \\$ \\` \\\\ unescaped,
+        is lexed as a command list of its own."""
+        s, n = self.s, self.n
+        buf: list[str] = []
+        while i < n:
+            i = self._skip(i)
+            if i >= n:
+                break
+            c = s[i]
+            if c == "\\" and i + 1 < n:
+                nxt = s[i + 1]
+                buf.append(nxt if nxt in "$`\\" else c + nxt)
                 i += 2
                 continue
-            out.append(cmd[i : i + 2]); i += 2; dollars = 0
-            continue
-        if quote:
-            if ch == quote[-1]:
-                quote = None
-            out.append(ch); i += 1; dollars = 0
-            continue
-        if ch == "$":
-            dollars += 1
-            out.append(ch); i += 1
-            continue
-        if ch == "'":
-            quote = "$'" if dollars % 2 else "'"
-        elif ch == '"':
-            quote = '"'
-        dollars = 0
-        out.append(ch); i += 1
-    return "".join(out)
+            if c == "`":
+                break
+            buf.append(c); i += 1
+        self.substitution = True
+        self.newlines += any("\n" in b for b in buf)   # a heredoc pending outside does not start its body in here
+        inner = _Lexer("".join(buf))
+        inner._list(0)
+        self.items.extend(inner._segments())
+        return min(i + 1, n)
+
+    def _delimiter(self, i: int) -> tuple[int, str, bool]:
+        """Read a here-document delimiter word from i: (end, terminator after quote removal, quoted?).
+        The word ends at a space, tab, newline or one of ; & | < > ( )."""
+        s, n = self.s, self.n
+        val: list[str] = []
+        quoted = False
+        while True:
+            i = self._skip(i)
+            if i >= n or s[i] in " \t\n;&|<>()":
+                return i, "".join(val), quoted
+            c = s[i]
+            if c == "\\":
+                quoted = True; val.append(s[i + 1 : i + 2]); i += 2
+            elif c == "'":
+                quoted = True
+                j = s.find("'", i + 1)
+                j = n if j < 0 else j
+                val.append(s[i + 1 : j]); i = j + 1
+            elif c == '"':
+                quoted = True; i = self._dquote(i + 1, val, expand=False)
+            elif (j := self._match(i, "$'")) is not None:
+                quoted = True
+                end = self._ansi_end(j)
+                val.append(_ansi_c(s[j : end - 1] if end <= n and s[end - 1 : end] == "'" else s[j:end])); i = end
+            elif (j := self._match(i, '$"')) is not None:
+                quoted = True; i = self._dquote(j, val, expand=False)
+            else:
+                val.append(c); i += 1
+
+    def _bodies(self, i: int, pending: list[tuple[str, bool, bool]]) -> int:
+        """Consume the here-document bodies that start at i, in order. Returns the index after the last terminator
+        line, or i unchanged when any body is unterminated (its lines then stay command text: fail closed)."""
+        s, n = self.s, self.n
+        found = []
+        pos = i
+        for term, dash, quoted in pending:
+            start = pos
+            while True:
+                if pos >= n:
+                    return i
+                k, line, conts = pos, [], []
+                while k < n and s[k] != "\n":
+                    if not quoted and s[k] == "\\" and k + 1 < n:
+                        if s[k + 1] == "\n":
+                            conts.append(k); k += 2
+                            continue
+                        line.append(s[k : k + 2]); k += 2
+                        continue
+                    line.append(s[k]); k += 1
+                text = "".join(line)
+                nxt = min(k + 1, n)
+                if (text.lstrip("\t") if dash else text) == term:
+                    found.append((start, pos, nxt, quoted, conts))
+                    pos = nxt
+                    break
+                found.append((None, None, None, quoted, conts))
+                pos = nxt
+        for start, body_end, end, quoted, conts in found:
+            if not quoted:
+                self.removed.update(conts)
+            if start is not None:
+                self.bodies.append((start, end))
+                if not quoted:
+                    self._body_expansions(start, body_end)
+        return pos
+
+    def _body_expansions(self, i: int, end: int) -> None:
+        """An unquoted here-document body undergoes command substitution: lex every $( ) and ` ` in it."""
+        s = self.s
+        while i < end:
+            c = s[i]
+            if c == "\\":
+                i += 2
+            elif c == "`":
+                i = self._backtick(i + 1)
+            elif c == "$" and (j := self._dollar(i)) is not None:
+                i = j
+            else:
+                i += 1
+
+    # -- command lists ------------------------------------------------------------------------------------------
+
+    def _list(self, i: int, stop: bool = False) -> int:
+        """Lex a command list from i to the end, or (stop) to the ) that closes a $( or <( ; return the index after."""
+        s, n = self.s, self.n
+        seg_start = i
+        words: list[str] = []
+        val: list[str] = []
+        started = False      # a word is being read (any character, quote or expansion seen)
+        target = False       # the next word is a redirection target, not a command word
+        depth = 0            # open ( subshells inside this list
+        pending: list[tuple[str, bool, bool, int]] = []
+
+        def end_word() -> None:
+            nonlocal val, started, target
+            if started:
+                if target:
+                    target = False
+                else:
+                    words.append("".join(val))
+            val, started = [], False
+
+        def end_segment(end: int, next_start: int) -> None:
+            nonlocal words, seg_start
+            end_word()
+            self.items.append((seg_start, end, words))
+            words, seg_start = [], next_start
+
+        while i < n:
+            i = self._skip(i)
+            if i >= n:
+                break
+            c = s[i]
+            if c == "\\":
+                if i + 1 < n:
+                    val.append(s[i + 1])
+                started = True; i += 2
+            elif c in " \t":
+                end_word(); i += 1
+            elif c == "\n":
+                end_segment(i, i + 1)
+                i += 1
+                if pending:
+                    if all(p[3] == self.newlines for p in pending):
+                        i = self._bodies(i, [p[:3] for p in pending])
+                    pending, seg_start = [], i
+                self.newlines += 1
+            elif c == "#" and not started:
+                j = s.find("\n", i)
+                j = n if j < 0 else j
+                self.comments.append((i, j)); i = j
+            elif c == ")":
+                if stop and depth == 0:
+                    end_segment(i, i + 1)
+                    return i + 1
+                depth = max(depth - 1, 0)
+                end_segment(i + 1, i + 1); i += 1
+            elif c == "(":
+                j = self._match(i, "((")
+                if j is not None and not started and all(w in _RESERVED_LEADING for w in words):
+                    end = self._arith(j, "))")
+                    if end is not None:
+                        val.append(s[i:end]); started = True; i = end
+                        continue
+                end_segment(i, i); depth += 1; i += 1
+            elif c == "&" and (j := self._match(i, "&>")) is not None:
+                end_word(); target = True
+                i = self._match(i, "&>>") or j
+            elif c in ";&|":
+                for op in _LIST_OPS:
+                    if (j := self._match(i, op)) is not None:
+                        end_segment(i, j); i = j
+                        break
+            elif c in "<>":
+                if (j := self._match(i, c + "(")) is not None:
+                    self.substitution = True
+                    end = self._list(j, stop=True)
+                    val.append(s[i:end]); started = True; i = end
+                    continue
+                if started and not target and _FD_WORD.match("".join(val)):
+                    val, started = [], False      # 2>x: the number belongs to the redirection
+                else:
+                    end_word()
+                if (j := self._match(i, "<<<")) is not None:
+                    target = True; i = j
+                elif (j := self._match(i, "<<")) is not None:
+                    dash = self._match(j, "-")
+                    j = dash or j
+                    while (j := self._skip(j)) < n and s[j] in " \t":
+                        j += 1
+                    end, term, quoted = self._delimiter(j)
+                    if end > j:
+                        pending.append((term, dash is not None, quoted, self.newlines))
+                    i = end
+                else:
+                    for op in _REDIRECT_OPS:
+                        if (j := self._match(i, op)) is not None:
+                            target = True; i = j
+                            break
+            elif c == "'":
+                j = s.find("'", i + 1)
+                j = n if j < 0 else j
+                val.append(s[i + 1 : j]); self.single.append((i, min(j + 1, n)))
+                started = True; i = j + 1
+            elif c == '"':
+                started = True; i = self._dquote(i + 1, val)
+            elif c == "`":
+                started = True
+                j = self._backtick(i + 1); val.append(s[i:j]); i = j
+            elif c == "$":
+                started = True
+                nxt = self._skip(i + 1)
+                c1 = s[nxt : nxt + 1]
+                if c1 == "$":
+                    val.append("$$"); i = nxt + 1
+                elif c1 == "'":
+                    end = self._ansi_end(nxt + 1)
+                    val.append(_ansi_c(s[nxt + 1 : end - 1])); self.single.append((i, end)); i = end
+                elif c1 == '"':
+                    i = self._dquote(nxt + 1, val)
+                elif (j := self._dollar(i)) is not None:
+                    val.append(s[i:j]); i = j
+                else:
+                    val.append("$"); i += 1
+            else:
+                val.append(c); started = True; i += 1
+        end_segment(n, n)
+        return n
+
+    # -- results ------------------------------------------------------------------------------------------------
+
+    def _drop(self) -> bytearray:
+        drop = bytearray(self.n + 1)
+        for k in self.removed:
+            drop[k] = drop[k + 1] = 1
+        return drop
+
+    def _segments(self) -> list[_Segment]:
+        drop = self._drop()
+        for a, b in self.comments:
+            drop[a:b] = b"\x01" * (b - a)
+        out = []
+        for item in self.items:
+            if isinstance(item, _Segment):
+                out.append(item)
+            else:
+                a, b, words = item
+                out.append(_Segment("".join(self.s[k] for k in range(a, b) if not drop[k]), words))
+        return [seg for seg in out if seg.text.strip()]
+
+    def result(self) -> _Lexed:
+        segments = self._segments()
+        drop = self._drop()
+        keep = [not drop[k] for k in range(self.n)]
+        joined = "".join(c for c, ok in zip(self.s, keep) if ok)
+        in_body = bytearray(self.n)
+        for a, b in self.bodies:
+            in_body[a:b] = b"\x01" * (b - a)
+        stripped = "".join(c for k, (c, ok) in enumerate(zip(self.s, keep)) if ok and not in_body[k])
+        masked, last = [], 0
+        for a, b in sorted(self.single):
+            if a < last:
+                continue
+            masked.append("".join(self.s[k] for k in range(last, a) if keep[k])); masked.append("''"); last = b
+        masked.append("".join(self.s[k] for k in range(last, self.n) if keep[k]))
+        return _Lexed(joined, stripped, "".join(masked), segments, self.substitution)
+
+
+def _lex(cmd: str) -> _Lexed:
+    lexer = _Lexer(cmd)
+    lexer._list(0)
+    return lexer.result()
 
 
 def _split_segments(cmd: str) -> list[str]:
-    """Split on &&, ||, ;, |, a single & (a background job) and newlines, but never inside quotes or comments.
-
-    A & that belongs to >&, <& or &> is a redirect, not a separator. Line continuations are removed before
-    this runs (see _join_continuations)."""
-    segments: list[str] = []
-    buf: list[str] = []
-    quote: str | None = None   # "'", '"' or "$'" (ANSI-C quoting)
-    redir_at = -2              # index of the last unescaped < or >
-    prev = ""                  # last character consumed outside quotes, "x" for anything word-like
-    i = 0
-    while i < len(cmd):
-        ch = cmd[i]
-        if quote:
-            buf.append(ch)
-            if ch == "\\" and quote != "'":
-                buf.append(cmd[i + 1 : i + 2]); i += 2; continue
-            if ch == quote[-1]:
-                quote = None
-            i += 1
-            continue
-        if ch == "\\":   # outside quotes a backslash makes the next character literal
-            buf.append(cmd[i : i + 2]); i += 2; prev = "x"
-            continue
-        if cmd[i : i + 2] == "$$":   # the PID parameter; a following ' is an ordinary quote
-            buf.append("$$"); i += 2; prev = "x"
-            continue
-        if cmd[i : i + 2] == "$'":
-            quote = "$'"; buf.append("$'"); i += 2; prev = "x"
-            continue
-        if ch in ("'", '"'):
-            quote = ch; buf.append(ch); i += 1; prev = "x"
-            continue
-        if ch == "#" and _comment_starts(prev):   # a comment holds no separators and no commands
-            j = cmd.find("\n", i)
-            i = len(cmd) if j < 0 else j
-            continue
-        two = cmd[i : i + 2]
-        if two in ("&&", "||", "|&"):
-            segments.append("".join(buf)); buf = []; i += 2; prev = ";"; continue
-        if ch in (";", "|", "\n"):
-            segments.append("".join(buf)); buf = []; i += 1; prev = ";"; continue
-        if ch == "&" and redir_at != i - 1 and cmd[i + 1 : i + 2] != ">":
-            segments.append("".join(buf)); buf = []; i += 1; prev = ";"; continue
-        if ch in ("<", ">"):
-            redir_at = i
-        buf.append(ch)
-        prev = ch
-        i += 1
-    segments.append("".join(buf))
-    return [seg for seg in segments if seg.strip()]
-
-
-def _heredoc_word(cmd: str, j: int) -> int:
-    """End index of the delimiter word starting at j: runs to whitespace or one of ;&|<>(), quotes kept whole."""
-    k = j
-    while k < len(cmd):
-        c = cmd[k]
-        if c.isspace() or c in ";&|<>()":
-            break
-        if c == "\\":
-            k += 2
-        elif c in ("'", '"'):
-            close = cmd.find(c, k + 1)
-            k = len(cmd) if close < 0 else close + 1
-        else:
-            k += 1
-    return min(k, len(cmd))
+    """The text of every simple command bash would run, in order (commands inside substitutions included)."""
+    return [seg.text for seg in _lex(cmd).segments]
 
 
 def _strip_heredocs(cmd: str) -> str:
-    """Drop heredoc bodies so file contents are not mistaken for commands.
-
-    Only a << that bash would treat as an operator counts: not quoted, not escaped, not in a # comment, not <<<.
-    The rest of the operator line stays command text; the body starts after the first unquoted newline and ends
-    at a line equal to the delimiter (leading tabs ignored for <<-). An unterminated heredoc is left as is."""
-    out: list[str] = []
-    quote: str | None = None
-    prev = ""
-    pending: list[tuple[str, bool]] = []
-    n = len(cmd)
-    i = 0
-    while i < n:
-        ch = cmd[i]
-        if quote:
-            if ch == "\\" and quote != "'":
-                out.append(cmd[i : i + 2]); i += 2; continue
-            if ch == quote[-1]:
-                quote = None
-            out.append(ch); i += 1
-            continue
-        two = cmd[i : i + 2]
-        if ch == "\\":
-            out.append(cmd[i : i + 2]); i += 2; prev = "x"
-            continue
-        if two in ("$$", "$'"):
-            if two == "$'":
-                quote = "$'"
-            out.append(two); i += 2; prev = "x"
-            continue
-        if ch in ("'", '"'):
-            quote = ch; out.append(ch); i += 1; prev = "x"
-            continue
-        if ch == "#" and _comment_starts(prev):
-            j = cmd.find("\n", i)
-            j = n if j < 0 else j
-            out.append(cmd[i:j]); i = j
-            continue
-        if ch == "\n":
-            out.append("\n"); i += 1; prev = "\n"
-            pos = i
-            for term, dash in pending:
-                while True:
-                    if pos >= n:
-                        out.append(cmd[i:])   # unterminated: fail closed, keep every line as command text
-                        return "".join(out)
-                    eol = cmd.find("\n", pos)
-                    line = cmd[pos : n if eol < 0 else eol]
-                    pos = n if eol < 0 else eol + 1
-                    if (line.lstrip("\t") if dash else line) == term:
-                        break
-            if pending:
-                i = pos
-                pending = []
-            continue
-        if cmd.startswith("<<<", i):
-            out.append("<<<"); i += 3; prev = "<"
-            continue
-        if two == "<<":
-            j = i + 2
-            dash = cmd[j : j + 1] == "-"
-            j += dash
-            while j < n and cmd[j] in " \t":
-                j += 1
-            k = _heredoc_word(cmd, j)
-            term = re.sub(r"['\"\\]", "", cmd[j:k])
-            if term:
-                out.append(cmd[i:k]); pending.append((term, dash)); i = k; prev = "x"
-                continue
-        out.append(ch); i += 1; prev = ch
-    return "".join(out)
+    """The command without here-document bodies (an unterminated body is kept, so it is checked as commands)."""
+    return _lex(cmd).stripped
 
 
 def _normalise_git(segment: str) -> str:
@@ -263,12 +570,20 @@ def _normalise_git(segment: str) -> str:
     return _GIT_GLOBAL_OPTS.sub(r"\1\2", segment, count=1)
 
 
-def _is_rm(segment: str) -> bool:
-    """True for any rm invocation, seen through wrappers, paths and a leading backslash."""
-    tokens = segment.split()
-    while tokens and tokens[0] in _WRAPPERS:
-        tokens = tokens[1:]
-    return bool(tokens) and tokens[0].lstrip("\\").rsplit("/", 1)[-1] == "rm"
+def _is_rm(words: list[str]) -> bool:
+    """True for any rm invocation: the command word after quote removal (the lexer's words), seen through reserved
+    words such as ! { if then do, assignments, wrappers and their options, and paths."""
+    i = 0
+    while i < len(words):
+        if words[i] in _WRAPPERS:   # before reserved words: `time -p` is both
+            i += 1
+            while i < len(words) and words[i].startswith("-"):
+                i += 1
+        elif words[i] in _RESERVED_LEADING or _ASSIGNMENT.match(words[i]):
+            i += 1
+        else:
+            break
+    return i < len(words) and words[i].rsplit("/", 1)[-1] == "rm"
 
 
 def _starts_with_prefix(segment: str, prefix: str) -> bool:
@@ -478,30 +793,30 @@ class Policy:
         return path.is_dir() and any(r == path or r in path.parents for r in {self.worktree, self.worktree.resolve()})
 
     def command_allowed(self, cmd: str) -> tuple[bool, str]:
-        cmd = _join_continuations(cmd)
+        lexed = _lex(cmd)
         self._pending_cwds = []
         if self.role == Role.investigate:
-            for seg in _split_segments(_strip_heredocs(cmd)):
-                if _CD.match(seg):
-                    target = self._cd_target(seg)
+            for seg in lexed.segments:
+                if _CD.match(seg.text):
+                    target = self._cd_target(seg.text)
                     if target is not None:
                         self._pending_cwds.extend(target)
         try:
-            ok, reason = self._command_allowed(cmd)
+            ok, reason = self._command_allowed(lexed)
             if ok:
                 self.cwds.update(self._pending_cwds)
             return ok, reason
         finally:
             self._pending_cwds = []
 
-    def _command_allowed(self, cmd: str) -> tuple[bool, str]:
+    def _command_allowed(self, lexed: _Lexed) -> tuple[bool, str]:
         for pattern in DESTRUCTIVE_PATTERNS:
-            if re.search(pattern, cmd):
+            if re.search(pattern, lexed.joined):
                 return False, f"destructive command matched {pattern!r}"
-        segments = _split_segments(_strip_heredocs(cmd))
+        segments = [seg.text for seg in lexed.segments]
         scratch_spellings = self._spellings(self.scratch_dir)
         home_spellings = self._home_spellings() if self.scratch_dir is not None or self.ateam_home is not None else []
-        for seg in segments:
+        for seg, words in ((s.text, s.words) for s in lexed.segments):
             mentions_scratch = any(sp in seg for sp in scratch_spellings)
             if mentions_scratch and ".." in seg:
                 return False, "paths that leave your scratch directory are not allowed"
@@ -518,7 +833,7 @@ class Policy:
             rest = seg
             for sp in [*scratch_spellings, *home_spellings]:
                 rest = rest.replace(sp, " ")
-            if _is_rm(seg):
+            if _is_rm(words):
                 return False, "rm is not allowed for workers; use `git rm` for tracked files, cleanup happens at integration"
             if _PROTECTED_MENTION.search(rest):
                 seg = rest
@@ -531,10 +846,9 @@ class Policy:
                 if not _READ_PREFIX.match(_normalise_git(seg)):
                     return False, "shell access to .ateam/ or .claude/ is limited to reading"
         if self.role == Role.investigate:
-            unquoted = _SINGLE_QUOTED.sub("''", cmd)
-            if _SUBSTITUTION.search(unquoted):
+            if lexed.substitution:
                 return False, "INVESTIGATE may not use command or process substitution"
-            if _PAGER.search(unquoted):
+            if _PAGER.search(lexed.masked):
                 return False, "INVESTIGATE may not set pagers, editors or diff drivers"
             for seg in segments:
                 if _CD.match(seg):

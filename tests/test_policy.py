@@ -768,3 +768,157 @@ def test_build_real_heredoc_body_is_data(policy_build):
 def test_build_heredoc_bodies_are_data(policy_build, cmd):
     ok, reason = policy_build.command_allowed(cmd)
     assert ok, (cmd, reason)
+
+
+# ---- round 4: one lexer. Every row is a probe whose bash parse (bashlex, `bash -n`, the bash manual) disagreed
+# with the policy's segmentation at ef4e2c4; see .superpowers/sdd/2026-10-25-owner-decisions/task-3-probe-table.md
+
+SUBST_REASON = "INVESTIGATE may not use command or process substitution"
+NPM_REASON = "INVESTIGATE may only run read-only inspection commands; 'npm test' is not allowed"
+_FIND_EXEC_SEG = "find . -maxdepth 0 -exec echo EXEC-MARKER {} \\;"
+
+INVESTIGATE_DENY_ROUND4 = [
+    # a comment ends at the newline; a backslash inside a comment is not a line continuation
+    ("ls # \\\nnpm test", NPM_REASON),
+    ("ls #\\\nnpm test", NPM_REASON),
+    ("ls;# \\\nnpm test", NPM_REASON),
+    ("ls # \\\ncd ..; pwd", CD_WORKTREE_REASON),
+    ("ls # '\nfind . -maxdepth 0 -ex\\\nec echo EXEC-MARKER {} \\;\n# '",
+     f"INVESTIGATE may not write, run other programs or change state; {_FIND_EXEC_SEG[:40]!r} is not allowed"),
+    # quote state: escaped, double-quoted, ANSI-C and locale-quoted apostrophes do not open a single quote
+    ("ls \\' $(npm test) \\'", SUBST_REASON),
+    ("ls \"'\" $(npm test) \"'\"", SUBST_REASON),
+    ("ls \"'\" `npm test` \"'\"", SUBST_REASON),
+    ("ls $'\\'' $(npm test) $'\\''", SUBST_REASON),
+    ("ls $\"'\" $(npm test) $\"'\"", SUBST_REASON),
+    ("ls \"\\\"'\" $(npm test) \"'\"", SUBST_REASON),
+]
+
+
+@pytest.mark.parametrize("cmd,reason", INVESTIGATE_DENY_ROUND4)
+def test_investigate_round4_lexer_denials(policy_investigate, cmd, reason):
+    ok, got = policy_investigate.command_allowed(cmd)
+    assert not ok and got == reason, (cmd, got)
+
+
+BUILD_RM_DENY_ROUND4 = [
+    # heredoc delimiters: quote removal, word boundaries (only space, tab, newline and ;&|<>() end the word)
+    "cat <<'EOF'\nx\\\nEOF\nrm x\nEOF",
+    "cat <<EOF\ndon't\nEOF\nr\\\nm x\n# '",
+    "cat <<$'EOF'\nd\nEOF\nrm x\n$EOF",
+    'cat <<E\\\\F\nE\\F\nrm x\nEF',
+    'cat <<EOF\r\nEOF\r\nrm x\nEOF',
+    'cat <<EOF\xa0\nEOF\xa0\nrm x\nEOF',
+    'cat <<$"EOF"\nd\nEOF\nrm x\n$EOF',
+    'cat <<"E\\"F"\nd\nE"F\nrm x\nEF',
+    # << inside arithmetic is a shift
+    'echo $((1<<2))\nrm x\n2',
+    'echo $(( (1<<2) ))\nrm x\n2',
+    '(( x = 1<<2 ))\nrm x\n2',
+    # substitutions run their commands, also in unquoted heredoc bodies and inside ${ }
+    'cat <<EOF\n$(rm x)\nEOF',
+    'cat <<EOF\n`rm x`\nEOF',
+    'echo $(rm x)',
+    'echo `rm x`',
+    'cat <(rm x)',
+    'echo "`rm x`"',
+    'echo "$(echo "a)"; rm x)"',
+    'echo ${x:-$(rm x)}',
+    'echo $((1<<2)) $(rm x)',
+    'echo $[1<<2] $(rm x)',
+    'echo `echo \\`rm x\\``',
+    # where a command starts: ( ) { } ! reserved words, case patterns, assignments, redirects, quoted words
+    '(rm x)',
+    '{ rm x; }',
+    'if true; then rm x; fi',
+    'case x in x) rm x;; esac',
+    'f() { rm x; }; f',
+    'for f in a; do rm $f; done',
+    'while rm x; do :; done',
+    '! rm x',
+    'coproc rm x',
+    'time -p rm x',
+    '"rm" x',
+    "r''m x",
+    'x=1 rm x',
+    '>out rm x',
+    '2>/dev/null rm x',
+    'env -i rm x',
+    # second batch, found after the first fix: still substitutions and command starts
+    'cat <<EOF\n$(echo\nrm x)\nEOF',
+    'x=$(rm x)',
+    'echo "$(echo \')\'; rm x)"',
+    '[[ -n $(rm x) ]]',
+    'cat <<EOF >$(rm x)\nbody\nEOF',
+    'echo ${x:-"$(rm x)"}',
+    'rm>x y',
+    'cat <<< $(rm x)',
+    'echo $(( $(rm x) ))',
+]
+
+
+@pytest.mark.parametrize("cmd", BUILD_RM_DENY_ROUND4)
+def test_build_round4_rm_found_where_bash_runs_it(policy_build, cmd):
+    ok, reason = policy_build.command_allowed(cmd)
+    assert not ok and reason == RM_REASON, (cmd, reason)
+
+
+INVESTIGATE_ALLOW_ROUND4 = [
+    'grep -c "\\$(x)" src/app.py',          # escaped $( inside double quotes is text
+    'grep -c "\\`" src/app.py',             # escaped backtick inside double quotes is text
+    "ls # $(npm test)",                     # a substitution inside a comment never runs
+    "ls src # $(npm test) `npm test`",
+    "grep -c '$(x)' src/app.py",
+    "grep -c \\$\\(x src/app.py",
+    "grep x src/app.py # it's",
+    "grep -c $'\\x27' src/app.py",
+    "ls src \\\n  tests",
+    "ls 'a'\\''b'",
+    'grep -n "a\\"b" src/app.py',
+    "ls ${x#*/}",                          # # inside ${ } is not a comment
+    "ls $'\\x3b' cd ..",                    # an ANSI-C ; is text
+    "ls # x\\\n; cd ..",                    # bash: syntax error on line 2, nothing runs; the policy may allow or deny
+]
+
+
+@pytest.mark.parametrize("cmd", INVESTIGATE_ALLOW_ROUND4[:-1])
+def test_investigate_round4_text_is_not_a_command(policy_investigate, cmd):
+    ok, reason = policy_investigate.command_allowed(cmd)
+    assert ok, (cmd, reason)
+
+
+BUILD_ALLOW_ROUND4 = [
+    "cat <<EOF\nrm x\nEOF",
+    "cat <<'EOF'\n$(rm x)\nEOF",
+    "cat <<\\EOF\n$(rm x)\nEOF",
+    "cat <<EOF\n\\$(rm x)\nEOF",
+    "cat <<'EOF'\n`rm x`\nEOF",
+    "echo '$(rm x)'",
+    'echo "\\$(rm x)"',
+    "let x=1<<2\nrm x\n2",                  # let's arguments are words: << is a real heredoc
+    "echo $(( 1 ))<<EOF\nrm x\nEOF",
+    'cat <<"EOF"\nx\\\nEOF\nEOF',
+    "cat <<EOF\nx\\\nEOF\nEOF",             # unquoted body: the continuation joins x and EOF; the next EOF ends it
+    "cat <<EOF\nEOF \nrm x\nEOF",           # a trailing space is not the terminator
+    "cat src/app.py 2>&1 | head",
+    "ls >&2",
+    "cat <&0",
+    "ls $'a;b'",
+    "cat <<EOF\\\nrm x\nEOF",               # the delimiter is EOFrm: never found, so all of it is body
+]
+
+
+@pytest.mark.parametrize("cmd", BUILD_ALLOW_ROUND4)
+def test_build_round4_data_is_not_a_command(policy_build, cmd):
+    ok, reason = policy_build.command_allowed(cmd)
+    assert ok, (cmd, reason)
+
+
+def test_lexer_wrappers_keep_their_shape():
+    from ateam.runner.policy import _split_segments, _strip_heredocs
+
+    assert _split_segments("ls; cat x") == ["ls", " cat x"]
+    assert _split_segments("ls # c\ngit log") == ["ls ", "git log"]
+    assert _split_segments("echo $(rm x)") == ["rm x", "echo $(rm x)"]
+    assert _strip_heredocs("cat <<EOF\nrm x\nEOF\nls") == "cat <<EOF\nls"
+    assert _strip_heredocs("cat <<EOF\nrm x") == "cat <<EOF\nrm x"   # unterminated: kept, so it is checked
