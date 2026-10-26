@@ -528,8 +528,8 @@ def test_approve_commit_failure_prints_recovery_and_leaves_store_untouched(monke
     def fail_commit(paths, message, subpaths):
         raise IntentError("simulated commit failure")
 
-    # `commit_intent` must stay a module-level name in ateam.cli for this patch to bite; approve calls it through the module global.
-    monkeypatch.setattr("ateam.cli.commit_intent", fail_commit)
+    # `commit_intent_files` must stay a module-level name in ateam.cli for this patch to bite; approve calls it through the module global.
+    monkeypatch.setattr("ateam.cli.commit_intent_files", fail_commit)
     r = run("approve", "P-0001", "--skip-records", "--target", str(cli_target))
     assert r.exit_code == 1 and "git -C" in r.output and "checkout" in r.output
     db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
@@ -821,7 +821,7 @@ def test_plan_covered_commit_failure_warns_and_still_transitions(monkeypatch, cl
     def fail_commit(paths, message, subpaths):
         raise IntentError("simulated commit failure")
 
-    monkeypatch.setattr("ateam.cli.commit_intent", fail_commit)
+    monkeypatch.setattr("ateam.cli.commit_intent_files", fail_commit)
     r = run("plan", "health check again", "--target", str(cli_target))
     assert r.exit_code == 0, r.output
     assert "warning: could not commit the covered plan in the intent repo: simulated commit failure" in r.output
@@ -871,6 +871,11 @@ def _review_investigation(monkeypatch, plan_reports, review):
             report, cost = review, 0.02
             if review == "crash":
                 raise RuntimeError("review sdk exploded")
+            if review == "plant_and_crash":
+                (kw["paths"].records / "R-0099-planted.yaml").write_text("id: R-0099\n")
+                raise RuntimeError("git broke after the session")
+            if review == "interrupt":
+                raise KeyboardInterrupt
             if review in ("tamper", "intent_tamper", "no_report"):
                 report = None
             if review == "tamper":
@@ -883,6 +888,8 @@ def _review_investigation(monkeypatch, plan_reports, review):
                 raise RuntimeError("revision sdk exploded")
             if report == "intent_tamper":
                 report, tampered = None, ["intent repo changed during the session"]
+            if report == "checkout_tamper":
+                report, tampered = None, ["planted.txt changed"]
         db = kw["db"]
         a = db.start_attempt(kw["name"], "investigate", "light", "haiku", {})
         db.finish_attempt(a, "completed" if report else "failed", None, 1, 1, cost, 1, 0.1, f"{kind}-{n}")
@@ -940,6 +947,8 @@ def test_plan_blocking_review_triggers_one_revision(monkeypatch, cli_target):
     assert c.title == "Add health with error path" and [a.id for a in c.acceptance] == ["A1", "A2"]
     assert stored.contracts == ["C-0002"] and "C-0003" not in load_contracts(TargetPaths.from_root(cli_target).contracts)
     assert "session plan-2:" in r.output and "total cost: $0.0400" in r.output
+    db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
+    assert db.feature_status("P-0001") == "plan_proposed"
     assert "no test for the error path" in r.output
 
 
@@ -984,6 +993,8 @@ def test_plan_failed_revision_keeps_first_plan_with_note(revision, monkeypatch, 
     assert stored.review.verdict == "needs_revision" and stored.review.revised is False
     assert load_contracts(TargetPaths.from_root(cli_target).contracts)["C-0002"].title == "Add health"
     assert "revision" in r.output and "kept the first plan" in r.output
+    assert stored.review.notes.startswith("n\nrevision discarded: ")
+    assert "revision discarded: " in run("plans", "show", "P-0001", "--target", str(cli_target)).output
 
 
 def test_plan_no_review_flag_skips_review(monkeypatch, cli_target):
@@ -1020,7 +1031,8 @@ def test_review_intent_tamper_writes_plan_but_commits_nothing(monkeypatch, cli_t
     assert r.exit_code == 0, r.output
     intent = TargetPaths.from_root(cli_target).intent
     assert "warning: the review session changed the intent repo; nothing was committed." in r.output
-    assert f'git -C "{intent}" add plans contracts records && git -C "{intent}" commit -m "ateam: propose plan P-0001"' in r.output
+    assert (f'git -C "{intent}" add contracts/C-0002-add-health.yaml plans/P-0001-health-endpoint.yaml && '
+            f'git -C "{intent}" commit -m "ateam: propose plan P-0001"') in r.output
     assert _intent_subject(cli_target) == before and _untracked_plan_file(cli_target)
     stored = _stored_plan(cli_target)
     assert stored.review.verdict == "unavailable" and stored.contracts == ["C-0002"]
@@ -1047,7 +1059,7 @@ def test_planner_intent_tamper_writes_rejected_plan_but_commits_nothing(monkeypa
     assert r.exit_code == 1
     intent = TargetPaths.from_root(cli_target).intent
     assert "warning: the planner session changed the intent repo; nothing was committed." in r.output
-    assert f'git -C "{intent}" add plans && git -C "{intent}" commit -m "ateam: reject plan P-0001' in r.output
+    assert f'git -C "{intent}" add plans/P-0001-add-a-health-function.yaml && git -C "{intent}" commit -m "ateam: reject plan P-0001' in r.output
     assert _intent_subject(cli_target) == before and _untracked_plan_file(cli_target)
     assert _stored_plan(cli_target).status == "plan_rejected"
     db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
@@ -1060,3 +1072,56 @@ def test_review_notes_are_stored_and_printed(monkeypatch, cli_target):
     assert r.exit_code == 0, r.output
     assert _stored_plan(cli_target).review.notes == "paths checked against routes.py"
     assert "paths checked against routes.py" in r.output.split("Review: defensible")[1]
+
+
+def _intent_git(cli_target):
+    return GitRepo(TargetPaths.from_root(cli_target).intent)
+
+
+def test_review_that_plants_and_crashes_commits_only_the_files_plan_wrote(monkeypatch, cli_target):
+    _review_investigation(monkeypatch, [_canned_plan()], "plant_and_crash")
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert "warning: review unavailable" in r.output
+    g = _intent_git(cli_target)
+    assert g.run("log", "-1", "--format=%s").strip() == "ateam: propose plan P-0001"
+    committed = g.run("show", "--name-only", "--format=", "HEAD").split()
+    assert sorted(committed) == ["contracts/C-0002-add-health.yaml", "plans/P-0001-health-endpoint.yaml"]
+    assert "?? records/R-0099-planted.yaml" in g.run("status", "--porcelain", "--untracked-files=all").splitlines()
+
+
+def test_planner_checkout_only_tamper_still_commits_the_rejected_plan(monkeypatch, cli_target):
+    _review_investigation(monkeypatch, ["checkout_tamper"], _DEFENSIBLE)
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 1
+    assert "nothing was committed" not in r.output and "planted.txt changed" in r.output
+    g = _intent_git(cli_target)
+    assert g.run("log", "-1", "--format=%s").strip().startswith("ateam: reject plan P-0001")
+    assert g.run("show", "--name-only", "--format=", "HEAD").split() == ["plans/P-0001-add-a-health-function.yaml"]
+    assert g.is_clean() and _stored_plan(cli_target).status == "plan_rejected"
+    db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
+    assert db.feature_status("P-0001") == "plan_rejected"
+
+
+def test_interrupted_review_saves_and_commits_the_plan_unreviewed(monkeypatch, cli_target):
+    _review_investigation(monkeypatch, [_canned_plan()], "interrupt")
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code != 0
+    stored = _stored_plan(cli_target)
+    assert stored.status == "plan_proposed" and stored.review.verdict == "unavailable" and stored.review.notes == "review interrupted"
+    g = _intent_git(cli_target)
+    assert g.run("log", "-1", "--format=%s").strip() == "ateam: propose plan P-0001" and g.is_clean()
+    db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
+    assert db.feature_status("P-0001") == "plan_proposed"
+
+
+def test_approve_and_reject_commit_only_their_files(monkeypatch, cli_target):
+    p = _proposed_plan(monkeypatch, cli_target)
+    r = run("approve", "P-0001", "--skip-records", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    g = _intent_git(cli_target)
+    assert sorted(g.run("show", "--name-only", "--format=", "HEAD").split()) == ["contracts/C-0002-add-health.yaml", "plans/P-0001-health-endpoint.yaml"]
+    _patch_investigation(monkeypatch, _canned_plan())
+    assert run("plan", "another", "--target", str(cli_target)).exit_code == 0
+    assert run("reject", "P-0002", "no", "--target", str(cli_target)).exit_code == 0
+    assert g.run("show", "--name-only", "--format=", "HEAD").split() == ["plans/P-0002-health-endpoint.yaml"]

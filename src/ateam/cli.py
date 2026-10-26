@@ -12,7 +12,7 @@ from ateam.brief import DEFAULT_MAX_CANDIDATES, assemble_investigation_brief
 from ateam.config import TargetConfig, load_config
 from ateam.gitops import GitRepo
 from ateam.paths import TargetPaths, home_dir, lookup_target, normalise_remote, origin_url, record_target, repo_id, repo_id_source
-from ateam.intent import IntentError, commit_intent, require_clean
+from ateam.intent import IntentError, commit_intent, commit_intent_files, intent_relpath, require_clean
 from ateam.runner.investigate import INTENT_TAMPER, run_investigation
 from ateam.state.db import StateDB
 
@@ -272,23 +272,24 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
     pid = f"P-{max(disk_next, db_next):04d}"
     ctx.db.transition("feature", pid, "requested", by="owner", reason=request[:200])
     ctx.db.transition("feature", pid, "investigating", by="ateam")
-    def _uncommitted(session: str, what: str, subpaths: str, message: str) -> None:
-        """A session tampered: the files stay written for the owner to inspect, but no ateam: commit may carry a planted file."""
+    def _uncommitted(session: str, files: list[Path], message: str) -> None:
+        """A session changed the intent repo: the files stay written for the owner to inspect, but no ateam: commit may carry a planted file."""
         intent = ctx.paths.intent
-        click.echo(f"warning: the {session} session changed the {what}; nothing was committed. Inspect: git -C \"{intent}\" status, "
-                   f"then commit the plan by hand: git -C \"{intent}\" add {subpaths} && git -C \"{intent}\" commit -m \"{message}\"")
+        names = " ".join(intent_relpath(ctx.paths, f) for f in files)
+        click.echo(f"warning: the {session} session changed the intent repo; nothing was committed. Inspect: git -C \"{intent}\" status, "
+                   f"then commit the plan by hand: git -C \"{intent}\" add {names} && git -C \"{intent}\" commit -m \"{message}\"")
 
     def _rejected(reason: str, tampered: list[str] | None = None) -> None:
-        """Leave a visible, terminal trace: a rejected plan file (committed unless the session tampered) and the feature state."""
+        """Leave a visible, terminal trace: a rejected plan file (committed unless the intent repo was changed) and the feature state."""
         rejected = Plan(id=pid, title=request[:80], request=request, status=PlanStatus.plan_rejected,
                         replaces=replaces, history=[PlanHistoryEntry(at=datetime.now(UTC), by="ateam", to=PlanStatus.plan_rejected, why=reason)])
-        save_plan(ctx.paths.plans, rejected)
+        written = save_plan(ctx.paths.plans, rejected)
         message = f"ateam: reject plan {pid} ({reason})"
-        if tampered:
-            _uncommitted("planner", "intent repo" if INTENT_TAMPER in tampered else "checkout", "plans", message)
+        if tampered and INTENT_TAMPER in tampered:
+            _uncommitted("planner", [written], message)
         else:
             try:
-                commit_intent(ctx.paths, message, ["plans"])
+                commit_intent_files(ctx.paths, message, [written])
             except (IntentError, GitError):
                 pass
         current = ctx.db.feature_status(pid)
@@ -342,8 +343,25 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
         sys.exit(1)
     sessions = [result.res]
     intent_tampered_by: str | None = None   # the first later session that changed the intent repo
-    if not pr.covered and not no_review:
-        # The review is advisory: whatever happens to its session, the validated plan is kept.
+
+    def _propose(pr, tampered_by: str | None) -> None:
+        """Write the plan, its contracts and records; commit exactly those files unless a session changed the intent repo."""
+        written = [save_contract(ctx.paths.contracts, c) for c in pr.contracts]
+        written += [save_record(ctx.paths.records, r) for r in pr.proposed.proposed]
+        written.append(save_plan(ctx.paths.plans, pr.plan.model_copy(update={"replaces": replaces})))
+        message = f"ateam: propose plan {pid}"
+        if tampered_by:
+            _uncommitted(tampered_by, written, message)
+        else:
+            commit_intent_files(ctx.paths, message, written)
+        ctx.db.transition("feature", pid, "plan_proposed", by="ateam")
+
+    def _with_note(notes: str, note: str) -> str:
+        return f"{notes}\n{note}" if notes else note
+
+    def _review_and_revise(pr, progress: dict):
+        """Run the review and at most one revision. Returns (plan result, review); never raises an ordinary Exception."""
+        nonlocal intent_tampered_by
         exclude = frozenset({replaces}) if replaces else frozenset()
         review: PlanReview | None = None
         reason = ""
@@ -386,47 +404,65 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
             click.echo(f"warning: review unavailable ({reason}); the plan is unreviewed")
             review = PlanReview(verdict="unavailable", session_id=review_res.session_id if review_res else None,
                                 cost_usd=review_res.cost_usd if review_res else 0.0)
-        blocking = [f for f in review.findings if f.severity == "blocking"]
-        if review.verdict == "needs_revision" and blocking:
-            revision_note = ""
-            prompt = ("A staff-engineer review found blocking problems with your plan. Revise the plan to address every "
-                      "blocking and important finding below, keep what was right, and return the complete report again.\n\n"
-                      + "\n".join(f"- {format_finding(f)}" for f in review.findings))
-            try:
-                if not result.res.session_id:
-                    raise RuntimeError("the planner session has no id to resume")
-                revised = asyncio.run(run_investigation(
-                    paths=ctx.paths, config=ctx.config, target_git=ctx.git, name=pid, spec=PLANNER_SPEC, prompt=prompt,
-                    brief_text=brief, tier=tiers[tier][Role.investigate], db=ctx.db, tier_name=tier,
-                    resume=result.res.session_id,
-                ))
-            except Exception as e:  # noqa: BLE001  a failed revision keeps the first valid plan
-                revision_note = f"the session failed: {type(e).__name__}: {e}"
+        progress["review"] = review
+        if review.verdict != "needs_revision" or not any(f.severity == "blocking" for f in review.findings):
+            return pr, review
+        revision_note = ""
+        prompt = ("A staff-engineer review found blocking problems with your plan. Revise the plan to address every "
+                  "blocking and important finding below, keep what was right, and return the complete report again.\n\n"
+                  + "\n".join(f"- {format_finding(f)}" for f in review.findings))
+        try:
+            if not result.res.session_id:
+                raise RuntimeError("the planner session has no id to resume")
+            revised = asyncio.run(run_investigation(
+                paths=ctx.paths, config=ctx.config, target_git=ctx.git, name=pid, spec=PLANNER_SPEC, prompt=prompt,
+                brief_text=brief, tier=tiers[tier][Role.investigate], db=ctx.db, tier_name=tier,
+                resume=result.res.session_id,
+            ))
+        except Exception as e:  # noqa: BLE001  a failed revision keeps the first valid plan
+            revision_note = f"the session failed: {type(e).__name__}: {e}"
+        else:
+            sessions.append(revised.res)
+            if revised.tampered:
+                revision_note = "the session changed the checkout or intent repo: " + "; ".join(revised.tampered)
+                if INTENT_TAMPER in revised.tampered:
+                    intent_tampered_by = intent_tampered_by or "revision"
+            elif revised.res.report is None:
+                revision_note = f"no report, subtype {revised.res.subtype}"
             else:
-                sessions.append(revised.res)
-                if revised.tampered:
-                    revision_note = "the session changed the checkout or intent repo: " + "; ".join(revised.tampered)
-                    if INTENT_TAMPER in revised.tampered:
-                        intent_tampered_by = intent_tampered_by or "revision"
-                elif revised.res.report is None:
-                    revision_note = f"no report, subtype {revised.res.subtype}"
+                try:
+                    pr2 = report_to_plan(revised.res.report, request, pid, ctx.paths.contracts, records, ctx.config,
+                                         ctx.paths.root, ctx.paths.records, tiers=tiers, existing_plans=existing_plans,
+                                         replaces=replaces)
+                except PlanError as e:
+                    revision_note = "the revised report is not usable: " + "; ".join(e.problems)
                 else:
-                    try:
-                        pr2 = report_to_plan(revised.res.report, request, pid, ctx.paths.contracts, records, ctx.config,
-                                             ctx.paths.root, ctx.paths.records, tiers=tiers, existing_plans=existing_plans,
-                                             replaces=replaces)
-                    except PlanError as e:
-                        revision_note = "the revised report is not usable: " + "; ".join(e.problems)
-                    else:
-                        if pr2.covered:
-                            revision_note = (f"the revised report calls the request covered by {', '.join(pr2.plan.covered_by)} "
-                                             "instead of revising the plan")
-                        else:
-                            pr = pr2
-                            review = review.model_copy(update={"revised": True})
-            if revision_note:
-                pr.problems.append(f"the planner's revision was discarded ({revision_note}); kept the first plan")
-                click.echo(f"warning: revision discarded ({revision_note}); kept the first plan")
+                    if not pr2.covered:
+                        return pr2, review.model_copy(update={"revised": True})
+                    revision_note = (f"the revised report calls the request covered by {', '.join(pr2.plan.covered_by)} "
+                                     "instead of revising the plan")
+        pr.problems.append(f"the planner's revision was discarded ({revision_note}); kept the first plan")
+        click.echo(f"warning: revision discarded ({revision_note}); kept the first plan")
+        return pr, review.model_copy(update={"notes": _with_note(review.notes, f"revision discarded: {revision_note}")})
+
+    if not pr.covered and not no_review:
+        progress: dict = {"review": None}
+        try:
+            pr, review = _review_and_revise(pr, progress)
+        except BaseException:
+            # Interrupted (Ctrl-C, cancellation): keep the validated first plan, unreviewed or with its review, then stop.
+            done = progress["review"]
+            if done is None:
+                kept = PlanReview(verdict="unavailable", notes="review interrupted")
+            else:
+                kept = done.model_copy(update={"notes": _with_note(done.notes, "revision discarded: interrupted")})
+            pr.plan = pr.plan.model_copy(update={"review": kept})
+            try:
+                _propose(pr, intent_tampered_by)
+                click.echo(f"interrupted: {pid} was saved as plan_proposed with review {kept.verdict}")
+            except Exception as e:  # noqa: BLE001  never mask the interrupt
+                click.echo(f"warning: could not save {pid} after the interrupt: {e}")
+            raise
         pr.plan = pr.plan.model_copy(update={"review": review})
 
     def _session_lines() -> None:
@@ -437,27 +473,19 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
             click.echo(f"total cost: ${sum(res.cost_usd for res in sessions):.4f} across {len(sessions)} sessions")
 
     if pr.covered:
-        save_plan(ctx.paths.plans, pr.plan)
+        covered_file = save_plan(ctx.paths.plans, pr.plan)
         covered_msg = f"ateam: plan {pid} covered by {', '.join(pr.plan.covered_by)}"
         try:
-            commit_intent(ctx.paths, covered_msg, ["plans"])
+            commit_intent_files(ctx.paths, covered_msg, [covered_file])
         except (IntentError, GitError) as e:
             click.echo(f"warning: could not commit the covered plan in the intent repo: {e}; commit it by hand: "
-                       f"git -C \"{ctx.paths.intent}\" add plans && git -C \"{ctx.paths.intent}\" commit -m \"{covered_msg}\"")
+                       f"git -C \"{ctx.paths.intent}\" add {intent_relpath(ctx.paths, covered_file)} && "
+                       f"git -C \"{ctx.paths.intent}\" commit -m \"{covered_msg}\"")
         ctx.db.transition("feature", pid, "plan_covered", by="ateam", reason=f"covered by {', '.join(pr.plan.covered_by)}")
         click.echo(render_plan_review(pr, tiers))
         _session_lines()
         return
-    for c in pr.contracts:
-        save_contract(ctx.paths.contracts, c)
-    for r in pr.proposed.proposed:
-        save_record(ctx.paths.records, r)
-    save_plan(ctx.paths.plans, pr.plan.model_copy(update={"replaces": replaces}))
-    if intent_tampered_by:
-        _uncommitted(intent_tampered_by, "intent repo", "plans contracts records", f"ateam: propose plan {pid}")
-    else:
-        commit_intent(ctx.paths, f"ateam: propose plan {pid}", ["plans", "contracts", "records"])
-    ctx.db.transition("feature", pid, "plan_proposed", by="ateam")
+    _propose(pr, intent_tampered_by)
     click.echo(render_plan_review(pr, tiers))
     _session_lines()
 
@@ -542,6 +570,7 @@ def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, targe
     graph = RecordGraph(records)
     notes: list[str] = []
     frozen_all: list[tuple] = []
+    approval_files: list[Path] = []   # exactly what this approval writes; nothing else rides the commit
     click.echo("Frozen contracts, in dependency order:")
     for cid in _dependency_order({cid: cs[cid] for cid in plan_.contracts}):
         c = cs[cid]
@@ -565,7 +594,7 @@ def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, targe
         c = c.model_copy(update={"allocation": c.allocation.model_copy(update={"tier": tier})})
         selected = select_records(c.paths, graph, ctx.paths.root)
         frozen = freeze(c, selected)
-        save_contract(ctx.paths.contracts, frozen)
+        approval_files.append(save_contract(ctx.paths.contracts, frozen))
         frozen_all.append((frozen, selected))
         click.echo(f"  {frozen.id}  {frozen.status:<6} build={tier['build']} test={tier['test']} investigate={tier.get('investigate', 'none')}  records: {', '.join(r.id for r in selected) or 'none'}")
     for n in notes:
@@ -574,17 +603,17 @@ def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, targe
         "status": PlanStatus.plan_approved, "tier_overrides": overrides,
         "history": [*plan_.history, PlanHistoryEntry(at=datetime.now(UTC), by="owner", to=PlanStatus.plan_approved)],
     })
-    save_plan(ctx.paths.plans, plan_)
+    approval_files.append(save_plan(ctx.paths.plans, plan_))
     superseded_id = None
     old_plan = plans_.get(plan_.replaces) if plan_.replaces else None
     if old_plan is not None and old_plan.status == PlanStatus.plan_proposed:
         superseded_id = old_plan.id
-        save_plan(ctx.paths.plans, old_plan.model_copy(update={
+        approval_files.append(save_plan(ctx.paths.plans, old_plan.model_copy(update={
             "status": PlanStatus.superseded,
             "history": [*old_plan.history, PlanHistoryEntry(at=datetime.now(UTC), by="owner", to=PlanStatus.superseded, why=f"replaced by {plan_id}")],
-        }))
+        })))
     try:
-        commit_intent(ctx.paths, f"ateam: approve plan {plan_id}", ["plans", "contracts"])
+        commit_intent_files(ctx.paths, f"ateam: approve plan {plan_id}", approval_files)
     except (IntentError, GitError) as e:
         click.echo(f"error: could not commit the approval in the intent repo: {e}")
         click.echo("Nothing was recorded in the state store. Restore the intent repo and re-run:")
@@ -629,8 +658,7 @@ def reject(plan_id: str, reason: str, target: Path) -> None:
         "status": PlanStatus.plan_rejected,
         "history": [*plan_.history, PlanHistoryEntry(at=datetime.now(UTC), by="owner", to=PlanStatus.plan_rejected, why=reason)],
     })
-    save_plan(ctx.paths.plans, plan_)
-    commit_intent(ctx.paths, f"ateam: reject plan {plan_id}", ["plans"])
+    commit_intent_files(ctx.paths, f"ateam: reject plan {plan_id}", [save_plan(ctx.paths.plans, plan_)])
     ctx.db.transition("feature", plan_id, "plan_rejected", by="owner", reason=reason)
     click.echo(f"{plan_id} -> plan_rejected")
 
