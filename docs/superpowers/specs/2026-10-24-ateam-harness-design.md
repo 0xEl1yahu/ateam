@@ -101,6 +101,8 @@ Three failure classes, each with its own mechanism:
 - **`ateam contracts refresh` stops on drift**: it leaves the draft in place and reports; it never rewrites a drifted contract. (Constrains a future feature; implemented with it.) (Owner, 2026-10-25.)
 - **Rebuild derives only from the intent repo.** Doctor's rebuild recreates state that the intent repo determines and nothing else. (Constrains a future feature; implemented with it.) (Owner, 2026-10-25.)
 - **Merge is fast-forward only by default, in the owner's checkout.** (Constrains a future feature; implemented with it.) (Owner, 2026-10-25.)
+- **A failed integration pauses; a stale proposal is refreshed.** `integrating -> paused(reason)`: a merge conflict or a setup failure pauses with `environment_failure`, failed final checks with `verification_unresolvable`, so `paused -> abandoned` is reachable. `merge_proposed -> integrating`: when the target moved after the proposal, re-running `ateam integrate` merges the new target tip, re-checks and writes a fresh proposal. `integrate` refuses a paused feature; resuming belongs to the pause/resume work. (Owner, 2026-10-26.)
+- **Integration defaults** (owner, 2026-10-26): merge reads the local target ref and never fetches; ATeam never sets a git identity; any status entry, untracked files included, makes the owner's checkout dirty for merge; the final check set is `config.checks` plus every contract's checks, de-duplicated; integrate merges the head verify recorded for each contract; the integration worktree and branch are left in place after merge or reject, for a later cleanup command.
 - **A moved target is merged into the integration branch.** When the target branch has moved since `ateam/<plan-id>` was created, `ateam integrate` merges the current target tip into the integration branch (never rebases it, so tree-verified contract commits keep their hashes) and then runs the full deterministic check set, so `ateam merge` can still fast-forward. This settles "rebase or merge" in step 4 of "Verification and integration". (Owner, 2026-10-26.)
 - **Worker reads are confined to the worktree and the worker's scratch directory** (decoded path arguments, the Read/Glob/Grep tools, recursive searches of an ancestor directory). (Owner, 2026-10-26.) Decided, not yet implemented: it is a feature with false-positive risk and gets its own plan; today only ATeam's home is protected from reads.
 - **A request already covered by an existing plan is a `plan_covered` outcome, not a rejection.** `ateam plan --replaces P-xxxx` hides that plan from the planner and marks it `superseded` when the new plan is approved. (Owner, 2026-10-25.)
@@ -309,6 +311,8 @@ Feature (one per plan):
 requested -> investigating -> plan_proposed -> plan_approved -> executing
 executing -> integrating -> merge_proposed -> merged
 executing -> paused(reason) -> executing | abandoned
+integrating -> paused(reason)      (a merge conflict, a setup failure or failed final checks)
+merge_proposed -> integrating      (the target moved after the proposal; integrate refreshes it)
 plan_proposed -> plan_rejected
 investigating -> plan_covered
 plan_proposed -> superseded

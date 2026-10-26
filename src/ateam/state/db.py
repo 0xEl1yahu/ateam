@@ -18,8 +18,8 @@ FEATURE_TRANSITIONS: dict[str | None, set[str]] = {
     "plan_approved": {"executing", "superseded"},   # superseded only before any of its contracts has started
     "executing": {"paused", "integrating"},
     "paused": {"executing", "abandoned"},
-    "integrating": {"merge_proposed"},
-    "merge_proposed": {"merged", "plan_rejected"},
+    "integrating": {"merge_proposed", "paused"},             # paused: a conflict, a setup failure or failed final checks
+    "merge_proposed": {"merged", "plan_rejected", "integrating"},   # integrating: the target moved after the proposal
     "plan_rejected": set(),
     "merged": set(),
     "abandoned": set(),

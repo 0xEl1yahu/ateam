@@ -235,3 +235,9 @@ def test_work_traces_names_every_kind_of_trace(tmp_path):
     assert db.work_traces("C-0002") == ["an attempt", "a contract transition", "a checkpoint", "a verify marker"]
     db.set_meta("verify-pending:C-0003", "{}")
     assert db.work_traces("C-0003") == ["a verify marker"]
+
+
+# Owner, 2026-10-26: a failed integration pauses; a stale proposal goes back to integrating.
+def test_integration_edges():
+    assert FEATURE_TRANSITIONS["integrating"] == {"merge_proposed", "paused"}
+    assert FEATURE_TRANSITIONS["merge_proposed"] == {"merged", "plan_rejected", "integrating"}

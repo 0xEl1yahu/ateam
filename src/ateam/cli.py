@@ -233,8 +233,9 @@ def init(remote: str | None, max_candidates: int, tier: str, target: Path) -> No
 
 
 def _plan_contract_ids(ctx: Context, plan) -> list[str]:
-    """A plan's contracts: those its file lists and those the state store files under it."""
-    return sorted(set(plan.contracts) | {r["contract_id"] for r in ctx.db.contracts_for_plan(plan.id)})
+    from ateam.plans.ops import plan_contract_ids
+
+    return plan_contract_ids(ctx.db, plan)
 
 
 def _started_reason(ctx: Context, plan, contracts: dict) -> str | None:
@@ -536,17 +537,9 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
 
 
 def _dependency_order(contracts: dict) -> list[str]:
-    """Contract ids with dependencies first; ties by id. Cycles were rejected at planning time."""
-    remaining = dict(contracts)
-    order: list[str] = []
-    while remaining:
-        ready = sorted(cid for cid, c in remaining.items() if all(d not in remaining for d in c.depends_on))
-        if not ready:
-            ready = sorted(remaining)[:1]
-        for cid in ready:
-            order.append(cid)
-            remaining.pop(cid)
-    return order
+    from ateam.plans.ops import dependency_order
+
+    return dependency_order(contracts)
 
 
 def _parse_tier_overrides(specs: tuple[str, ...], plan_contracts: list[str], tier_names: list[str]) -> dict[str, dict[str, str]]:
@@ -1056,6 +1049,63 @@ def contracts_freeze(contract_id: str, force: bool, target: Path) -> None:
     for r in selected:
         ctx.db.set_record_hash(r.id, r.content_hash())
     click.echo(f"{frozen.id} frozen as {frozen.status} with records: {', '.join(r.id for r in selected) or '(none)'}")
+
+
+@contracts.command("refresh")
+@click.argument("plan_id", required=False)
+@TARGET_OPTION
+def contracts_refresh(plan_id: str | None, target: Path) -> None:
+    """Promote frozen draft contracts whose dependencies are all verified or integrated. Stops on drift: a drifted
+    draft is left as it is and reported (owner, 2026-10-25). Only the status changes; the frozen hash does not."""
+    from ateam.contracts.model import ContractStatus
+    from ateam.contracts.select import drift
+    from ateam.contracts.store import load_contracts, save_contract
+    from ateam.plans.store import load_plans
+    from ateam.records.store import load_records
+
+    ctx = _context(target)
+    plans_ = load_plans(ctx.paths.plans)
+    if plan_id is not None and plan_id not in plans_:
+        _fail(f"unknown plan {plan_id}")
+    cs = load_contracts(ctx.paths.contracts)
+    recs = load_records(ctx.paths.records)
+    live = ("plan_approved", "executing", "integrating")
+    promote, problems = [], 0
+    for cid, c in sorted(cs.items()):
+        if plan_id is not None and c.plan != plan_id:
+            continue
+        frozen = ctx.db.contract_hash(cid)
+        if c.status != ContractStatus.draft or frozen is None or ctx.db.contract_status(cid) != "draft":
+            continue
+        if ctx.db.feature_status(c.plan) not in live:
+            continue
+        waiting = [d for d in c.depends_on if ctx.db.contract_status(d) not in ("verified", "integrated")]
+        if waiting:
+            click.echo(f"{cid}: waiting on " + ", ".join(f"{d} ({ctx.db.contract_status(d) or 'missing'})" for d in waiting))
+            continue
+        if c.content_hash() != frozen:
+            click.echo(f"{cid}: differs from its frozen hash (hand edit); left draft")
+            problems += 1
+            continue
+        drifted = drift(c, recs)
+        if drifted:
+            click.echo(f"{cid}: record drift ({', '.join(drifted)}); left draft")
+            problems += 1
+            continue
+        promote.append(c)
+    if not promote:
+        click.echo("nothing to refresh")
+        sys.exit(1 if problems else 0)
+    try:
+        require_clean(ctx.paths)
+    except IntentError as e:
+        _fail(str(e))
+    files = [save_contract(ctx.paths.contracts, c.model_copy(update={"status": ContractStatus.ready})) for c in promote]
+    commit_intent_files(ctx.paths, f"ateam: refresh {', '.join(c.id for c in promote)}", files)
+    for c in promote:
+        ctx.db.transition("contract", c.id, "ready", by="refresh")
+        click.echo(f"{c.id} -> ready")
+    sys.exit(1 if problems else 0)
 
 
 @contracts.command("validate")

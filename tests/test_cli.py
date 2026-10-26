@@ -1969,3 +1969,59 @@ def test_validate_reports_a_superseded_contract_as_info(monkeypatch, cli_target)
     commit_intent(p, "edit record", ["records"])
     r = run("contracts", "validate", "--target", str(cli_target))
     assert "INFO C-0002: superseded" in r.output and "ERROR C-0002" not in r.output and "ERROR C-0003" not in r.output
+
+
+# ---- contracts refresh: promote drafts whose dependencies are verified; stop on drift (owner, 2026-10-25)
+
+def _mark_verified(p, cli_target, cid):
+    from ateam.contracts.store import save_contract
+    c = load_contracts(p.contracts)[cid]
+    save_contract(p.contracts, c.model_copy(update={"status": ContractStatus.verified}))
+    commit_intent(p, f"{cid} verified", ["contracts"])
+    db = _db(cli_target)
+    for to in ("building", "verifying", "verified"):
+        db.transition("contract", cid, to, by="t")
+
+
+def test_refresh_promotes_a_draft_whose_dependencies_are_verified(monkeypatch, cli_target):
+    p = _approved_predecessor(monkeypatch, cli_target)
+    _mark_verified(p, cli_target, "C-0002")
+    frozen = _db(cli_target).contract_hash("C-0003")
+    head = GitRepo(p.intent).head()
+    r = run("contracts", "refresh", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert "C-0003 -> ready" in r.output
+    assert load_contracts(p.contracts)["C-0003"].status == "ready" and _db(cli_target).contract_status("C-0003") == "ready"
+    assert load_contracts(p.contracts)["C-0003"].content_hash() == frozen == _db(cli_target).contract_hash("C-0003")
+    g = GitRepo(p.intent)
+    assert g.run("rev-parse", "HEAD~1").strip() == head and g.run("log", "-1", "--format=%s").strip() == "ateam: refresh C-0003"
+
+
+def test_refresh_keeps_a_draft_with_an_unverified_dependency(monkeypatch, cli_target):
+    p = _approved_predecessor(monkeypatch, cli_target)
+    head = GitRepo(p.intent).head()
+    r = run("contracts", "refresh", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert "C-0003: waiting on C-0002 (ready)" in r.output and "nothing to refresh" in r.output
+    assert load_contracts(p.contracts)["C-0003"].status == "draft" and GitRepo(p.intent).head() == head
+
+
+def test_refresh_stops_on_drift(monkeypatch, cli_target):
+    from ateam.records.store import load_records, save_record
+    p = _approved_predecessor(monkeypatch, cli_target)
+    _mark_verified(p, cli_target, "C-0002")
+    r1 = load_records(p.records)["R-0001"]
+    save_record(p.records, r1.model_copy(update={"statement": r1.statement + " (changed)"}))
+    commit_intent(p, "edit record", ["records"])
+    r = run("contracts", "refresh", "--target", str(cli_target))
+    assert r.exit_code == 1
+    assert "C-0003: record drift (R-0001); left draft" in r.output
+    assert load_contracts(p.contracts)["C-0003"].status == "draft" and _db(cli_target).contract_status("C-0003") == "draft"
+
+
+def test_refresh_skips_unfrozen_contracts_and_honours_the_plan_filter(monkeypatch, cli_target):
+    p = _proposed_plan(monkeypatch, cli_target, two=True)          # C-0002, C-0003: never frozen
+    r = run("contracts", "refresh", "--target", str(cli_target))
+    assert r.exit_code == 0 and "nothing to refresh" in r.output and "C-0003" not in r.output
+    r = run("contracts", "refresh", "P-0009", "--target", str(cli_target))
+    assert r.exit_code == 1 and "unknown plan P-0009" in r.output
