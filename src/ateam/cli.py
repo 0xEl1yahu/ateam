@@ -985,6 +985,11 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
     if res.error:
         click.echo(f"error: {res.error}")
     click.echo(f"scope ok={scope.ok} outside={scope.outside} dirty={scope.dirty} changed={tree.changed_vs_base}")
+    if Role(role) is Role.test and res.report and scope.ok:
+        from ateam.runner.run import classify_test_report
+
+        test_outcome, test_class = classify_test_report(res.report)
+        click.echo(f"classification: {test_outcome}/{test_class or '-'}")
     click.echo(json.dumps(res.report, indent=2) if res.report else "no structured report")
     sys.exit(0 if (res.report and scope.ok) else (3 if res.report else 1))
 

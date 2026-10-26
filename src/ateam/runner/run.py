@@ -117,6 +117,13 @@ def ensure_setup(worktree: Path, config: TargetConfig, db: StateDB, on_command=N
     return list(config.setup)
 
 
+def classify_test_report(report: dict) -> tuple[str, str | None]:
+    """Outcome and failure class of a TEST attempt. Only not_met fails it; cannot_determine alone stays completed."""
+    if not any(v.get("verdict") == "not_met" for v in report.get("verdicts", [])):
+        return "completed", None
+    return "failed", ("requirements" if report.get("requirements_unclear") else "implementation")
+
+
 def default_base(git_worktree: GitRepo, target_branch: str) -> str:
     """The commit the worktree forked from: merge-base with the target branch, else HEAD."""
     try:
@@ -182,5 +189,7 @@ async def run_contract_attempt(
     else:
         outcome = "completed" if res.report and scope.ok else ("scope_breach" if res.report else "failed")
         failure_class = None
+        if role is Role.test and res.report and scope.ok:
+            outcome, failure_class = classify_test_report(res.report)
     db.finish_attempt(attempt_id, outcome, failure_class, tokens_in, tokens_out, res.cost_usd, res.num_turns, res.wall_s, res.session_id)
     return res, tree, scope, cp

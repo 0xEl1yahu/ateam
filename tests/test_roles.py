@@ -19,7 +19,7 @@ def test_report_schemas_are_strict():
     for spec in ROLE_SPECS.values():
         assert spec.report_schema["type"] == "object" and spec.report_schema["additionalProperties"] is False
     assert set(ROLE_SPECS[Role.build].report_schema["properties"]) == {"status", "commits", "files", "checks_run", "risks", "proposals", "notes"}
-    assert set(ROLE_SPECS[Role.test].report_schema["properties"]) == {"verdicts", "notes"}
+    assert set(ROLE_SPECS[Role.test].report_schema["properties"]) == {"verdicts", "notes", "requirements_unclear"}
     assert ROLE_SPECS[Role.test].report_schema["properties"]["verdicts"]["items"]["properties"]["verdict"]["enum"] == ["met", "not_met", "cannot_determine"]
 
 
@@ -50,3 +50,13 @@ def test_planner_schema_new_fields_required():
 def test_investigation_common_tells_workers_to_use_read_for_line_ranges():
     from ateam.roles import INVESTIGATION_COMMON
     assert "Read tool with offset and limit" in INVESTIGATION_COMMON
+
+
+def test_test_schema_requires_requirements_unclear():
+    from ateam.roles import TEST_SCHEMA
+    assert "requirements_unclear" in TEST_SCHEMA["required"]
+    assert TEST_SCHEMA["properties"]["requirements_unclear"] == {"type": "boolean"}
+
+
+def test_test_prompt_explains_the_flag():
+    assert "requirements_unclear" in ROLE_SPECS[Role.test].system_prompt

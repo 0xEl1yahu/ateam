@@ -225,3 +225,46 @@ def test_ensure_setup_failure_records_nothing(target_repo, ateam_home, tmp_path)
         ensure_setup(target_repo, cfg, db)
     assert e.value.cmd == "echo boom >&2; exit 3" and e.value.returncode == 3 and "boom" in e.value.output
     assert db.get_meta(f"setup:{target_repo.resolve()}") is None
+
+
+@pytest.mark.parametrize("verdicts,flag,expected", [
+    ([("A1", "met")], False, ("completed", None)),
+    ([("A1", "not_met")], False, ("failed", "implementation")),
+    ([("A1", "not_met")], True, ("failed", "requirements")),
+    ([("A1", "cannot_determine")], True, ("completed", None)),
+    ([("A1", "met")], True, ("completed", None)),
+])
+def test_classify_test_report(verdicts, flag, expected):
+    from ateam.runner.run import classify_test_report
+
+    report = {"verdicts": [{"id": i, "verdict": v, "evidence": "e"} for i, v in verdicts], "notes": "", "requirements_unclear": flag}
+    assert classify_test_report(report) == expected
+
+
+@pytest.mark.asyncio
+async def test_test_attempt_records_classification(monkeypatch, target_repo, sample_contract, records_three, ateam_home):
+    from ateam.config import TargetConfig
+    from ateam.contracts.select import freeze
+    from ateam.gitops import GitRepo
+    from ateam.paths import TargetPaths, home_dir
+    from ateam.roles import Role
+    from ateam.runner import run as run_mod
+    from ateam.state.db import StateDB
+    from ateam.tiers import load_tiers
+
+    report = {"verdicts": [{"id": "A1", "verdict": "not_met", "evidence": "x"}], "notes": "A1 is ambiguous", "requirements_unclear": True}
+
+    async def fake_query(prompt, options):
+        yield _result(structured_output=report)
+
+    monkeypatch.setattr("ateam.runner.run.query", fake_query)
+    db = StateDB(home_dir(target_repo) / "state.db"); db.init_schema()
+    contract = freeze(sample_contract, [records_three["R-0001"]])
+    db.upsert_contract(contract.id, contract.plan, contract.status, contract.content_hash())
+    git = GitRepo(target_repo)
+    await run_mod.run_contract_attempt(
+        paths=TargetPaths.from_root(target_repo), config=TargetConfig(), git_worktree=git, worktree=target_repo, base=git.head(),
+        contract=contract, records=records_three, role=Role.test, tiers=load_tiers(), db=db,
+    )
+    row = db.telemetry_rows()[-1]
+    assert row["outcome"] == "failed" and row["failure_class"] == "requirements"
