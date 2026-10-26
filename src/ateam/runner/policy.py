@@ -931,6 +931,11 @@ def _git_config_option(words: list[str]) -> bool:
     return any(o.startswith("-c") or o.startswith("--config-env") for o in opts)
 
 
+# Where a spelling of the worker's own worktree ends in a command: end of text, a shell delimiter, or a `/` that does
+# not start a `..` step.
+_OWN_WORKTREE_END = r"""(?=$|[\s'"`;&|<>()]|/(?!\.\.(?:$|[/\s'"`;&|<>()])))"""
+
+
 FOLLOW_LINKS_REASON = ("searches that follow symbolic links are not allowed: a link can lead into ATeam's home; "
                        "drop -R/-L/--follow (grep -r, rg and find do not follow links)")
 
@@ -1048,6 +1053,17 @@ class Policy:
         except ValueError:
             return False
 
+    def _in_own_worktree(self, path: Path) -> bool:
+        """True when the path, resolved first (so a link out is judged by its target), is the worker's own worktree
+        or lies under it. Such a path is not ATeam's home even when the worktree lives there (owner, 2026-10-26)."""
+        candidate = path if path.is_absolute() else self.worktree / path
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return False
+        root = self.worktree.resolve()
+        return resolved == root or root in resolved.parents
+
     def _spellings(self, path: Path | None) -> list[str]:
         if path is None:
             return []
@@ -1066,7 +1082,7 @@ class Policy:
         return [*joined, *(Path(os.path.normpath(j)) for j in joined)]
 
     def _under_home_not_scratch(self, file_path: str) -> bool:
-        """True when a path resolves into ATeam's home but not into this worker's scratch dir."""
+        """True when a path resolves into ATeam's home but not into this worker's scratch dir or own worktree."""
         home = self.ateam_home or Path(os.environ.get("ATEAM_HOME") or (Path.home() / ".ateam"))
         raw = file_path.strip().strip("'\"")
         if raw.startswith("~"):
@@ -1084,8 +1100,11 @@ class Policy:
                 resolved.relative_to(home.resolve())
             except ValueError:
                 continue
-            if not self._in_scratch(str(resolved)):
-                return True
+            if self._in_scratch(str(resolved)):
+                continue
+            if self._in_own_worktree(resolved) and not self._in_own_worktree(home):   # a home nested in the worktree stays home
+                continue
+            return True
         return False
 
     def _wildcard_reaches_home(self, token: str) -> bool:
@@ -1226,11 +1245,18 @@ class Policy:
             return False, "INVESTIGATE may not use command or process substitution"
         scratch_spellings = self._spellings(self.scratch_dir)
         home_spellings = self._home_spellings() if self.scratch_dir is not None or self.ateam_home is not None else []
+        worktree_spellings = self._spellings(self.worktree)
         for seg, words in ((s.text, s.words) for s in all_segments):
             mentions_scratch = any(sp in seg for sp in scratch_spellings)
             if mentions_scratch and ".." in seg:
                 return False, "paths that leave your scratch directory are not allowed"
-            if any(sp in seg for sp in home_spellings) and not mentions_scratch:
+            # The own worktree may live under the home; its spelling is not a home mention when it ends at a path
+            # boundary and is not followed by `/..` (a look-alike sibling or a step out stays a mention). Every path
+            # token is still resolved below, which also judges a link out of the worktree.
+            unworktreed = seg
+            for sp in worktree_spellings:
+                unworktreed = re.sub(re.escape(sp) + _OWN_WORKTREE_END, " ", unworktreed)
+            if any(sp in unworktreed for sp in home_spellings) and not mentions_scratch:
                 return False, "ATeam's home (intent repo, state store, logs) is off limits to workers; only your scratch directory is writable"
             if home_spellings:
                 decoded = [e for w in words for e in _brace_expand(w)]   # a $'...' or quoted spelling of a home path

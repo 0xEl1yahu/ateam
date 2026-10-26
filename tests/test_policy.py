@@ -1587,3 +1587,130 @@ def test_symlink_following_searches_denied(role, cmd, request):
 @pytest.mark.parametrize("cmd", DOES_NOT_FOLLOW)
 def test_searches_that_do_not_follow_links_stay_allowed(cmd, policy_investigate):
     assert policy_investigate.command_allowed(cmd) == (True, "")
+
+
+# ---- own worktree under ATeam's home (owner, 2026-10-26): the scheduler puts a contract's worktree at
+# <home>/<id>/worktrees/<cid>. A path that resolves inside the worker's own worktree is not "home"; nothing else
+# under the home becomes readable.
+
+READ_HOME_REASON = "ATeam's home (intent repo, state store, logs) is not readable by workers; only your scratch directory is"
+OWN_WT_ID = "repo-0123abcd"
+
+
+@pytest.fixture(params=["build", "test", "investigate"])
+def own_worktree(request, tmp_path, monkeypatch):
+    from ateam.roles import Role
+    from ateam.runner.policy import Policy
+
+    home = tmp_path / ".ateam"
+    monkeypatch.setenv("ATEAM_HOME", str(home))
+    base = home / OWN_WT_ID
+    wt = base / "worktrees" / "C-0001"
+    for d in (wt / "src", base / "worktrees" / "C-0002" / "src", base / "worktrees" / "P-0001" / "src",
+              base / "intent", base / "scratch" / "C-0001", base / "scratch" / "C-0001-test",
+              base / "worktrees" / "C-0001-evil"):
+        d.mkdir(parents=True, exist_ok=True)
+    for f in (wt / "src" / "x.py", base / "worktrees" / "C-0002" / "src" / "x.py",
+              base / "worktrees" / "P-0001" / "src" / "x.py", base / "intent" / "config.yaml", base / "state.db",
+              base / "scratch" / "C-0001-test" / "x", base / "worktrees" / "C-0001-evil" / "x"):
+        f.write_text("x = 1\n")
+    (wt / "lnk").symlink_to(base / "intent", target_is_directory=True)
+    pol = Policy(worktree=wt, role=Role(request.param), allowed_paths=["src/**"], protected=[".claude/**"], bound={},
+                 scratch_dir=base / "scratch" / "C-0001", ateam_home=home)
+    return pol, home, base, wt
+
+
+OWN_WT_ALLOWED_TOOLS = [
+    ("Read", {"file_path": "{wt}/src/x.py"}),
+    ("Read", {"file_path": "src/x.py"}),
+    ("Grep", {"pattern": "x", "path": "{wt}"}),
+    ("Grep", {"pattern": "x", "path": "{wt}/src"}),
+    ("Glob", {"pattern": "src/*.py", "path": "{wt}"}),
+]
+OWN_WT_ALLOWED_CMDS = ["cat src/x.py", "cat {wt}/src/x.py", "ls {wt}", "ls {wt}/src", "cd {wt}/src && ls"]
+OWN_WT_ALLOWED_GIT = ["git -C {wt} log", "git -C {wt} status"]
+OWN_WT_DENIED_CMDS = [
+    "cat {base}/worktrees/C-0002/src/x.py",   # another contract's worktree
+    "cat {base}/worktrees/P-0001/src/x.py",   # the integration worktree
+    "cat {base}/intent/config.yaml",
+    "cat {base}/state.db",
+    "cat {base}/scratch/C-0001-test/x",       # another scratch dir that shares the prefix
+    "cat {wt}/../C-0002/src/x.py",
+    "cat ../C-0002/src/x.py",
+    "cat {wt}/lnk/config.yaml",               # a symlink inside the worktree pointing into the home
+    "cat lnk/config.yaml",
+    "cat {wt}-evil/x",                        # a sibling whose name has the worktree's name as a prefix
+    "ls {wt} {base}/intent",
+    "X=a:{wt}/../../intent/config.yaml cat src/x.py",   # a path list, not a path token: the text check is the net
+    "cat a:{wt}-evil/x",
+]
+OWN_WT_DENIED_TOOLS = [
+    ("Read", {"file_path": "{wt}/lnk/config.yaml"}),
+    ("Read", {"file_path": "lnk/config.yaml"}),
+    ("Read", {"file_path": "{wt}/../C-0002/src/x.py"}),
+    ("Read", {"file_path": "{wt}-evil/x"}),
+    ("Read", {"file_path": "{base}/intent/config.yaml"}),
+    ("Grep", {"pattern": "x", "path": "{wt}/lnk"}),
+    ("Grep", {"pattern": "x", "path": "{base}/worktrees/P-0001"}),
+]
+
+
+def _fmt(template, base, wt):
+    return template.format(base=base, wt=wt)
+
+
+@pytest.mark.parametrize("tool,inp", OWN_WT_ALLOWED_TOOLS)
+def test_own_worktree_under_home_readable_by_tools(own_worktree, tool, inp):
+    pol, home, base, wt = own_worktree
+    filled = {k: _fmt(v, base, wt) for k, v in inp.items()}
+    assert pol._decide(tool, filled) == (True, ""), (pol.role, tool, filled)
+
+
+@pytest.mark.parametrize("cmd", OWN_WT_ALLOWED_CMDS)
+def test_own_worktree_under_home_readable_by_shell(own_worktree, cmd):
+    pol, home, base, wt = own_worktree
+    assert pol.command_allowed(_fmt(cmd, base, wt)) == (True, ""), pol.role
+
+
+@pytest.mark.parametrize("cmd", OWN_WT_ALLOWED_GIT)
+def test_own_worktree_under_home_git_dash_c_for_writers(own_worktree, cmd):
+    pol, home, base, wt = own_worktree
+    if pol.role.value == "investigate":
+        pytest.skip("git -C is a BUILD/TEST row")
+    assert pol.command_allowed(_fmt(cmd, base, wt)) == (True, ""), pol.role
+
+
+@pytest.mark.parametrize("cmd", OWN_WT_DENIED_CMDS)
+def test_own_worktree_rule_keeps_the_rest_of_home_closed_to_shell(own_worktree, cmd):
+    pol, home, base, wt = own_worktree
+    assert pol.command_allowed(_fmt(cmd, base, wt)) == (False, HOME_REASON), pol.role
+
+
+@pytest.mark.parametrize("tool,inp", OWN_WT_DENIED_TOOLS)
+def test_own_worktree_rule_keeps_the_rest_of_home_closed_to_tools(own_worktree, tool, inp):
+    pol, home, base, wt = own_worktree
+    filled = {k: _fmt(v, base, wt) for k, v in inp.items()}
+    assert pol._decide(tool, filled) == (False, READ_HOME_REASON), (pol.role, tool, filled)
+
+
+def test_in_own_worktree_resolves_before_containment(own_worktree):
+    pol, home, base, wt = own_worktree
+    assert pol._in_own_worktree(wt) and pol._in_own_worktree(wt / "src" / "x.py")
+    assert not pol._in_own_worktree(wt / "lnk" / "config.yaml")
+    assert not pol._in_own_worktree(wt / ".." / "C-0002")
+    assert not pol._in_own_worktree(Path(f"{wt}-evil") / "x")
+
+
+@pytest.mark.parametrize("role", ["build", "test", "investigate"])
+def test_own_worktree_rule_never_opens_a_home_nested_in_the_worktree(tmp_path, role):
+    from ateam.roles import Role
+    from ateam.runner.policy import Policy
+
+    wt = tmp_path / "wt"; (wt / "src").mkdir(parents=True)
+    home = wt / ".ateam-home"; (home / "intent").mkdir(parents=True); (home / "scratch" / "C-0001").mkdir(parents=True)
+    (home / "intent" / "config.yaml").write_text("x: 1")
+    pol = Policy(worktree=wt, role=Role(role), allowed_paths=["src/**"], protected=[], bound={},
+                 scratch_dir=home / "scratch" / "C-0001", ateam_home=home)
+    assert pol.command_allowed(f"cat {home}/intent/config.yaml") == (False, HOME_REASON)
+    assert pol.command_allowed("cat .ateam-home/intent/config.yaml") == (False, HOME_REASON)
+    assert pol._decide("Read", {"file_path": f"{home}/intent/config.yaml"}) == (False, READ_HOME_REASON)
