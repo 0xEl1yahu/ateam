@@ -109,6 +109,12 @@ class StateDB:
         row = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return row["value"] if row else None
 
+    def delete_meta(self, *keys: str) -> None:
+        """Remove every key in one transaction."""
+        with self.conn:
+            for key in keys:
+                self.conn.execute("DELETE FROM meta WHERE key=?", (key,))
+
     # -- records ------------------------------------------------------------
 
     def set_record_hash(self, record_id: str, hash: str) -> None:
@@ -170,6 +176,54 @@ class StateDB:
                 )
             else:
                 self.conn.execute("UPDATE contracts SET status=?, updated_at=? WHERE contract_id=?", (to, _now(), id))
+
+    def finish_verification(
+        self, contract_id: str, start: str, steps: list[str], by: str, reason: str, checkpoint: dict[str, Any],
+        clear_keys: list[str],
+    ) -> None:
+        """Record a verification in one transaction: the transitions, the final status, the checkpoint, and the
+        removal of the verify markers in `clear_keys`. Steps are checked from `start`, the status seen before the checks ran, so a
+        store row rewritten behind the verifier's back cannot change the walk; nothing is written if a step is invalid."""
+        current = start
+        for to in steps:
+            if to not in CONTRACT_TRANSITIONS.get(current, set()):
+                raise InvalidTransition(f"contract {contract_id}: {current} -> {to} is not allowed")
+            current = to
+        with self.conn:
+            current = start
+            for to in steps:
+                self.conn.execute(
+                    "INSERT INTO transitions (kind, id, from_status, to_status, by, reason, at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    ("contract", contract_id, current, to, by, reason, _now()),
+                )
+                current = to
+            self.conn.execute("UPDATE contracts SET status=?, updated_at=? WHERE contract_id=?", (current, _now(), contract_id))
+            self.conn.execute(
+                "INSERT INTO checkpoints (contract_id, attempt_id, facts, at) VALUES (?, ?, ?, ?)",
+                (contract_id, None, json.dumps(checkpoint, default=str), _now()),
+            )
+            for key in clear_keys:
+                self.conn.execute("DELETE FROM meta WHERE key=?", (key,))
+
+    def fingerprint(self, contract_id: str) -> str:
+        """A hash of everything the store holds about one contract, plus every record hash, as committed (writes by
+        other connections included). Other contracts' rows are left out, so parallel work does not change it."""
+        import hashlib
+
+        queries = [
+            ("SELECT * FROM contracts WHERE contract_id=?", (contract_id,)),
+            ("SELECT * FROM transitions WHERE kind='contract' AND id=? ORDER BY seq", (contract_id,)),
+            ("SELECT * FROM checkpoints WHERE contract_id=? ORDER BY seq", (contract_id,)),
+            ("SELECT * FROM attempts WHERE contract_id=? ORDER BY attempt_id", (contract_id,)),
+            ("SELECT * FROM meta WHERE key LIKE 'verify-%:' || ? ORDER BY key", (contract_id,)),
+            ("SELECT record_id, hash FROM record_hashes ORDER BY record_id", ()),
+        ]
+        h = hashlib.sha256()
+        for sql, args in queries:
+            for row in self.conn.execute(sql, args):
+                h.update(repr(tuple(row)).encode())
+            h.update(b"|")
+        return h.hexdigest()
 
     def transitions(self, kind: Kind, id: str) -> list[dict[str, Any]]:
         rows = self.conn.execute("SELECT * FROM transitions WHERE kind=? AND id=? ORDER BY seq", (kind, id))
