@@ -488,3 +488,49 @@ git commit -m "feat(test): requirements_unclear flag and attempt classification"
 git add README.md docs/first-run-walkthrough.md examples/
 git commit -m "docs: plan review, --replaces, covered outcome, setup per worktree"
 ```
+
+---
+
+### Task 11: BUILD and TEST get the same `cd` rule as INVESTIGATE
+
+Owner decision, 2026-10-26: BUILD and TEST may `cd` only to an absolute path inside the worktree, so the home check can resolve relative paths from every directory they enter; the rule must not stop them doing their job.
+
+**Files:**
+- Modify: `src/ateam/runner/policy.py` (`command_allowed`: apply the INVESTIGATE `cd`/`pushd` rule to every role; the candidate-cwd set feeds the home and wildcard checks for every role)
+- Modify: `src/ateam/roles.py` (`WORKER_COMMON`: one sentence, "Use absolute paths with `cd`; a relative `cd` is denied.")
+- Modify: `docs/superpowers/specs/2026-10-24-ateam-harness-design.md` (Roles table: BUILD and TEST "may not" column gains "cd outside the worktree or by a relative path"; Decisions list gains the bullet "(Owner, 2026-10-26.)")
+- Test: `tests/test_policy.py` (`BUILD_MUST_DENY`/`BUILD_MUST_ALLOW` and the TEST tables)
+
+**Interfaces:**
+- Consumes: Task 2's `_cd_target`, `cwds`, `_bases()`.
+- Produces: `CD_WORKTREE_REASON` generalised to "workers may cd only to an absolute path inside the worktree" (update INVESTIGATE's rows to the new text in the same commit, or keep a role-specific prefix; one string, used by every role).
+
+- [ ] **Step 1: Table rows (failing first).** BUILD deny: `cd src && ls`, `cd .. && ls`, `cd /tmp && ls`, `cd src && cat ../../.ateam/state.db` (home reason after an allowed absolute `cd`: use `cd <abs>/src && cat ../../.ateam/state.db`), `pushd ..`. BUILD allow: `cd <abs>/src && .venv/bin/pytest -q`, `cd <abs>/src && git add x && git commit -m m`. TEST deny/allow mirrors BUILD with `cd <abs>/tests && .venv/bin/pytest -q` allowed. Keep every existing BUILD/TEST row's verdict except the ones that relied on relative `cd`.
+- [ ] **Step 2: Run** `.venv/bin/pytest tests/test_policy.py -q` → FAIL on the new rows.
+- [ ] **Step 3: Implement**: move the `cd` rule and the candidate-cwd bookkeeping out of the `Role.investigate` branch so they run for every role, before the role-specific checks. Spec and role text edits.
+- [ ] **Step 4: Run** `.venv/bin/pytest -q` → PASS.
+- [ ] **Step 5: Commit**: `git add src/ateam/runner/policy.py src/ateam/roles.py docs/superpowers/specs/2026-10-24-ateam-harness-design.md tests/test_policy.py && git commit -m "feat(policy): BUILD and TEST cd only to absolute paths inside the worktree"`
+
+---
+
+### Task 12: Contracts carry interfaces
+
+Owner decision, 2026-10-26: a contract names the shapes it produces and consumes (exact names and signatures) so a worker follows a pre-agreed plan; the planner must fill it, the brief shows it, the review pass judges it.
+
+**Files:**
+- Modify: `src/ateam/contracts/model.py` (`Interface(BaseModel)` with `kind: Literal["produces", "consumes"]`, `name: str`, `signature: str`, `note: str = ""`; `Contract.interfaces: list[Interface] = []`)
+- Modify: `src/ateam/roles.py` (`PLANNER_SCHEMA` contract items gain required `interfaces: [{kind, name, signature, note}]`; `PLANNER_SPEC` gains one sentence: "For every contract list the interfaces it produces (new or changed functions, classes, CLI flags, file formats, with exact signatures) and the ones it consumes from other contracts or existing code; a later contract that consumes a name must match the producing contract's signature exactly."; `REVIEWER_SPEC` gains: "Check that every consumed interface is produced by an earlier contract or exists in the code, with the same signature.")
+- Modify: `src/ateam/planner.py` (`report_to_plan`: validate each `consumes` names a `produces` in an earlier contract of the same plan or a symbol found by `rg`-free text search of the repo (`name in file text` over the contract's paths and `files_read`); mismatch is a note, not fatal: "C-0002 consumes `foo(a, b)` but C-0001 produces `foo(a)`"; `render_plan_review` prints `interfaces:` per contract)
+- Modify: `src/ateam/brief.py` (worker `_task`: an `Interfaces` block listing produces/consumes; investigation `_plans`: one `    produces: name(signature)` line per interface under each contract)
+- Modify: `examples/contract.example.yaml`, `examples/plan.example.yaml`, `README.md` (one sentence in the contract description)
+- Test: `tests/test_contract_model.py`, `tests/test_planner.py`, `tests/test_brief.py`, `tests/test_examples.py`
+
+**Interfaces:**
+- Consumes: Task 4's plan index format; Task 7's `REVIEWER_SPEC`.
+- Produces: `Contract.interfaces`, `Interface`.
+
+- [ ] **Step 1: Failing tests.** Model: a contract round-trips with two interfaces; an unknown `kind` is a validation error. Planner: a consumes/produces signature mismatch yields the note text above; a consumes with no producer and no text match yields "C-0002 consumes `bar` which no contract produces and the code does not define". Brief: the worker brief contains `## Interfaces` (or the `_task` block's existing heading style) with `produces: integrate(plan_id: str) -> MergeProposal`; the investigation brief's plan index contains `    produces: ...`. Examples validate.
+- [ ] **Step 2: Run** the four test files → FAIL.
+- [ ] **Step 3: Implement** per the Files block. Old contracts without `interfaces` still load (default empty).
+- [ ] **Step 4: Run** `.venv/bin/pytest -q` → PASS.
+- [ ] **Step 5: Commit**: `git add src/ateam/contracts/model.py src/ateam/roles.py src/ateam/planner.py src/ateam/brief.py examples/ README.md tests/ && git commit -m "feat(contracts): interfaces produced and consumed, validated at planning and shown in briefs"`
