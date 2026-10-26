@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -14,6 +15,8 @@ from claude_agent_sdk import HookMatcher, PermissionResultAllow, PermissionResul
 from ateam.globs import matches
 from ateam.records.model import Record
 from ateam.roles import Role
+
+log = logging.getLogger(__name__)
 
 WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 READ_OR_WRITE_TOOLS = WRITE_TOOLS | {"Read"}
@@ -75,11 +78,17 @@ _WRAPPER_ARG_OPTS = {
 }
 _WRAPPER_POSITIONAL = {"timeout": 1}
 _SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "mksh"}
-_NESTING_LIMIT = 8   # eval and shell -c bodies are re-lexed this deep; deeper is denied
+_NESTING_LIMIT = 8   # nested $( ` ${ <( and eval / shell -c bodies are followed this deep; deeper is denied
+_COMPOUND_START = {"{", "if", "while", "until", "for", "case", "select", "[[", "(("}
 _READ_TOOL_HINT_WORDS = {"sed", "awk", "python", "python3", "perl", "ruby", "node"}
 _CD = re.compile(r"^\s*(?:cd|pushd)\b")
 CD_WORKTREE_REASON = "workers may cd only to an absolute path inside the worktree or its scratch directory"  # every role; see Policy._cd_target
-NESTING_REASON = "eval or shell -c nested too deeply to check"
+NESTING_REASON = "command nests substitutions, brace expansions, eval or shell -c too deeply to check"
+ANALYSE_REASON = "command could not be analysed; simplify it"
+
+
+class _TooComplex(Exception):
+    """Nesting or brace expansion beyond what the policy follows: the command is denied with NESTING_REASON."""
 _GIT_BRANCH = re.compile(r"^\s*git\s+branch\b(?P<rest>.*)$")
 
 
@@ -96,6 +105,23 @@ _ANSI_C_SIMPLE = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n"
                   "\\": "\\", "'": "'", '"': '"', "?": "?"}
 _LIST_OPS = (";;&", ";;", ";&", ";", "&&", "&", "||", "|&", "|")
 _REDIRECT_OPS = (">>", ">|", ">&", "<&", "<>", ">", "<")
+
+
+def _skip_prefix(words: list[str]) -> int:
+    """Index of the first word that is not a leading reserved word, assignment, `function NAME` or `coproc NAME`
+    (NAME only when a compound command follows)."""
+    i = 0
+    while i < len(words):
+        w = words[i]
+        if w == "function" and i + 1 < len(words):
+            i += 2
+        elif w == "coproc" and i + 2 < len(words) and words[i + 2] in _COMPOUND_START and words[i + 1] not in _RESERVED_LEADING:
+            i += 2
+        elif w in _RESERVED_LEADING or _ASSIGNMENT.match(w):
+            i += 1
+        else:
+            break
+    return i
 
 
 def _ansi_c(body: str) -> str:
@@ -139,11 +165,17 @@ class _Lexed:
     masked: str               # joined with every '...' and $'...' replaced by ''
     segments: list[_Segment]  # simple commands in order, including those inside substitutions
     substitution: bool        # $( ), $(( )), ` `, <( ) or >( ) that bash would expand (not in '...', comments or quoted bodies)
+    legacy: "_Lexed | None" = None   # the bash 3.2-5.2 reading, when this is the union of both (see _lex)
 
 
 class _Lexer:
-    def __init__(self, s: str) -> None:
+    """legacy: bash 3.2 to 5.2, where ${ closes at its first } (no ${ cmd; }) and a case label's ) closes a $(.
+    Otherwise bash 5.3. _lex reads every command both ways."""
+
+    def __init__(self, s: str, legacy: bool = False, level: int = 0) -> None:
         self.s, self.n = s, len(s)
+        self.legacy = legacy
+        self.level = level                              # nested $( ` ${ <( being read; deeper than the limit raises
         self.removed: set[int] = set()                  # index of the backslash of each removed backslash-newline
         self.comments: list[tuple[int, int]] = []
         self.bodies: list[tuple[int, int]] = []         # heredoc body plus terminator line
@@ -153,6 +185,11 @@ class _Lexer:
         self.newlines = 0                               # newline tokens read at any depth
 
     # -- characters ---------------------------------------------------------------------------------------------
+
+    def _enter(self) -> None:
+        self.level += 1
+        if self.level > _NESTING_LIMIT:
+            raise _TooComplex
 
     def _skip(self, i: int) -> int:
         """The next index at or after i once line continuations are removed (bash removes them as it reads)."""
@@ -213,6 +250,13 @@ class _Lexer:
 
     def _dollar(self, i: int, in_dquote: bool = False) -> int | None:
         """End index of the $-expansion at i that can hold commands ($( ), $(( )), ${ }, ${ cmd; }, $[ ]), else None."""
+        self._enter()
+        try:
+            return self._dollar_at(i, in_dquote)
+        finally:
+            self.level -= 1
+
+    def _dollar_at(self, i: int, in_dquote: bool) -> int | None:
         j = self._match(i, "$((")
         if j is not None:
             end = self._arith(j, "))")
@@ -226,7 +270,7 @@ class _Lexer:
         j = self._match(i, "${")
         if j is not None:
             k = self._skip(j)
-            if self.s[k : k + 1] in (" ", "\t", "\n", "|"):   # bash 5.3 ${ cmd; } and ${| cmd; } run a command list
+            if not self.legacy and self.s[k : k + 1] in (" ", "\t", "\n", "|"):   # bash 5.3 ${ cmd; }, ${| cmd; }
                 self.substitution = True
                 return self._list(k + 1 if self.s[k] == "|" else k, stop="}")
             return self._braced(j, in_dquote)
@@ -313,7 +357,9 @@ class _Lexer:
             buf.append(c); i += 1
         self.substitution = True
         self.newlines += any("\n" in b for b in buf)   # a heredoc pending outside does not start its body in here
-        inner = _Lexer("".join(buf))
+        inner = _Lexer("".join(buf), self.legacy, self.level + 1)
+        if inner.level > _NESTING_LIMIT:
+            raise _TooComplex
         inner._list(0)
         self.items.extend(inner._segments())
         return min(i + 1, n)
@@ -420,8 +466,9 @@ class _Lexer:
         fresh = False        # the next word is the first of a case pattern, where esac ends the case
         groups = 0           # open { } brace groups, whose } is not the close of a ${ cmd; }
 
-        def command_position() -> bool:
-            return all(w in _RESERVED_LEADING or _ASSIGNMENT.match(w) for w in words)
+        def command_position(w: str = "") -> bool:
+            """w (the word being added) is where a command or reserved word may start."""
+            return _skip_prefix([*words, w]) >= len(words)
 
         def end_word() -> None:
             nonlocal val, started, target, fresh, groups
@@ -430,7 +477,7 @@ class _Lexer:
                     target = False
                 else:
                     w = "".join(val)
-                    first = command_position()
+                    first = command_position(w)
                     words.append(w)
                     state = cases[-1][0] if cases else None
                     if state == "subject":
@@ -444,7 +491,7 @@ class _Lexer:
                         fresh = False
                     elif first and w == "esac" and state == "body":
                         cases.pop()
-                    elif first and w == "case":
+                    elif first and w == "case" and not self.legacy:
                         cases.append(["subject", depth])
                     elif first and w == "{":
                         groups += 1
@@ -516,7 +563,11 @@ class _Lexer:
             elif c in "<>":
                 if (j := self._match(i, c + "(")) is not None:
                     self.substitution = True
-                    end = self._list(j, stop=")")
+                    self._enter()
+                    try:
+                        end = self._list(j, stop=")")
+                    finally:
+                        self.level -= 1
                     val.append(s[i:end]); started = True; i = end
                     continue
                 if started and not target and _FD_WORD.match("".join(val)):
@@ -539,7 +590,7 @@ class _Lexer:
                         if (j := self._match(i, op)) is not None:
                             target = True; i = j
                             break
-            elif c == "}" and not started and groups and command_position() and (stop == "}" or self._closes_word(i + 1)):
+            elif c == "}" and not started and groups and command_position("}") and (stop == "}" or self._closes_word(i + 1)):
                 groups -= 1                       # the } of a brace group: a word, as before. Inside ${ cmd; } a
                                                   # joined }x is taken as the group's too, so a later } closes
                 val.append(c); started = True; i += 1
@@ -616,9 +667,23 @@ class _Lexer:
 
 
 def _lex(cmd: str) -> _Lexed:
-    lexer = _Lexer(cmd)
-    lexer._list(0)
-    return lexer.result()
+    """The command read as bash 5.3 and as bash 3.2-5.2 (the worker may run either): joined, stripped and masked text
+    of the 5.3 reading, the other reading in .legacy, and the segments of both (5.3's first, duplicates dropped), so a
+    forbidden command found under either reading is denied. May raise _TooComplex."""
+    readings = []
+    for legacy in (False, True):
+        lexer = _Lexer(cmd, legacy)
+        lexer._list(0)
+        readings.append(lexer.result())
+    modern, old = readings
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    segments = []
+    for seg in modern.segments + old.segments:
+        key = (seg.text, tuple(seg.words))
+        if key not in seen:
+            seen.add(key)
+            segments.append(seg)
+    return _Lexed(modern.joined, modern.stripped, modern.masked, segments, modern.substitution or old.substitution, old)
 
 
 def _split_segments(cmd: str) -> list[str]:
@@ -639,12 +704,11 @@ def _normalise_git(segment: str) -> str:
 _SEQUENCE = re.compile(r"^(?:(-?\d+)\.\.(-?\d+)|([A-Za-z])\.\.([A-Za-z]))(?:\.\.(-?\d+))?$")
 
 
-def _brace_expand(word: str, limit: int = 256) -> list[str]:
-    """Bash brace expansion of one word: {a,b} and {x..y[..step]}, nested, preamble and postscript kept; a ${ is
-    not a brace. Quotes are already removed from the lexer's words, so a quoted brace is expanded too (fail closed)."""
-    i = 0
-    while i < len(word):
-        if word[i] == "{" and word[i - 1 : i] != "$":
+def _brace_once(word: str, limit: int) -> list[str] | None:
+    """The words from expanding the first expandable brace group of word, else None."""
+    i = word.find("{")
+    while i >= 0:
+        if word[i - 1 : i] != "$":
             depth, commas, j = 0, [], i
             for j in range(i, len(word)):
                 if word[j] == "{":
@@ -656,31 +720,50 @@ def _brace_expand(word: str, limit: int = 256) -> list[str]:
                 elif word[j] == "," and depth == 1:
                     commas.append(j)
             if depth == 0:
-                body = word[i + 1 : j]
                 parts: list[str] = []
                 if commas:
                     edges = [i, *commas, j]
                     parts = [word[a + 1 : b] for a, b in zip(edges, edges[1:])]
-                elif m := _SEQUENCE.match(body):
+                elif m := _SEQUENCE.match(word[i + 1 : j]):
                     step = abs(int(m.group(5) or 1)) or 1
                     num = m.group(1) is not None
                     a, b = (int(m.group(1)), int(m.group(2))) if num else (ord(m.group(3)), ord(m.group(4)))
                     seq = itertools.islice(range(a, b + (1 if b >= a else -1), step if b >= a else -step), limit)
                     parts = [str(k) if num else chr(k) for k in seq]
                 if parts:
-                    out: list[str] = []
-                    for p in parts:
-                        out.extend(_brace_expand(word[:i] + p + word[j + 1 :], limit))
-                        if len(out) >= limit:
-                            break
-                    return [w for w in out if w][:limit] or [""]
-        i += 1
-    return [word]
+                    return [word[:i] + p + word[j + 1 :] for p in parts]
+        i = word.find("{", i + 1)
+    return None
+
+
+def _brace_expand(word: str, limit: int = 256) -> list[str]:
+    """Bash brace expansion of one word: {a,b} and {x..y[..step]}, nested, preamble and postscript kept; a ${ is
+    not a brace. Quotes are already removed from the lexer's words, so a quoted brace is expanded too (fail closed).
+    Iterative, at most `limit` words; a word with more braces or work than that raises _TooComplex."""
+    if "{" not in word:
+        return [word]
+    if word.count("{") > 2 * limit:
+        raise _TooComplex
+    out: list[str] = []
+    stack, steps = [word], 0
+    while stack and len(out) < limit:
+        steps += 1
+        if steps > 4 * limit:
+            raise _TooComplex
+        w = stack.pop()
+        expanded = _brace_once(w, limit)
+        if expanded is None:
+            if w:
+                out.append(w)
+        else:
+            stack.extend(reversed(expanded))
+    return out or [""]
 
 
 def _command_words(words: list[str]) -> list[str]:
     """The words from the command word on: brace expansion applied, then reserved words such as ! { if then do,
-    assignments, wrappers with their options (and the options' arguments) skipped; `env -S STRING` splits STRING."""
+    assignments, `function NAME`, `coproc NAME`, wrappers with their options (and the options' arguments) skipped;
+    `env -S STRING` splits STRING."""
     words = [e for w in words for e in _brace_expand(w)]
     i = 0
     while i < len(words):
@@ -704,8 +787,8 @@ def _command_words(words: list[str]) -> list[str]:
                 if opt in _WRAPPER_ARG_OPTS.get(name, ()):
                     i += 1
             i += _WRAPPER_POSITIONAL.get(name, 0)
-        elif words[i] in _RESERVED_LEADING or _ASSIGNMENT.match(words[i]):
-            i += 1
+        elif (k := _skip_prefix(words[i:])) > 0:
+            i += k
         else:
             break
     return words[i:]
@@ -810,7 +893,7 @@ class Policy:
     ateam_home: Path | None = None    # the ATeam home base ($ATEAM_HOME or ~/.ateam); everything in it except scratch_dir is off limits
     denials: list[str] = field(default_factory=list)
     injected: set[str] = field(default_factory=set)
-    cwds: set[Path] = field(default_factory=set)  # directories INVESTIGATE has cd'd into (the Bash tool keeps its cwd between calls)
+    cwds: set[Path] = field(default_factory=set)  # directories the worker has cd'd into, any role (the Bash tool keeps its cwd between calls)
     _pending_cwds: list[Path] = field(default_factory=list, repr=False)  # cd targets of the command being checked
 
     # -- paths --------------------------------------------------------------
@@ -969,42 +1052,47 @@ class Policy:
         """path is an existing directory at or under root (either spelling of root)."""
         return path.is_dir() and any(r == path or r in path.parents for r in {root, root.resolve()})
 
-    def _all_segments(self, segments: list[_Segment], depth: int = 0) -> list[_Segment] | None:
+    def _all_segments(self, segments: list[_Segment], depth: int = 0) -> list[_Segment]:
         """The segments plus, after each, the segments of the literal shell code it runs through eval or a shell's
-        -c (re-lexed, recursively). None when that nests deeper than _NESTING_LIMIT."""
+        -c (re-lexed, recursively). Raises _TooComplex beyond _NESTING_LIMIT."""
         out: list[_Segment] = []
         for seg in segments:
             out.append(seg)
             inner = _inner_command(seg.words)
             if inner is not None:
                 if depth >= _NESTING_LIMIT:
-                    return None
-                nested = self._all_segments(_lex(inner).segments, depth + 1)
-                if nested is None:
-                    return None
-                out.extend(nested)
+                    raise _TooComplex
+                out.extend(self._all_segments(_lex(inner).segments, depth + 1))
         return out
 
     def command_allowed(self, cmd: str) -> tuple[bool, str]:
+        """(allowed, reason). Never raises: input too deep to follow, or any failure to analyse it, is a denial."""
+        try:
+            return self._command_allowed_or_raise(cmd)
+        except _TooComplex:
+            return False, NESTING_REASON
+        except Exception:  # noqa: BLE001  (a guard that raises might fail open in the SDK)
+            log.exception("policy could not analyse a command: %r", cmd[:200])
+            return False, ANALYSE_REASON
+        finally:
+            self._pending_cwds = []
+
+    def _command_allowed_or_raise(self, cmd: str) -> tuple[bool, str]:
         lexed = _lex(cmd)
         segments = self._all_segments(lexed.segments)
-        if segments is None:
-            return False, NESTING_REASON
         self._pending_cwds = []
         for seg in segments:
             if _cd_args(seg.words) is not None and (target := self._cd_target(seg)) is not None:
                 self._pending_cwds.extend(target)
-        try:
-            ok, reason = self._command_allowed(lexed, segments)
-            if ok:
-                self.cwds.update(self._pending_cwds)
-            return ok, reason
-        finally:
-            self._pending_cwds = []
+        ok, reason = self._command_allowed(lexed, segments)
+        if ok:
+            self.cwds.update(self._pending_cwds)
+        return ok, reason
 
     def _command_allowed(self, lexed: _Lexed, all_segments: list[_Segment]) -> tuple[bool, str]:
+        readings = [lexed, *([lexed.legacy] if lexed.legacy is not None else [])]
         for pattern in DESTRUCTIVE_PATTERNS:
-            if re.search(pattern, lexed.joined):
+            if any(re.search(pattern, r.joined) for r in readings):
                 return False, f"destructive command matched {pattern!r}"
         if self.role == Role.investigate and lexed.substitution:
             return False, "INVESTIGATE may not use command or process substitution"
@@ -1043,7 +1131,7 @@ class Policy:
             if _cd_args(s.words) is not None and self._cd_target(s) is None:
                 return False, CD_WORKTREE_REASON
         if self.role == Role.investigate:
-            if _PAGER.search(lexed.masked):
+            if any(_PAGER.search(r.masked) for r in readings):
                 return False, "INVESTIGATE may not set pagers, editors or diff drivers"
             for s in lexed.segments:
                 seg = s.text
@@ -1067,6 +1155,14 @@ class Policy:
     # -- SDK hooks ----------------------------------------------------------
 
     def _decide(self, tool_name: str, tool_input: dict[str, Any]) -> tuple[bool, str]:
+        """The decision for one tool call. Never raises: a failure to decide is a denial (logged)."""
+        try:
+            return self._decide_or_raise(tool_name, tool_input)
+        except Exception:  # noqa: BLE001  (a hook that raises might fail open in the SDK)
+            log.exception("policy could not decide on %s", tool_name)
+            return False, ANALYSE_REASON
+
+    def _decide_or_raise(self, tool_name: str, tool_input: dict[str, Any]) -> tuple[bool, str]:
         if tool_name in WRITE_TOOLS:
             return self.path_writable_abs(str(tool_input.get("file_path", "")))
         if tool_name == "Bash":

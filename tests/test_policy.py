@@ -1025,14 +1025,14 @@ def writer_with_home(request, target_repo):
 
 
 HOME_REASON = "ATeam's home (intent repo, state store, logs) is off limits to workers; only your scratch directory is writable"
+WILDCARD_HOME_REASON = "wildcard paths that could reach ATeam's home are not allowed"
 
 
 def test_build_and_test_home_check_resolves_from_the_entered_directory(writer_with_home):
     root = writer_with_home.worktree
     for cmd in (f"cd {root}/src && cat ../../.ateam/state.db", f"cd {root}/src\ncat ../../.ateam/state.db"):
         assert writer_with_home.command_allowed(cmd) == (False, HOME_REASON), cmd
-    ok, reason = writer_with_home.command_allowed(f"cd {root}/src; ls ../../.ateam/*")
-    assert not ok and "ATeam's home" in reason
+    assert writer_with_home.command_allowed(f"cd {root}/src; ls ../../.ateam/*") == (False, WILDCARD_HOME_REASON)
 
 
 def test_build_and_test_cwd_persists_across_calls_for_home_rule(writer_with_home):
@@ -1202,7 +1202,7 @@ def test_build_runtime_residuals(policy_build, cmd):
 SCRATCH_LEAVE_REASON = "paths that leave your scratch directory are not allowed"
 
 
-@pytest.fixture(params=[Role_ for Role_ in ("build", "test", "investigate")])
+@pytest.fixture(params=["build", "test", "investigate"])
 def scratch_layout(request, tmp_path, monkeypatch):
     from ateam.paths import TargetPaths
     from ateam.roles import Role
@@ -1230,7 +1230,7 @@ def test_cd_leaving_scratch_or_into_home_denied(scratch_layout):
     pol, paths, scratch = scratch_layout
     assert pol.command_allowed(f"cd {scratch}/.. && ls") == (False, SCRATCH_LEAVE_REASON)
     assert pol.command_allowed(f"cd {paths.intent} && ls") == (False, HOME_REASON)
-    assert pol.command_allowed(f"cd {scratch}x && ls")[0] is False      # a sibling that only shares the prefix
+    assert pol.command_allowed(f"cd {scratch}x && ls") == (False, HOME_REASON)   # a sibling that only shares the prefix
 
 
 def test_relative_reads_from_scratch_meet_the_home_check(scratch_layout):
@@ -1245,3 +1245,120 @@ def test_cd_into_scratch_through_a_symlink_out_denied(scratch_layout, tmp_path):
     outside = tmp_path / "elsewhere"; outside.mkdir()
     (scratch / "link").symlink_to(outside, target_is_directory=True)
     assert pol.command_allowed(f"cd {scratch}/link && ls") == (False, CD_WORKTREE_REASON)
+
+
+# ---- Task 11 review, fix round 1
+
+# Critical 1: workers run /bin/bash 3.2 on macOS. Bash 3.2 to 5.2 close ${ at the first } and close $( at a case
+# label's ); 5.3 lexes ${ cmd; } and case patterns. The lexer reads both ways and every rule sees both readings.
+BOTH_BASH_READINGS = [
+    ('echo "${ echo }"\nrm y', RM_REASON),
+    ('echo "${ { }"\nrm y', RM_REASON),
+    ('echo "${ echo }"\ncd /', CD_WORKTREE_REASON),
+    ('echo "$(case x in x)"\nrm y', RM_REASON),
+    ('echo "$(case x in x)"\ncd /', CD_WORKTREE_REASON),
+    ('echo "${x }"\nrm y', RM_REASON),          # control: denied before this round too
+]
+
+
+# Reviewed and kept allowed (reported to the controller): rm y runs under neither reading. bash 3.2-5.2: the first }
+# closes ${, so "\nrm y\n" is a quoted argument. bash 5.3: } follows echo, not a reserved-word position, so ${ never
+# closes and the input is a syntax error. The pre-Task-11 lexer allowed it too.
+BOTH_READINGS_NOTHING_RUNS = ['echo ${ echo }"\nrm y\n"']
+
+
+@pytest.mark.parametrize("cmd", BOTH_READINGS_NOTHING_RUNS)
+def test_bash_readings_where_nothing_runs_stay_allowed(policy_build, cmd):
+    ok, reason = policy_build.command_allowed(cmd)
+    assert ok, (cmd, reason)
+
+
+@pytest.mark.parametrize("role", ["policy_build", "policy_test"])
+@pytest.mark.parametrize("cmd,reason", BOTH_BASH_READINGS)
+def test_bash_32_and_53_readings_are_both_checked(request, role, cmd, reason):
+    pol = request.getfixturevalue(role)
+    assert pol.command_allowed(cmd) == (False, reason), cmd
+
+
+# Important 1: `function NAME { ...; }` and `coproc NAME { ...; }` bodies are commands
+FUNCTION_BODY_ROWS = [
+    ("function f { cd ..; }; f", CD_WORKTREE_REASON),
+    ("function f { cd /; }; f", CD_WORKTREE_REASON),
+    ("function f { cd ..; }\nf", CD_WORKTREE_REASON),
+    ("function f { rm x; }; f", RM_REASON),
+    ("coproc c { rm x; }", RM_REASON),
+    ("coproc c while rm x; do :; done", RM_REASON),
+    ('echo "${ function f { ls; }; rm x; }"', RM_REASON),
+]
+
+
+@pytest.mark.parametrize("role", ["policy_build", "policy_test"])
+@pytest.mark.parametrize("cmd,reason", FUNCTION_BODY_ROWS)
+def test_function_and_coproc_bodies_are_judged(request, role, cmd, reason):
+    pol = request.getfixturevalue(role)
+    assert pol.command_allowed(cmd) == (False, reason), cmd
+
+
+@pytest.mark.parametrize("cmd", ["function f { ls; }; f", "function f() { ls; }; f", "coproc ls"])
+def test_function_and_coproc_lookalikes_allowed(policy_build, cmd):
+    ok, reason = policy_build.command_allowed(cmd)
+    assert ok, (cmd, reason)
+
+
+# Important 2: input too deep or too large to analyse is denied, never an exception
+
+NESTING_REASON = "command nests substitutions, brace expansions, eval or shell -c too deeply to check"
+ANALYSE_REASON = "command could not be analysed; simplify it"
+
+
+@pytest.mark.parametrize("cmd", [
+    'echo "' + "{a,b}" * 1200 + '"',
+    "echo " + "$(" * 600 + "x" + ")" * 600,
+    "echo " + "${x:-" * 20 + "y" + "}" * 20,
+    "echo " + "<(" * 20 + "x" + ")" * 20,
+])
+def test_too_deep_or_too_large_is_denied_not_raised(policy_build, cmd):
+    assert policy_build.command_allowed(cmd) == (False, NESTING_REASON)
+
+
+@pytest.mark.parametrize("cmd", ["echo $(dirname $(dirname $(pwd)))", "echo {a,b}{c,d}", "echo `echo \\`pwd\\``",
+                                 "echo ${x:-${y:-z}}"])
+def test_ordinary_nesting_allowed(policy_build, cmd):
+    ok, reason = policy_build.command_allowed(cmd)
+    assert ok, (cmd, reason)
+
+
+def test_eval_nesting_uses_the_same_reason(policy_build):
+    assert policy_build.command_allowed("eval " * 12 + "ls") == (False, NESTING_REASON)
+
+
+@pytest.mark.asyncio
+async def test_any_analysis_exception_is_a_denial(policy_build, monkeypatch, caplog):
+    import ateam.runner.policy as policy_mod
+
+    def boom(cmd):
+        raise RuntimeError("lexer exploded")
+
+    monkeypatch.setattr(policy_mod, "_lex", boom)
+    with caplog.at_level("ERROR"):
+        assert policy_build.command_allowed("ls") == (False, ANALYSE_REASON)
+    assert "lexer exploded" in caplog.text
+    r = await policy_build.can_use_tool("Bash", {"command": "ls"}, None)
+    assert isinstance(r, PermissionResultDeny) and r.message == f"ATeam: {ANALYSE_REASON}"
+    out = await policy_build.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ls"}}, None, None)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+@pytest.mark.asyncio
+async def test_decide_exception_outside_bash_is_a_denial(policy_build, monkeypatch):
+    def boom(*a, **k):
+        raise ValueError("path exploded")
+
+    monkeypatch.setattr(type(policy_build), "path_writable_abs", boom)
+    r = await policy_build.can_use_tool("Edit", {"file_path": "src/api/x.py"}, None)
+    assert isinstance(r, PermissionResultDeny) and r.message == f"ATeam: {ANALYSE_REASON}"
+
+
+@pytest.mark.xfail(strict=True, reason="run-time residual: the command word comes from an expansion at run time")
+def test_build_runtime_cd_residual(policy_build):
+    assert policy_build.command_allowed("c=cd; $c /tmp") == (False, CD_WORKTREE_REASON)
