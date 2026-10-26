@@ -45,6 +45,7 @@ Adapted from the Claude Code team's own published practices (Boris Cherny's "how
 - Worker sessions use the clean room (`setting_sources=[]`, strict MCP config, slash commands off, auto-memory off, permission mode `default`). Never `--bare`: it does not authenticate with a claude.ai login.
 - Never `str.strip()` the output of `git status --porcelain`.
 - Workers may `cd` only to an absolute path inside their worktree or their scratch directory; `tests/test_policy.py` holds the allow and deny strings.
+- The policy pre-guard guards against slop and accidents, not adversaries. Grade a bypass by ordinary usage: a careless session's path to `rm`, a write outside its paths or a read of ATeam's home is Important; a contrived encoding is Minor and a listed residual unless the fix is a few lines. One fix round on exotic shell grammar, then ask the owner.
 - A new worktree's `.venv` comes from the python.org interpreter (`/Library/Frameworks/Python.framework/Versions/3.14/bin/python3.14 -m venv`); the `python3.14` first on PATH here makes venvs without a standard library.
 - In tests, never `monkeypatch.undo()`: it also drops the fixture's `ATEAM_HOME` and the test then writes into the real `~/.ateam`. Scope a patch with `monkeypatch.context()`.
 - Approval commits in a target stage only `.ateam/` paths and use the `ateam:` message prefix.
