@@ -169,3 +169,69 @@ def test_meta_key_value(tmp_path):
 def test_feature_transitions_include_covered_and_superseded():
     assert "plan_covered" in FEATURE_TRANSITIONS["investigating"] and "superseded" in FEATURE_TRANSITIONS["plan_proposed"]
     assert FEATURE_TRANSITIONS["plan_covered"] == set() == FEATURE_TRANSITIONS["superseded"]
+
+
+# Owner, 2026-10-26: an approved plan that has not started can be superseded, and so can its draft and ready contracts.
+def test_approved_feature_can_be_superseded_and_superseded_is_terminal():
+    assert FEATURE_TRANSITIONS["plan_approved"] == {"executing", "superseded"}
+    assert CONTRACT_TRANSITIONS["draft"] == {"ready", "superseded"} and CONTRACT_TRANSITIONS["ready"] == {"building", "superseded"}
+    assert CONTRACT_TRANSITIONS["superseded"] == set()
+    for started in ("building", "verifying", "failed", "paused", "verified", "integrated", None):
+        assert "superseded" not in CONTRACT_TRANSITIONS[started]
+
+
+def test_every_contract_status_has_a_transition_row():
+    from ateam.contracts.model import ContractStatus
+    assert {str(s) for s in ContractStatus} == {k for k in CONTRACT_TRANSITIONS if k is not None}
+
+
+def _approved(db, plan="P-0001"):
+    for to in ("requested", "investigating", "plan_proposed", "plan_approved"):
+        db.transition("feature", plan, to, by="t")
+    db.upsert_contract("C-0002", plan, "ready", "h2")
+    db.upsert_contract("C-0003", plan, "draft", "h3")
+
+
+def test_supersede_writes_every_transition_in_one_go(tmp_path):
+    db = fresh(tmp_path)
+    _approved(db)
+    db.supersede("P-0001", "plan_approved", {"C-0002": "ready", "C-0003": "draft"}, by="owner", reason="replaced by P-0002")
+    assert db.feature_status("P-0001") == "superseded"
+    assert db.contract_status("C-0002") == "superseded" == db.contract_status("C-0003")
+    assert [t["from_status"] for t in db.transitions("contract", "C-0002")] == ["ready"]
+    assert db.transitions("feature", "P-0001")[-1]["reason"] == "replaced by P-0002"
+
+
+@pytest.mark.parametrize("steps", [
+    {"C-0002": "ready", "C-0003": "ready"},      # C-0003 is draft in the store: the expected status is stale
+    {"C-0002": "ready", "C-0009": "draft"},      # no store row
+])
+def test_supersede_writes_nothing_when_a_step_is_invalid(steps, tmp_path):
+    db = fresh(tmp_path)
+    _approved(db)
+    with pytest.raises(InvalidTransition):
+        db.supersede("P-0001", "plan_approved", steps, by="owner", reason="r")
+    assert db.feature_status("P-0001") == "plan_approved" and db.contract_status("C-0002") == "ready"
+    assert db.transitions("contract", "C-0002") == []
+
+
+def test_supersede_refuses_a_contract_that_has_started(tmp_path):
+    db = fresh(tmp_path)
+    _approved(db)
+    db.transition("contract", "C-0002", "building", by="t")
+    with pytest.raises(InvalidTransition):
+        db.supersede("P-0001", "plan_approved", {"C-0002": "building"}, by="owner", reason="r")
+    assert db.feature_status("P-0001") == "plan_approved" and db.contract_status("C-0002") == "building"
+
+
+def test_work_traces_names_every_kind_of_trace(tmp_path):
+    db = fresh(tmp_path)
+    _approved(db)
+    assert db.work_traces("C-0002") == []
+    db.start_attempt("C-0002", "build", "light", "haiku", {})
+    db.transition("contract", "C-0002", "building", by="t")
+    db.set_checkpoint("C-0002", None, {"x": 1})
+    db.set_meta("verify-running:C-0002", "{}")
+    assert db.work_traces("C-0002") == ["an attempt", "a contract transition", "a checkpoint", "a verify marker"]
+    db.set_meta("verify-pending:C-0003", "{}")
+    assert db.work_traces("C-0003") == ["a verify marker"]

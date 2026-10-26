@@ -232,10 +232,39 @@ def init(remote: str | None, max_candidates: int, tier: str, target: Path) -> No
 # ---------------------------------------------------------------- plan
 
 
+def _plan_contract_ids(ctx: Context, plan) -> list[str]:
+    """A plan's contracts: those its file lists and those the state store files under it."""
+    return sorted(set(plan.contracts) | {r["contract_id"] for r in ctx.db.contracts_for_plan(plan.id)})
+
+
+def _started_reason(ctx: Context, plan, contracts: dict) -> str | None:
+    """Why an approved plan can no longer be superseded, or None when none of its work has started (owner, 2026-10-26).
+    Fails closed: any trace of work in the state store, or a file and store that disagree, counts as started."""
+    store_status = ctx.db.feature_status(plan.id) or "missing"
+    if plan.status != "plan_approved" or store_status != "plan_approved":
+        return f"{plan.id} is {plan.status} in its file and {store_status} in the state store"
+    rows = {r["contract_id"]: r for r in ctx.db.contracts_for_plan(plan.id)}
+    for cid in _plan_contract_ids(ctx, plan):
+        c = contracts.get(cid)
+        if c is None:
+            return f"{cid} has no contract file"
+        if c.plan != plan.id:
+            return f"{cid} belongs to {c.plan} in its file"
+        if cid not in rows:
+            stored = ctx.db.contract_status(cid)
+            return f"{cid} has no row in the state store" if stored is None else f"{cid} belongs to another plan in the state store"
+        traces = ctx.db.work_traces(cid)
+        if traces:
+            return f"{cid} has {traces[0]}"
+        if c.status not in ("draft", "ready") or rows[cid]["status"] not in ("draft", "ready"):
+            return f"{cid} is {c.status} in its file and {rows[cid]['status']} in the state store"
+    return None
+
+
 @main.command()
 @click.argument("request")
 @click.option("--tier", default="careful", show_default=True, type=click.Choice(["light", "standard", "careful"]))
-@click.option("--replaces", default=None, metavar="P-xxxx", help="Supersede this plan_proposed plan when the new plan is approved.")
+@click.option("--replaces", default=None, metavar="P-xxxx", help="Supersede this plan when the new plan is approved: a plan_proposed plan, or an approved one none of whose contracts has started.")
 @click.option("--no-review", "no_review", is_flag=True, help="Skip the staff-engineer review of the draft plan.")
 @TARGET_OPTION
 def plan(request: str, tier: str, replaces: str | None, no_review: bool, target: Path) -> None:
@@ -264,8 +293,12 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
         old = load_plans(ctx.paths.plans).get(replaces)
         if old is None:
             _fail(f"--replaces names unknown plan {replaces}")
-        if old.status != PlanStatus.plan_proposed:
-            _fail(f"--replaces needs a plan_proposed plan; {replaces} is {old.status}")
+        if old.status == PlanStatus.plan_approved:
+            why = _started_reason(ctx, old, load_contracts(ctx.paths.contracts))
+        else:
+            why = None if old.status == PlanStatus.plan_proposed else f"{replaces} is {old.status}"
+        if why:
+            _fail(f"--replaces needs a plan_proposed plan or an approved plan that has not started; {why}")
     disk_next = int(next_plan_id(ctx.paths.plans).split("-")[1])
     db_max = ctx.db.max_feature_id()
     db_next = int(db_max.split("-")[1]) + 1 if db_max else 1
@@ -538,14 +571,14 @@ def _parse_tier_overrides(specs: tuple[str, ...], plan_contracts: list[str], tie
 @click.argument("plan_id")
 @click.option("--tier", "tier_specs", multiple=True, help="Override tiers: C-0002=careful (build and test) or C-0002:investigate=light (one role); repeatable.")
 @click.option("--skip-records", is_flag=True, help="Do not walk the plan's proposed records now.")
-@click.option("--force", is_flag=True, help="Approve a replacement whose replaced plan is no longer plan_proposed; nothing is superseded.")
+@click.option("--force", is_flag=True, help="Approve a replacement whose replaced plan is rejected, covered or gone; nothing is superseded. Never overrides an approved plan that has started.")
 @TARGET_OPTION
 def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, force: bool, target: Path) -> None:
     """Approve a plan: review its proposed records, apply tier overrides, freeze its contracts."""
     from datetime import UTC, datetime
 
     from ateam.allocation import investigate_tier_for, tier_for_complexity, tier_for_test
-    from ateam.contracts.model import Level
+    from ateam.contracts.model import ContractStatus, Level
     from ateam.contracts.select import freeze, select_records
     from ateam.contracts.store import load_contracts, save_contract
     from ateam.gitops import GitError
@@ -553,6 +586,7 @@ def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, force
     from ateam.plans.store import load_plans, save_plan
     from ateam.records.graph import RecordGraph
     from ateam.records.store import load_records
+    from ateam.state.db import InvalidTransition
     from ateam.tiers import ORDER, at_least, load_tiers
 
     ctx = _context(target)
@@ -565,13 +599,25 @@ def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, force
     replacer = next((p for p in plans_.values() if p.replaces == plan_id and p.status == PlanStatus.plan_proposed), None)
     if replacer is not None:
         _fail(f"{plan_id} is replaced by proposed plan {replacer.id}; approve or reject {replacer.id} first")
-    supersede = False   # the replaced plan is superseded only when it is still plan_proposed in both the file and the state store
+    # The replaced plan is superseded when it is plan_proposed in both the file and the state store, or approved in both
+    # with none of its work started. An approved plan that has started is never left live beside its replacement.
+    supersede = False
+    old_approved = False
+    old = plans_.get(plan_.replaces) if plan_.replaces else None
+
+    def refuse_if_started() -> None:
+        why = _started_reason(ctx, old, load_contracts(ctx.paths.contracts)) if old is not None else f"{plan_.replaces} has no plan file"
+        if why:
+            _fail(f"{plan_.replaces} cannot be superseded ({why}); reject {plan_id} or finish {plan_.replaces}")
+
     if plan_.replaces:
-        old = plans_.get(plan_.replaces)
         file_status = str(old.status) if old is not None else "missing"
         store_status = ctx.db.feature_status(plan_.replaces) or "missing"
         if file_status == "plan_proposed" and store_status == "plan_proposed":
             supersede = True
+        elif "plan_approved" in (file_status, store_status):
+            refuse_if_started()
+            supersede = old_approved = True
         elif not force:
             shown = store_status if store_status != "plan_proposed" else file_status
             _fail(f"{plan_.replaces} is {shown}; approving {plan_id} would leave two live plans for the same request; "
@@ -588,6 +634,8 @@ def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, force
         require_clean(ctx.paths)
     except IntentError as e:
         _fail(str(e))
+    if old_approved:
+        refuse_if_started()   # again: the record review can wait on prompts, and worker run and verify take no lock
 
     cs = load_contracts(ctx.paths.contracts)
     missing = [cid for cid in plan_.contracts if cid not in cs]
@@ -632,13 +680,17 @@ def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, force
     })
     approval_files.append(save_plan(ctx.paths.plans, plan_))
     superseded_id = None
-    old_plan = plans_.get(plan_.replaces) if plan_.replaces else None
-    if old_plan is not None and supersede:
-        superseded_id = old_plan.id
-        approval_files.append(save_plan(ctx.paths.plans, old_plan.model_copy(update={
+    old_steps: dict[str, str] = {}   # an approved predecessor's contracts and their store status before the commit
+    if old is not None and supersede:
+        superseded_id = old.id
+        approval_files.append(save_plan(ctx.paths.plans, old.model_copy(update={
             "status": PlanStatus.superseded,
-            "history": [*old_plan.history, PlanHistoryEntry(at=datetime.now(UTC), by="owner", to=PlanStatus.superseded, why=f"replaced by {plan_id}")],
+            "history": [*old.history, PlanHistoryEntry(at=datetime.now(UTC), by="owner", to=PlanStatus.superseded, why=f"replaced by {plan_id}")],
         })))
+        if old_approved:
+            for cid in _plan_contract_ids(ctx, old):
+                old_steps[cid] = ctx.db.contract_status(cid)
+                approval_files.append(save_contract(ctx.paths.contracts, cs[cid].model_copy(update={"status": ContractStatus.superseded})))
     try:
         commit_intent_files(ctx.paths, f"ateam: approve plan {plan_id}", approval_files)
     except (IntentError, GitError) as e:
@@ -653,10 +705,25 @@ def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, force
             ctx.db.set_record_hash(r.id, r.content_hash())
     ctx.db.transition("feature", plan_id, "plan_approved", by="owner")
     click.echo(f"{plan_id} -> plan_approved")
-    if superseded_id is not None:
-        if ctx.db.feature_status(superseded_id) == "plan_proposed":
-            ctx.db.transition("feature", superseded_id, "superseded", by="owner", reason=f"replaced by {plan_id}")
-            click.echo(f"{superseded_id} -> superseded")
+    if superseded_id is None:
+        return
+    if old_approved:
+        try:
+            ctx.db.supersede(superseded_id, "plan_approved", old_steps, by="owner", reason=f"replaced by {plan_id}")
+        except InvalidTransition as e:
+            click.echo(f"error: the intent repo says {', '.join([superseded_id, *old_steps])} are superseded but the state store "
+                       f"was not changed: {e}. Investigate before running any of them.")
+            sys.exit(1)
+        for cid in old_steps:
+            click.echo(f"{cid} -> superseded")
+        click.echo(f"{superseded_id} -> superseded")
+    elif ctx.db.feature_status(superseded_id) == "plan_proposed":
+        ctx.db.transition("feature", superseded_id, "superseded", by="owner", reason=f"replaced by {plan_id}")
+        click.echo(f"{superseded_id} -> superseded")
+    for other in sorted(plans_.values(), key=lambda p: p.id):
+        for field in ("covered_by", "depends_on_plans"):
+            if superseded_id in getattr(other, field) and other.id not in (plan_id, superseded_id):
+                click.echo(f"note: {other.id} names superseded {superseded_id} in {field}")
 
 
 @main.command()
@@ -954,6 +1021,7 @@ def contracts_freeze(contract_id: str, force: bool, target: Path) -> None:
     from ateam.contracts.model import ContractStatus
     from ateam.contracts.select import freeze, select_records
     from ateam.contracts.store import load_contracts, save_contract
+    from ateam.plans.store import load_plans
     from ateam.records.graph import RecordGraph
     from ateam.records.store import load_records
 
@@ -961,6 +1029,13 @@ def contracts_freeze(contract_id: str, force: bool, target: Path) -> None:
     cs = load_contracts(ctx.paths.contracts)
     if contract_id not in cs:
         _fail(f"unknown contract {contract_id}")
+    if ContractStatus.superseded in (cs[contract_id].status, ctx.db.contract_status(contract_id)):
+        _fail(f"{contract_id} is superseded; a superseded contract is never frozen again")
+    owner = cs[contract_id].plan
+    owner_file = load_plans(ctx.paths.plans).get(owner)
+    for owner_status in (owner_file.status if owner_file else None, ctx.db.feature_status(owner)):
+        if owner_status in ("plan_rejected", "plan_covered", "superseded"):
+            _fail(f"{contract_id} belongs to {owner}, which is {owner_status}; its contracts are never frozen")
     if cs[contract_id].status != ContractStatus.draft and not force:
         _fail(f"{contract_id} is already frozen ({cs[contract_id].status}); pass --force to re-freeze and reset it")
     recs = load_records(ctx.paths.records)
@@ -1003,6 +1078,9 @@ def contracts_validate(target: Path) -> None:
         frozen = ctx.db.contract_hash(cid)
         if frozen is None:
             click.echo(f"INFO {cid}: not frozen ({c.status})")
+            continue
+        if ctx.db.contract_status(cid) == "superseded":
+            click.echo(f"INFO {cid}: superseded")
             continue
         if c.content_hash() != frozen:
             click.echo(f"ERROR {cid}: hand edit; content differs from the hash stored at freeze")

@@ -15,7 +15,7 @@ FEATURE_TRANSITIONS: dict[str | None, set[str]] = {
     "requested": {"investigating"},
     "investigating": {"plan_proposed", "plan_covered"},
     "plan_proposed": {"plan_approved", "plan_rejected", "superseded"},
-    "plan_approved": {"executing"},
+    "plan_approved": {"executing", "superseded"},   # superseded only before any of its contracts has started
     "executing": {"paused", "integrating"},
     "paused": {"executing", "abandoned"},
     "integrating": {"merge_proposed"},
@@ -24,19 +24,20 @@ FEATURE_TRANSITIONS: dict[str | None, set[str]] = {
     "merged": set(),
     "abandoned": set(),
     "plan_covered": set(),   # terminal; entered from investigating by `ateam plan`
-    "superseded": set(),     # terminal; entered from plan_proposed when a replacing plan is approved
+    "superseded": set(),     # terminal; entered from plan_proposed, or plan_approved before work starts, when a replacing plan is approved
 }
 
 CONTRACT_TRANSITIONS: dict[str | None, set[str]] = {
     None: {"draft", "ready"},
-    "draft": {"ready"},
-    "ready": {"building"},
+    "draft": {"ready", "superseded"},
+    "ready": {"building", "superseded"},
     "building": {"verifying", "failed", "paused"},
     "verifying": {"verified", "failed", "paused"},
     "failed": {"building", "paused"},
     "paused": {"building", "ready"},
     "verified": {"integrated"},
     "integrated": set(),
+    "superseded": set(),     # terminal; its plan was superseded before the contract started
 }
 
 Kind = Literal["feature", "contract"]
@@ -204,6 +205,39 @@ class StateDB:
             )
             for key in clear_keys:
                 self.conn.execute("DELETE FROM meta WHERE key=?", (key,))
+
+    def supersede(self, plan_id: str, plan_from: str, contract_steps: dict[str, str], by: str, reason: str) -> None:
+        """Supersede a plan and its contracts in one transaction. `plan_from` and each value of `contract_steps` are the
+        statuses seen before the intent commit; nothing is written if the store no longer agrees or a step is invalid."""
+        steps = [("feature", plan_id, plan_from), *(("contract", cid, frm) for cid, frm in contract_steps.items())]
+        for kind, id, frm in steps:
+            current = self.feature_status(id) if kind == "feature" else self.contract_status(id)
+            table = FEATURE_TRANSITIONS if kind == "feature" else CONTRACT_TRANSITIONS
+            if current != frm or "superseded" not in table.get(current, set()):
+                raise InvalidTransition(f"{kind} {id}: {current} -> superseded is not allowed (expected {frm})")
+        with self.conn:
+            for kind, id, frm in reversed(steps):   # contracts first, the feature last
+                self.conn.execute(
+                    "INSERT INTO transitions (kind, id, from_status, to_status, by, reason, at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (kind, id, frm, "superseded", by, reason, _now()),
+                )
+                if kind == "feature":
+                    self.conn.execute("UPDATE features SET status=?, updated_at=? WHERE feature_id=?", ("superseded", _now(), id))
+                else:
+                    self.conn.execute("UPDATE contracts SET status=?, updated_at=? WHERE contract_id=?", ("superseded", _now(), id))
+
+    def work_traces(self, contract_id: str) -> list[str]:
+        """What the store holds that shows work started on a contract. Freezing leaves no trace; anything else does."""
+        traces = []
+        if self.latest_attempt(contract_id) is not None:
+            traces.append("an attempt")
+        if self.transitions("contract", contract_id):
+            traces.append("a contract transition")
+        if self.latest_checkpoint(contract_id) is not None:
+            traces.append("a checkpoint")
+        if self.get_meta(f"verify-pending:{contract_id}") or self.get_meta(f"verify-running:{contract_id}"):
+            traces.append("a verify marker")
+        return traces
 
     def fingerprint(self, contract_id: str) -> str:
         """A hash of everything the store holds about one contract, plus every record hash, as committed (writes by

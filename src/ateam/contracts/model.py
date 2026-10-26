@@ -28,6 +28,7 @@ class ContractStatus(StrEnum):
     failed = "failed"
     paused = "paused"
     integrated = "integrated"
+    superseded = "superseded"
 
 
 class Level(StrEnum):

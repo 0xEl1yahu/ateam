@@ -755,7 +755,10 @@ def test_plan_replaces_refuses_non_proposed_plan(status, monkeypatch, cli_target
     briefs: list[str] = []
     _capturing_investigation(monkeypatch, _canned_plan(), briefs)
     r = run("plan", "again", "--replaces", "P-0001", "--target", str(cli_target))
-    assert r.exit_code == 1 and f"--replaces needs a plan_proposed plan; P-0001 is {status}" in r.output
+    assert r.exit_code == 1 and "--replaces needs a plan_proposed plan or an approved plan that has not started" in r.output
+    assert f"P-0001 is {status}" in r.output
+    if status == "plan_approved":   # only the file was edited: the store still says plan_proposed
+        assert "P-0001 is plan_approved in its file and plan_proposed in the state store" in r.output
     assert briefs == []
     db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
     assert db.feature_status("P-0002") is None
@@ -1730,3 +1733,239 @@ def test_invalid_planner_output_says_no_contracts_were_written(monkeypatch, cli_
     _patch_investigation(monkeypatch, bad)
     r = run("plan", "add a health function", "--target", str(cli_target))
     assert "The planner's output is not usable; no contracts were written. Problems:" in r.output
+
+
+# ---- superseding an approved plan that has not started (owner, 2026-10-26)
+
+def _approved_predecessor(monkeypatch, cli_target):
+    """P-0001 approved with C-0002 ready and C-0003 draft; no work started."""
+    p = _proposed_plan(monkeypatch, cli_target, two=True)
+    assert run("approve", "P-0001", "--skip-records", "--target", str(cli_target)).exit_code == 0
+    return p
+
+
+def _intent_state(p, cli_target):
+    from ateam.plans.store import load_plans
+    cs = load_contracts(p.contracts)
+    db = _db(cli_target)
+    return (GitRepo(p.intent).head(), str(load_plans(p.plans)["P-0001"].status), str(cs["C-0002"].status), str(cs["C-0003"].status),
+            db.feature_status("P-0001"), db.contract_status("C-0002"), db.contract_status("C-0003"))
+
+
+def test_plan_replaces_an_approved_plan_that_has_not_started(monkeypatch, cli_target):
+    from ateam.plans.store import load_plans
+    p = _approved_predecessor(monkeypatch, cli_target)
+    briefs: list[str] = []
+    _capturing_investigation(monkeypatch, _canned_plan(), briefs)
+    r = run("plan", "a better health function", "--replaces", "P-0001", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    section = briefs[0].split("## Existing plans and contracts")[1].split("\n## ")[0]
+    assert "P-0001" not in section
+    assert load_plans(p.plans)["P-0002"].replaces == "P-0001"
+
+
+def _trace_attempt(db, p):
+    db.start_attempt("C-0002", "build", "light", "haiku", {})
+
+
+def _trace_transition(db, p):
+    db.transition("contract", "C-0002", "building", by="t")
+
+
+def _trace_checkpoint(db, p):
+    db.set_checkpoint("C-0003", None, {"x": 1})
+
+
+def _trace_marker(db, p):
+    db.set_meta("verify-running:C-0002", "{}")
+
+
+def _trace_failed(db, p):
+    db.transition("contract", "C-0002", "building", by="t"); db.transition("contract", "C-0002", "failed", by="verify")
+
+
+def _trace_no_row(db, p):
+    with db.conn:
+        db.conn.execute("DELETE FROM contracts WHERE contract_id='C-0003'")
+
+
+def _trace_foreign_file(db, p):
+    from ateam.contracts.store import save_contract
+    c = load_contracts(p.contracts)["C-0003"]
+    save_contract(p.contracts, c.model_copy(update={"plan": "P-0007"}))
+    commit_intent(p, "hand edit", ["contracts"])
+
+
+@pytest.mark.parametrize("trace,reason", [
+    (_trace_attempt, "C-0002 has an attempt"),
+    (_trace_transition, "C-0002 has a contract transition"),
+    (_trace_checkpoint, "C-0003 has a checkpoint"),
+    (_trace_marker, "C-0002 has a verify marker"),
+    (_trace_failed, "C-0002 has a contract transition"),
+    (_trace_no_row, "C-0003 has no row in the state store"),
+    (_trace_foreign_file, "C-0003 belongs to P-0007 in its file"),
+])
+def test_plan_replaces_refuses_an_approved_plan_that_has_started(trace, reason, monkeypatch, cli_target):
+    p = _approved_predecessor(monkeypatch, cli_target)
+    trace(_db(cli_target), p)
+    head = GitRepo(p.intent).head()
+    briefs: list[str] = []
+    _capturing_investigation(monkeypatch, _canned_plan(), briefs)
+    r = run("plan", "again", "--replaces", "P-0001", "--target", str(cli_target))
+    assert r.exit_code == 1, r.output
+    assert "--replaces needs a plan_proposed plan or an approved plan that has not started" in r.output and reason in r.output
+    assert briefs == [] and _db(cli_target).feature_status("P-0002") is None and GitRepo(p.intent).head() == head
+
+
+def test_approve_supersedes_an_approved_plan_and_its_contracts(monkeypatch, cli_target):
+    from ateam.plans.store import load_plans
+    p = _approved_predecessor(monkeypatch, cli_target)
+    _patch_investigation(monkeypatch, _canned_plan())
+    assert run("plan", "a better health function", "--replaces", "P-0001", "--target", str(cli_target)).exit_code == 0
+    head = GitRepo(p.intent).head()
+    r = run("approve", "P-0002", "--skip-records", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    plans = load_plans(p.plans)
+    assert plans["P-0002"].status == "plan_approved"
+    assert plans["P-0001"].status == "superseded" and plans["P-0001"].history[-1].why == "replaced by P-0002"
+    cs = load_contracts(p.contracts)
+    assert cs["C-0002"].status == "superseded" == cs["C-0003"].status
+    db = _db(cli_target)
+    assert db.feature_status("P-0001") == "superseded" and db.feature_status("P-0002") == "plan_approved"
+    assert db.contract_status("C-0002") == "superseded" == db.contract_status("C-0003")
+    assert db.contract_hash("C-0002") == cs["C-0002"].content_hash()   # status is not part of the frozen hash
+    g = GitRepo(p.intent)
+    assert g.is_clean() and g.run("rev-parse", "HEAD~1").strip() == head
+    files = g.run("show", "--name-only", "--format=", "HEAD")
+    assert all(x in files for x in ("P-0001", "P-0002", "C-0002", "C-0003"))
+    out = r.output
+    assert out.index("P-0002 -> plan_approved") < out.index("C-0002 -> superseded") < out.index("C-0003 -> superseded") < out.index("P-0001 -> superseded")
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_approve_refuses_when_the_approved_predecessor_started_after_planning(force, monkeypatch, cli_target):
+    p = _approved_predecessor(monkeypatch, cli_target)
+    _patch_investigation(monkeypatch, _canned_plan())
+    assert run("plan", "a better health function", "--replaces", "P-0001", "--target", str(cli_target)).exit_code == 0
+    _db(cli_target).start_attempt("C-0002", "build", "light", "haiku", {})
+    before = _intent_state(p, cli_target)
+    args = ["approve", "P-0002", "--skip-records", "--target", str(cli_target)] + (["--force"] if force else [])
+    r = run(*args)
+    assert r.exit_code == 1, r.output
+    assert "P-0001 cannot be superseded (C-0002 has an attempt); reject P-0002 or finish P-0001" in r.output
+    assert _intent_state(p, cli_target) == before and _db(cli_target).feature_status("P-0002") == "plan_proposed"
+
+
+def test_approve_rechecks_the_predecessor_just_before_the_commit(monkeypatch, cli_target):
+    import ateam.cli as cli_mod
+    p = _approved_predecessor(monkeypatch, cli_target)
+    _patch_investigation(monkeypatch, _canned_plan())
+    assert run("plan", "a better health function", "--replaces", "P-0001", "--target", str(cli_target)).exit_code == 0
+    real = cli_mod._started_reason
+    calls: list[str] = []
+
+    def second_check_sees_work(*a, **kw):
+        calls.append("check")
+        if len(calls) == 2:   # work started while the records were being reviewed
+            _db(cli_target).start_attempt("C-0003", "build", "light", "haiku", {})
+        return real(*a, **kw)
+
+    monkeypatch.setattr(cli_mod, "_started_reason", second_check_sees_work)
+    head = GitRepo(p.intent).head()
+    r = run("approve", "P-0002", "--skip-records", "--target", str(cli_target))
+    assert r.exit_code == 1 and "C-0003 has an attempt" in r.output, r.output
+    assert len(calls) == 2 and GitRepo(p.intent).head() == head and GitRepo(p.intent).is_clean()
+    assert _db(cli_target).feature_status("P-0001") == "plan_approved"
+
+
+def test_approve_commit_failure_with_an_approved_predecessor_restores_its_contracts(monkeypatch, cli_target):
+    import re, subprocess
+    from ateam.intent import IntentError
+    p = _approved_predecessor(monkeypatch, cli_target)
+    _patch_investigation(monkeypatch, _canned_plan())
+    assert run("plan", "a better health function", "--replaces", "P-0001", "--target", str(cli_target)).exit_code == 0
+    before = _intent_state(p, cli_target)
+
+    def fail_commit(paths, message, subpaths):
+        raise IntentError("simulated commit failure")
+
+    monkeypatch.setattr("ateam.cli.commit_intent_files", fail_commit)
+    r = run("approve", "P-0002", "--skip-records", "--target", str(cli_target))
+    assert r.exit_code == 1 and "Nothing was recorded in the state store" in r.output
+    subprocess.run(re.search(r"^\s*(git -C .*)$", r.output, re.M).group(1), shell=True, check=True)
+    assert GitRepo(p.intent).is_clean() and _intent_state(p, cli_target) == before
+
+
+def test_approve_reports_a_store_that_disagrees_after_the_commit(monkeypatch, cli_target):
+    from ateam.state.db import InvalidTransition, StateDB as DB
+    p = _approved_predecessor(monkeypatch, cli_target)
+    _patch_investigation(monkeypatch, _canned_plan())
+    assert run("plan", "a better health function", "--replaces", "P-0001", "--target", str(cli_target)).exit_code == 0
+
+    def boom(self, *a, **kw):
+        raise InvalidTransition("contract C-0003: building -> superseded is not allowed (expected draft)")
+
+    monkeypatch.setattr(DB, "supersede", boom)
+    r = run("approve", "P-0002", "--skip-records", "--target", str(cli_target))
+    assert r.exit_code == 1 and "Traceback" not in r.output
+    assert "the intent repo says P-0001, C-0002, C-0003 are superseded but the state store was not changed" in r.output
+    assert "building -> superseded" in r.output
+
+
+def test_approve_notes_plans_that_name_the_superseded_plan(monkeypatch, cli_target):
+    from ateam.plans.store import load_plans, save_plan
+    p = _approved_predecessor(monkeypatch, cli_target)
+    _patch_investigation(monkeypatch, _canned_plan())
+    assert run("plan", "another thing", "--target", str(cli_target)).exit_code == 0     # P-0002
+    plans = load_plans(p.plans)
+    save_plan(p.plans, plans["P-0002"].model_copy(update={"depends_on_plans": ["P-0001"]}))
+    commit_intent(p, "name P-0001", ["plans"])
+    assert run("plan", "a better health function", "--replaces", "P-0001", "--target", str(cli_target)).exit_code == 0   # P-0003
+    r = run("approve", "P-0003", "--skip-records", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert "note: P-0002 names superseded P-0001 in depends_on_plans" in r.output
+
+
+def _superseded(monkeypatch, cli_target):
+    p = _approved_predecessor(monkeypatch, cli_target)
+    _patch_investigation(monkeypatch, _canned_plan())
+    assert run("plan", "a better health function", "--replaces", "P-0001", "--target", str(cli_target)).exit_code == 0
+    assert run("approve", "P-0002", "--skip-records", "--target", str(cli_target)).exit_code == 0
+    return p
+
+
+def test_superseded_contract_does_not_run_or_verify(monkeypatch, cli_target, tmp_path):
+    _superseded(monkeypatch, cli_target)
+    wt = tmp_path / "wt-sup"; GitRepo(cli_target).worktree_add(wt, "wt-sup", "main")
+    r = run("worker", "run", "C-0002", "--role", "build", "--cwd", str(wt), "--target", str(cli_target))
+    assert r.exit_code == 4 and "C-0002 is superseded; only ready, building, failed or paused contracts run" in r.output
+    r = run("verify", "C-0002", "--cwd", str(wt), "--target", str(cli_target))
+    assert r.exit_code == 4 and "superseded" in r.output, r.output
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_freeze_refuses_a_superseded_contract(force, monkeypatch, cli_target):
+    p = _superseded(monkeypatch, cli_target)
+    head = GitRepo(p.intent).head()
+    r = run("contracts", "freeze", "C-0002", *(["--force"] if force else []), "--target", str(cli_target))
+    assert r.exit_code == 1 and "C-0002 is superseded; a superseded contract is never frozen again" in r.output
+    assert _db(cli_target).contract_status("C-0002") == "superseded" and GitRepo(p.intent).head() == head
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_freeze_refuses_a_contract_whose_plan_is_dead(force, monkeypatch, cli_target):
+    p = _proposed_plan(monkeypatch, cli_target)
+    assert run("reject", "P-0001", "not now", "--target", str(cli_target)).exit_code == 0
+    r = run("contracts", "freeze", "C-0002", *(["--force"] if force else []), "--target", str(cli_target))
+    assert r.exit_code == 1 and "C-0002 belongs to P-0001, which is plan_rejected; its contracts are never frozen" in r.output
+    assert _db(cli_target).contract_hash("C-0002") is None
+
+
+def test_validate_reports_a_superseded_contract_as_info(monkeypatch, cli_target):
+    p = _superseded(monkeypatch, cli_target)
+    from ateam.records.store import load_records, save_record
+    r1 = load_records(p.records)["R-0001"]
+    save_record(p.records, r1.model_copy(update={"statement": r1.statement + " (changed)"}))   # drift for C-0002's bound record
+    commit_intent(p, "edit record", ["records"])
+    r = run("contracts", "validate", "--target", str(cli_target))
+    assert "INFO C-0002: superseded" in r.output and "ERROR C-0002" not in r.output and "ERROR C-0003" not in r.output

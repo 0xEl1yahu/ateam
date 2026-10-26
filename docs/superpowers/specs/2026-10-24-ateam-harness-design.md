@@ -106,6 +106,9 @@ Three failure classes, each with its own mechanism:
 - **BUILD and TEST `cd` only to an absolute path inside the worktree**, like INVESTIGATE, so the home check can resolve relative paths from every directory a worker enters. A relative `cd`, `cd` alone, `cd -` and any target outside the worktree are denied for every role with one reason: "workers may cd only to an absolute path inside the worktree or its scratch directory". (Owner, 2026-10-26.) The worker's scratch directory, the one writable place outside the worktree, is also a `cd` target for every role, by absolute path (controller ruling, 2026-10-26).
 - **Three INVESTIGATE allow rows from the lexer round stand**: an escaped `"\$(x)"`, an escaped `` "\`" `` inside double quotes, and a `$(...)` inside a comment are text, not substitutions. (Owner, 2026-10-26.)
 - **Workers run under `/bin/bash`.** The policy's shell model is bash 3.2 to 5.3: the lexer reads every command both as bash 3.2-5.2 and as 5.3 and checks the commands found under either reading; the worker environment sets `SHELL` and `CLAUDE_CODE_SHELL` to `/bin/bash` so the Bash tool does not run the login shell (zsh on macOS). (Owner, 2026-10-26.)
+- **An approved plan that has not started can be superseded.** `ateam plan --replaces` accepts an approved plan when none of its work has started; approving the replacement marks the old plan and its contracts `superseded`, a terminal contract state reachable from `draft` and `ready` only. "Started" fails closed: any contract of the plan with an attempt, a contract transition row, a checkpoint, a verify marker, or a status other than `draft`/`ready` in its file or the store. A plan's contracts are those its file lists plus those the store files under it. (Owner, 2026-10-26.)
+- **`approve --force` never leaves a started approved plan live beside its replacement.** When the replaced plan is approved and has started, `approve` refuses with or without `--force`; `--force` still approves a replacement whose predecessor is rejected, covered or gone, superseding nothing. (Owner, 2026-10-26.)
+- **Contracts of dead plans are never frozen.** `ateam contracts freeze` refuses, with or without `--force`, a contract that is `superseded` or whose plan is `plan_rejected`, `plan_covered` or `superseded` in its file or the store. (Owner, 2026-10-26.)
 - **`c=rm; $c x` and `$(echo rm) x` stay BUILD residuals**, backed by the post-run tree check: the command word is made at run time, which no pre-run lexer can see. They are pinned as strict expected failures in the policy tests. (Owner, 2026-10-26.)
 
 ## Calls made by the assistant (owner to check)
@@ -308,13 +311,14 @@ executing -> paused(reason) -> executing | abandoned
 plan_proposed -> plan_rejected
 investigating -> plan_covered
 plan_proposed -> superseded
+plan_approved -> superseded        (only while none of its contracts has started)
 ```
 
-`plan_covered` and `superseded` are terminal. `plan_covered`: the planner returned no contracts and named the plans that already cover the request. `superseded`: a later plan was approved with `--replaces` naming this one.
+`plan_covered` and `superseded` are terminal. `plan_covered`: the planner returned no contracts and named the plans that already cover the request. `superseded`: a later plan was approved with `--replaces` naming this one. An approved plan is superseded only when none of its work has started: every contract is `draft` or `ready` in its file and in the store, and none has an attempt, a contract transition, a checkpoint or a verify marker. Its contracts are superseded with it, in the same approval commit and one store transaction.
 
 Pause reasons are an enum: `decision_change_needed`, `scope_exceeded`, `budget_exhausted`, `verification_unresolvable`, `sensitive_action`, `environment_failure`, `records_drifted`.
 
-Contract: `draft -> ready -> building -> verifying -> verified -> integrated`, with `failed` (retry possible) and `paused` as side exits. A contract becomes `ready` when every dependency is `verified`.
+Contract: `draft -> ready -> building -> verifying -> verified -> integrated`, with `failed` (retry possible) and `paused` as side exits, and `superseded` (terminal, from `draft` or `ready` only) when its approved plan is superseded. A contract becomes `ready` when every dependency is `verified`.
 
 Every transition is a row in SQLite with timestamp, actor and reason. `ateam status` reads only this table plus the live worker list. `ateam stop` sends interrupt to running sessions, marks their attempts `interrupted`, and leaves worktrees in place. `ateam resume` re-enters `executing` and either resumes the interrupted session by ID or starts a fresh attempt from the worktree, builder's choice per failure class.
 
