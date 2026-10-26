@@ -102,6 +102,9 @@ Three failure classes, each with its own mechanism:
 - **Rebuild derives only from the intent repo.** Doctor's rebuild recreates state that the intent repo determines and nothing else. (Constrains a future feature; implemented with it.) (Owner, 2026-10-25.)
 - **Merge is fast-forward only by default, in the owner's checkout.** (Constrains a future feature; implemented with it.) (Owner, 2026-10-25.)
 - **A request already covered by an existing plan is a `plan_covered` outcome, not a rejection.** `ateam plan --replaces P-xxxx` hides that plan from the planner and marks it `superseded` when the new plan is approved. (Owner, 2026-10-25.)
+- **BUILD and TEST `cd` only to an absolute path inside the worktree**, like INVESTIGATE, so the home check can resolve relative paths from every directory a worker enters. A relative `cd`, `cd` alone, `cd -` and any target outside the worktree are denied for every role with one reason: "workers may cd only to an absolute path inside the worktree". (Owner, 2026-10-26.)
+- **Three INVESTIGATE allow rows from the lexer round stand**: an escaped `"\$(x)"`, an escaped `` "\`" `` inside double quotes, and a `$(...)` inside a comment are text, not substitutions. (Owner, 2026-10-26.)
+- **`c=rm; $c x` and `$(echo rm) x` stay BUILD residuals**, backed by the post-run tree check: the command word is made at run time, which no pre-run lexer can see. They are pinned as strict expected failures in the policy tests. (Owner, 2026-10-26.)
 
 ## Calls made by the assistant (owner to check)
 
@@ -318,8 +321,8 @@ Every transition is a row in SQLite with timestamp, actor and reason. `ateam sta
 | Role | May | May not | Ends with |
 |---|---|---|---|
 | INVESTIGATE | read, search, run read-only commands from a strict allow-list (git log/show/diff/blame/status/ls-files/grep/branch --list, ls, cat, head, tail, wc, grep, rg, find, tree, du, stat, file, pwd, sort, uniq, cut; no interpreters, no sed, no awk) | edit, write, run anything that can write, run tests | findings report with evidence and proposed records |
-| BUILD | read, edit, write, run checks, commit in its worktree | edit `.ateam/**` or `.claude/**`, touch files outside `paths` plus `incidental`, push, merge, run `rm` in any form (tracked files go through `git rm`; cleanup is an integration step) | build report: commits, files, checks run, risks, record proposals |
-| TEST | read, run checks and tests, write only under a scratch directory | edit source, edit tests that the contract names, see the builder's transcript | verdict per acceptance criterion with evidence |
+| BUILD | read, edit, write, run checks, commit in its worktree | edit `.ateam/**` or `.claude/**`, touch files outside `paths` plus `incidental`, push, merge, run `rm` in any form (tracked files go through `git rm`; cleanup is an integration step), cd outside the worktree or by a relative path | build report: commits, files, checks run, risks, record proposals |
+| TEST | read, run checks and tests, write only under a scratch directory | edit source, edit tests that the contract names, see the builder's transcript, cd outside the worktree or by a relative path | verdict per acceptance criterion with evidence |
 
 Enforcement, in layers. Layers 1 to 3 run before a tool executes (pre-guards); layer 4 verifies afterwards. The system prompt is not a layer.
 
