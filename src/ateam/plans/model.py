@@ -7,6 +7,7 @@ import json
 import re
 from datetime import datetime
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -36,6 +37,23 @@ class PlanHistoryEntry(BaseModel):
     why: str | None = None
 
 
+class ReviewFinding(BaseModel):
+    contract: str
+    severity: Literal["blocking", "important", "minor"]
+    finding: str
+    suggestion: str
+
+
+class PlanReview(BaseModel):
+    """The staff-engineer review of the draft plan. `unavailable` means the review session failed; the plan is unreviewed."""
+
+    verdict: Literal["defensible", "needs_revision", "unavailable"]
+    findings: list[ReviewFinding] = Field(default_factory=list)
+    revised: bool = False
+    session_id: str | None = None
+    cost_usd: float = 0.0
+
+
 class Plan(BaseModel):
     id: str = Field(pattern=PLAN_ID_RE.pattern)
     title: str
@@ -52,11 +70,12 @@ class Plan(BaseModel):
     verification_approach: str = ""
     tier_overrides: dict[str, dict[str, str]] = Field(default_factory=dict)
     history: list[PlanHistoryEntry] = Field(default_factory=list)
+    review: PlanReview | None = None
 
     def slug(self) -> str:
         words = re.sub(r"[^a-z0-9]+", "-", self.title.lower()).strip("-").split("-")
         return "-".join(w for w in words[:6] if w)[:40].rstrip("-")
 
     def content_hash(self) -> str:
-        data = json.loads(self.model_dump_json(exclude={"status", "history"}))
+        data = json.loads(self.model_dump_json(exclude={"status", "history", "review"}))
         return hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":")).encode()).hexdigest()

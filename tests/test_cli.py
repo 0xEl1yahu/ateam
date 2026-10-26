@@ -314,7 +314,8 @@ def _patch_investigation(monkeypatch, report):
         db = kw["db"]
         a = db.start_attempt(kw["name"], "investigate", "light", "haiku", {})
         db.finish_attempt(a, "completed", None, 1, 1, 0.001, 1, 0.1, "s")
-        res = WorkerResult("success", False, "completed", "s", 1, 0.001, {}, {}, report, [], [], None, 0.1)
+        rep = _DEFENSIBLE if _is_review(kw) else report
+        res = WorkerResult("success", False, "completed", "s", 1, 0.001, {}, {}, rep, [], [], None, 0.1)
         return inv_mod.InvestigationResult(res=res, attempt_id=a, tampered=[])
 
     monkeypatch.setattr("ateam.cli.run_investigation", fake, raising=False)
@@ -580,11 +581,13 @@ def _capture_investigation(monkeypatch, report):
     seen: dict = {}
 
     async def fake(**kw):
-        seen.update(kw)
+        if not _is_review(kw):
+            seen.update(kw)
         db = kw["db"]
         a = db.start_attempt(kw["name"], "investigate", "light", "haiku", {})
         db.finish_attempt(a, "completed", None, 1, 1, 0.001, 1, 0.1, "s")
-        res = WorkerResult("success", False, "completed", "s", 1, 0.001, {}, {}, report, [], [], None, 0.1)
+        rep = _DEFENSIBLE if _is_review(kw) else report
+        res = WorkerResult("success", False, "completed", "s", 1, 0.001, {}, {}, rep, [], [], None, 0.1)
         return inv_mod.InvestigationResult(res=res, attempt_id=a, tampered=[])
 
     monkeypatch.setattr("ateam.cli.run_investigation", fake, raising=False)
@@ -689,7 +692,7 @@ def test_init_and_plan_default_to_careful(monkeypatch, cli_target):
     assert run("init", "--target", str(cli_target)).exit_code == 0
     capturing_report(_canned_plan())
     assert run("plan", "add a health function", "--target", str(cli_target)).exit_code == 0
-    assert seen == ["careful", "careful"]
+    assert seen == ["careful", "careful", "careful"]   # init, plan, and the plan's review at the same tier
 
 
 # ---- plan covered, --replaces, supersede on approval
@@ -699,11 +702,13 @@ def _capturing_investigation(monkeypatch, report, briefs):
     from ateam.runner.run import WorkerResult
 
     async def fake(**kw):
-        briefs.append(kw["brief_text"])
+        if not _is_review(kw):
+            briefs.append(kw["brief_text"])
         db = kw["db"]
         a = db.start_attempt(kw["name"], "investigate", "light", "haiku", {})
         db.finish_attempt(a, "completed", None, 1, 1, 0.001, 1, 0.1, "s")
-        res = WorkerResult("success", False, "completed", "s", 1, 0.001, {}, {}, report, [], [], None, 0.1)
+        rep = _DEFENSIBLE if _is_review(kw) else report
+        res = WorkerResult("success", False, "completed", "s", 1, 0.001, {}, {}, rep, [], [], None, 0.1)
         return inv_mod.InvestigationResult(res=res, attempt_id=a, tampered=[])
 
     monkeypatch.setattr("ateam.cli.run_investigation", fake, raising=False)
@@ -835,3 +840,161 @@ def test_approve_does_not_claim_supersede_when_old_feature_moved_on(monkeypatch,
     r = run("approve", "P-0002", "--skip-records", "--target", str(cli_target))
     assert r.exit_code == 0, r.output
     assert "P-0001 -> superseded" not in r.output
+
+
+# ---- staff-engineer review of the draft plan
+
+_DEFENSIBLE = {"verdict": "defensible", "findings": [], "notes": "ok"}
+
+
+def _is_review(kw) -> bool:
+    import ateam.roles as roles
+    return kw["spec"] is getattr(roles, "REVIEWER_SPEC", None)
+
+
+def _review_investigation(monkeypatch, plan_reports, review):
+    """A fake run_investigation that dispatches on the spec. Planner calls return plan_reports in turn; the review
+    returns `review` (a report dict) or fails as "tamper", "crash" or "no_report"."""
+    from ateam.runner import investigate as inv_mod
+    from ateam.runner.run import WorkerResult
+
+    calls: list[dict] = []
+    reports = list(plan_reports)
+
+    async def fake(**kw):
+        kind = "review" if _is_review(kw) else "plan"
+        calls.append({"kind": kind, "name": kw["name"], "resume": kw.get("resume"), "prompt": kw["prompt"],
+                      "brief": kw["brief_text"], "tier_name": kw.get("tier_name")})
+        n = sum(1 for c in calls if c["kind"] == kind)
+        tampered: list[str] = []
+        if kind == "review":
+            report, cost = review, 0.02
+            if review == "crash":
+                raise RuntimeError("review sdk exploded")
+            if review in ("tamper", "no_report"):
+                report = None
+            if review == "tamper":
+                tampered = ["planted.txt changed"]
+        else:
+            report, cost = reports.pop(0), 0.01
+            if report == "crash":
+                raise RuntimeError("revision sdk exploded")
+        db = kw["db"]
+        a = db.start_attempt(kw["name"], "investigate", "light", "haiku", {})
+        db.finish_attempt(a, "completed" if report else "failed", None, 1, 1, cost, 1, 0.1, f"{kind}-{n}")
+        res = WorkerResult("success", False, "completed", f"{kind}-{n}", 1, cost, {}, {}, report, [], [], None, 0.1)
+        return inv_mod.InvestigationResult(res=res, attempt_id=a, tampered=tampered)
+
+    monkeypatch.setattr("ateam.cli.run_investigation", fake, raising=False)
+    return calls
+
+
+def _stored_plan(cli_target, pid="P-0001"):
+    from ateam.plans.store import load_plans
+    return load_plans(TargetPaths.from_root(cli_target).plans)[pid]
+
+
+def test_plan_runs_review_and_stores_it(monkeypatch, cli_target):
+    calls = _review_investigation(monkeypatch, [_canned_plan()], _DEFENSIBLE)
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert [c["kind"] for c in calls] == ["plan", "review"]
+    review_call = calls[1]
+    assert review_call["name"] == "P-0001-review" and review_call["resume"] is None and review_call["tier_name"] == "careful"
+    draft = _section(review_call["brief"], "Draft plan")
+    assert "C-0002" in draft and "Add health" in draft and "tests/test_routes.py::RoutesTest::test_health" in draft
+    stored = _stored_plan(cli_target)
+    assert stored.status == "plan_proposed" and stored.review.verdict == "defensible" and stored.review.revised is False
+    assert stored.review.session_id == "review-1" and stored.review.cost_usd == pytest.approx(0.02)
+    assert "Review: defensible" in r.output
+    assert "session plan-1:" in r.output and "session review-1:" in r.output and "total cost: $0.0300" in r.output
+    assert "review:" in run("plans", "show", "P-0001", "--target", str(cli_target)).output
+
+
+def test_plan_blocking_review_triggers_one_revision(monkeypatch, cli_target):
+    second = _canned_plan()
+    second["contracts"][0]["title"] = "Add health with error path"
+    second["contracts"][0]["acceptance"].append({"id": "A2", "statement": "health() reports a broken database",
+                                                 "check": {"type": "test", "ref": "tests/test_routes.py::RoutesTest::test_health_db_down"}})
+    review = {"verdict": "needs_revision", "notes": "n", "findings": [
+        {"contract": "C-0002", "severity": "blocking", "finding": "no test for the error path", "suggestion": "add one"},
+        {"contract": "C-0002", "severity": "minor", "finding": "terse title", "suggestion": "rename"}]}
+    calls = _review_investigation(monkeypatch, [_canned_plan(), second], review)
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert [c["kind"] for c in calls] == ["plan", "review", "plan"]
+    revision = calls[2]
+    assert revision["name"] == "P-0001" and revision["resume"] == "plan-1" and calls[0]["resume"] is None
+    assert revision["prompt"].startswith(
+        "A staff-engineer review found blocking problems with your plan. Revise the plan to address every blocking and "
+        "important finding below, keep what was right, and return the complete report again.\n\n")
+    assert "- [blocking] C-0002: no test for the error path. Suggestion: add one" in revision["prompt"]
+    stored = _stored_plan(cli_target)
+    assert stored.review.verdict == "needs_revision" and stored.review.revised is True
+    assert [f.severity for f in stored.review.findings] == ["blocking", "minor"]
+    c = load_contracts(TargetPaths.from_root(cli_target).contracts)["C-0002"]
+    assert c.title == "Add health with error path" and [a.id for a in c.acceptance] == ["A1", "A2"]
+    assert stored.contracts == ["C-0002"] and "C-0003" not in load_contracts(TargetPaths.from_root(cli_target).contracts)
+    assert "session plan-2:" in r.output and "total cost: $0.0400" in r.output
+    assert "no test for the error path" in r.output
+
+
+def test_plan_important_only_review_does_not_revise(monkeypatch, cli_target):
+    review = {"verdict": "needs_revision", "notes": "n", "findings": [
+        {"contract": "C-0002", "severity": "important", "finding": "port is unstated", "suggestion": "name it"}]}
+    calls = _review_investigation(monkeypatch, [_canned_plan()], review)
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert [c["kind"] for c in calls] == ["plan", "review"]
+    stored = _stored_plan(cli_target)
+    assert stored.review.revised is False and stored.review.findings[0].finding == "port is unstated"
+    assert "[important] C-0002: port is unstated" in r.output
+
+
+@pytest.mark.parametrize("failure", ["tamper", "crash", "no_report", "malformed"])
+def test_plan_survives_review_failure(failure, monkeypatch, cli_target):
+    review = {"title": "not a review"} if failure == "malformed" else failure
+    calls = _review_investigation(monkeypatch, [_canned_plan()], review)
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert [c["kind"] for c in calls] == ["plan", "review"]
+    assert "warning: review unavailable" in r.output and "the plan is unreviewed" in r.output
+    stored = _stored_plan(cli_target)
+    assert stored.status == "plan_proposed" and stored.contracts == ["C-0002"] and stored.review.verdict == "unavailable"
+    db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
+    assert db.feature_status("P-0001") == "plan_proposed"
+    assert GitRepo(TargetPaths.from_root(cli_target).intent).is_clean()
+
+
+@pytest.mark.parametrize("revision", ["invalid", "crash"])
+def test_plan_failed_revision_keeps_first_plan_with_note(revision, monkeypatch, cli_target):
+    bad = _canned_plan(); bad["contracts"][0]["depends_on"] = [0]
+    review = {"verdict": "needs_revision", "notes": "n", "findings": [
+        {"contract": "C-0002", "severity": "blocking", "finding": "wrong file", "suggestion": "use routes.py"}]}
+    calls = _review_investigation(monkeypatch, [_canned_plan(), bad if revision == "invalid" else "crash"], review)
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert [c["kind"] for c in calls] == ["plan", "review", "plan"]
+    stored = _stored_plan(cli_target)
+    assert stored.status == "plan_proposed" and stored.contracts == ["C-0002"]
+    assert stored.review.verdict == "needs_revision" and stored.review.revised is False
+    assert load_contracts(TargetPaths.from_root(cli_target).contracts)["C-0002"].title == "Add health"
+    assert "revision" in r.output and "kept the first plan" in r.output
+
+
+def test_plan_no_review_flag_skips_review(monkeypatch, cli_target):
+    calls = _review_investigation(monkeypatch, [_canned_plan()], _DEFENSIBLE)
+    r = run("plan", "add a health function", "--no-review", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert [c["kind"] for c in calls] == ["plan"]
+    assert _stored_plan(cli_target).review is None and "Review:" not in r.output
+
+
+def test_covered_plan_is_not_reviewed(monkeypatch, cli_target):
+    _proposed_plan(monkeypatch, cli_target)
+    covered = {"title": "Health again", "contracts": [], "depends_on_plans": ["P-0001"], "unknowns": [], "notes": "n"}
+    calls = _review_investigation(monkeypatch, [covered], _DEFENSIBLE)
+    r = run("plan", "health check again", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert [c["kind"] for c in calls] == ["plan"]
+    assert _stored_plan(cli_target, "P-0002").status == "plan_covered" and _stored_plan(cli_target, "P-0002").review is None

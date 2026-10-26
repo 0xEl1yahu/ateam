@@ -31,7 +31,7 @@ class InvestigationResult:
 
 async def run_investigation(
     *, paths: TargetPaths, config: TargetConfig, target_git: GitRepo, name: str, spec: RoleSpec, prompt: str,
-    brief_text: str, tier: TierSpec, db: StateDB, tier_name: str = "custom",
+    brief_text: str, tier: TierSpec, db: StateDB, tier_name: str = "custom", resume: str | None = None,
 ) -> InvestigationResult:
     if spec.role != Role.investigate:
         raise ValueError("run_investigation only runs INVESTIGATE specs")
@@ -45,7 +45,7 @@ async def run_investigation(
     checkout_before = take(target_git)
     attempt_id = db.start_attempt(name, Role.investigate.value, tier_name, tier.model, {})
     try:
-        options = worker_options(cwd=paths.root, spec=spec, brief_text=brief_text, policy=policy, tier=tier)
+        options = worker_options(cwd=paths.root, spec=spec, brief_text=brief_text, policy=policy, tier=tier, resume=resume)
         res = await run_worker(prompt, options, policy)
         tampered = changed(checkout_before, take(target_git))
         intent_after = (intent.head(), intent.is_clean())

@@ -216,3 +216,28 @@ def test_plan_index_caps_each_plan(target_repo, tmp_path, sample_contract):
     sec = _idx(text)
     assert sec.count("[truncated at 2500 characters]") == 1
     assert "P-0002 requested  Small" in sec
+
+
+# --- review brief ---
+
+def _review(root, tmp_path, **kw):
+    from ateam.brief import assemble_review_brief
+    args = dict(target_root=root, config=TargetConfig(), records={}, plans={}, contracts={},
+                scratch_dir=tmp_path / "scratch", request="add a thing", draft="# Draft\ntitle: Health\n## contracts\n- C-0002")
+    args.update(kw)
+    return assemble_review_brief(**args)
+
+
+def test_review_brief_headings(target_repo, tmp_path):
+    text = _review(target_repo, tmp_path)
+    assert _headings(text) == ["Rules", "Records", "Existing plans and contracts", "Request", "Draft plan", "Checks", "Rubric", "Handoff file"]
+    assert "### Draft\ntitle: Health\n#### contracts" in text                     # the draft's own headings are demoted two levels
+    assert str(tmp_path / "scratch" / "handoff.yaml") in text
+
+
+def test_review_brief_excludes_replaced_plan(target_repo, tmp_path):
+    plans = {"P-0001": Plan(id="P-0001", title="Old", request="r", status=PlanStatus.plan_proposed),
+             "P-0002": Plan(id="P-0002", title="Other", request="r", status=PlanStatus.plan_proposed)}
+    text = _review(target_repo, tmp_path, plans=plans, exclude_plans=frozenset({"P-0001"}))
+    index = text.split("## Existing plans and contracts\n")[1].split("\n## ")[0]
+    assert "P-0001" not in index and "P-0002" in index

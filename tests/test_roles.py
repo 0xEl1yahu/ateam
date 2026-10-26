@@ -60,3 +60,18 @@ def test_test_schema_requires_requirements_unclear():
 
 def test_test_prompt_explains_the_flag():
     assert "requirements_unclear" in ROLE_SPECS[Role.test].system_prompt
+
+
+def test_review_schema_and_spec_shape():
+    from ateam.roles import INVESTIGATION_COMMON, REVIEW_SCHEMA, REVIEWER_SPEC
+    assert REVIEW_SCHEMA["type"] == "object" and REVIEW_SCHEMA["additionalProperties"] is False
+    assert set(REVIEW_SCHEMA["required"]) == set(REVIEW_SCHEMA["properties"]) == {"verdict", "findings", "notes"}
+    assert REVIEW_SCHEMA["properties"]["verdict"]["enum"] == ["defensible", "needs_revision"]
+    item = REVIEW_SCHEMA["properties"]["findings"]["items"]
+    assert item["additionalProperties"] is False
+    assert set(item["required"]) == set(item["properties"]) == {"contract", "severity", "finding", "suggestion"}
+    assert item["properties"]["severity"]["enum"] == ["blocking", "important", "minor"]
+    assert REVIEWER_SPEC.role == Role.investigate and REVIEWER_SPEC.tools == ["Read", "Glob", "Grep", "Bash"]
+    assert REVIEWER_SPEC.report_schema is REVIEW_SCHEMA
+    assert "staff engineer" in REVIEWER_SPEC.system_prompt and INVESTIGATION_COMMON in REVIEWER_SPEC.system_prompt
+    assert "never rewrite the plan" in REVIEWER_SPEC.system_prompt.lower()

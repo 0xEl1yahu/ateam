@@ -236,24 +236,28 @@ def init(remote: str | None, max_candidates: int, tier: str, target: Path) -> No
 @click.argument("request")
 @click.option("--tier", default="careful", show_default=True, type=click.Choice(["light", "standard", "careful"]))
 @click.option("--replaces", default=None, metavar="P-xxxx", help="Supersede this plan_proposed plan when the new plan is approved.")
+@click.option("--no-review", "no_review", is_flag=True, help="Skip the staff-engineer review of the draft plan.")
 @TARGET_OPTION
-def plan(request: str, tier: str, replaces: str | None, target: Path) -> None:
+def plan(request: str, tier: str, replaces: str | None, no_review: bool, target: Path) -> None:
     """Turn a feature request into contracts and a plan for approval."""
     import asyncio
 
     from ateam.contracts.store import load_contracts, save_contract
-    from ateam.planner import PlanError, render_plan_review, report_to_plan
+    from ateam.brief import assemble_review_brief
+    from ateam.planner import PlanError, format_finding, render_draft, render_plan_review, report_to_plan
     from ateam.plans.store import load_plans
     from ateam.plans.store import next_id as next_plan_id
     from ateam.plans.store import save_plan
     from ateam.records.store import load_records, save_record
-    from ateam.roles import PLANNER_SPEC, Role
+    from ateam.roles import PLANNER_SPEC, REVIEWER_SPEC, Role
     from ateam.tiers import load_tiers
 
     from datetime import UTC, datetime
 
+    from pydantic import ValidationError
+
     from ateam.gitops import GitError
-    from ateam.plans.model import Plan, PlanHistoryEntry, PlanStatus
+    from ateam.plans.model import Plan, PlanHistoryEntry, PlanReview, PlanStatus
 
     ctx = _context(target)
     if replaces is not None:
@@ -326,6 +330,97 @@ def plan(request: str, tier: str, replaces: str | None, target: Path) -> None:
             click.echo(f"  - {problem}")
         click.echo(f"Re-run: ateam plan \"{request}\"")
         sys.exit(1)
+    sessions = [result.res]
+    if not pr.covered and not no_review:
+        # The review is advisory: whatever happens to its session, the validated plan is kept.
+        exclude = frozenset({replaces}) if replaces else frozenset()
+        review: PlanReview | None = None
+        reason = ""
+        review_res = None
+        try:
+            review_brief = assemble_review_brief(
+                target_root=ctx.paths.root, config=ctx.config, records=records, plans=existing_plans,
+                contracts=load_contracts(ctx.paths.contracts), scratch_dir=ctx.paths.scratch_root / f"{pid}-review",
+                request=request, draft=render_draft(pr), exclude_plans=exclude,
+            )
+            reviewed = asyncio.run(run_investigation(
+                paths=ctx.paths, config=ctx.config, target_git=ctx.git, name=f"{pid}-review", spec=REVIEWER_SPEC,
+                prompt=("Review the Draft plan in your brief against the Request. Read the Rules section first and open the "
+                        "files the contracts name. Fill every field of the report: verdict, findings, notes."),
+                brief_text=review_brief, tier=tiers[tier][Role.investigate], db=ctx.db, tier_name=tier,
+            ))
+        except Exception as e:  # noqa: BLE001  the review session is untrusted; it can never cost the owner the plan
+            reason = f"the session failed: {type(e).__name__}: {e}"
+        else:
+            review_res = reviewed.res
+            sessions.append(review_res)
+            report = review_res.report
+            if reviewed.tampered:
+                reason = "the session changed the checkout or intent repo: " + "; ".join(reviewed.tampered)
+            elif report is None:
+                reason = f"no report, subtype {review_res.subtype}"
+            elif not isinstance(report, dict) or report.get("verdict") not in ("defensible", "needs_revision"):
+                reason = "the report is not a review"
+            else:
+                try:
+                    review = PlanReview.model_validate({
+                        "verdict": report["verdict"], "findings": report.get("findings") or [],
+                        "session_id": review_res.session_id, "cost_usd": review_res.cost_usd,
+                    })
+                except ValidationError:
+                    reason = "the report does not match the review schema"
+        if review is None:
+            click.echo(f"warning: review unavailable ({reason}); the plan is unreviewed")
+            review = PlanReview(verdict="unavailable", session_id=review_res.session_id if review_res else None,
+                                cost_usd=review_res.cost_usd if review_res else 0.0)
+        blocking = [f for f in review.findings if f.severity == "blocking"]
+        if review.verdict == "needs_revision" and blocking:
+            revision_note = ""
+            prompt = ("A staff-engineer review found blocking problems with your plan. Revise the plan to address every "
+                      "blocking and important finding below, keep what was right, and return the complete report again.\n\n"
+                      + "\n".join(f"- {format_finding(f)}" for f in review.findings))
+            try:
+                if not result.res.session_id:
+                    raise RuntimeError("the planner session has no id to resume")
+                revised = asyncio.run(run_investigation(
+                    paths=ctx.paths, config=ctx.config, target_git=ctx.git, name=pid, spec=PLANNER_SPEC, prompt=prompt,
+                    brief_text=brief, tier=tiers[tier][Role.investigate], db=ctx.db, tier_name=tier,
+                    resume=result.res.session_id,
+                ))
+            except Exception as e:  # noqa: BLE001  a failed revision keeps the first valid plan
+                revision_note = f"the session failed: {type(e).__name__}: {e}"
+            else:
+                sessions.append(revised.res)
+                if revised.tampered:
+                    revision_note = "the session changed the checkout or intent repo: " + "; ".join(revised.tampered)
+                elif revised.res.report is None:
+                    revision_note = f"no report, subtype {revised.res.subtype}"
+                else:
+                    try:
+                        pr2 = report_to_plan(revised.res.report, request, pid, ctx.paths.contracts, records, ctx.config,
+                                             ctx.paths.root, ctx.paths.records, tiers=tiers, existing_plans=existing_plans,
+                                             replaces=replaces)
+                    except PlanError as e:
+                        revision_note = "the revised report is not usable: " + "; ".join(e.problems)
+                    else:
+                        if pr2.covered:
+                            revision_note = (f"the revised report calls the request covered by {', '.join(pr2.plan.covered_by)} "
+                                             "instead of revising the plan")
+                        else:
+                            pr = pr2
+                            review = review.model_copy(update={"revised": True})
+            if revision_note:
+                pr.problems.append(f"the planner's revision was discarded ({revision_note}); kept the first plan")
+                click.echo(f"warning: revision discarded ({revision_note}); kept the first plan")
+        pr.plan = pr.plan.model_copy(update={"review": review})
+
+    def _session_lines() -> None:
+        click.echo("")
+        for res in sessions:
+            click.echo(f"session {res.session_id}: {res.num_turns} turns, ${res.cost_usd:.4f}")
+        if len(sessions) > 1:
+            click.echo(f"total cost: ${sum(res.cost_usd for res in sessions):.4f} across {len(sessions)} sessions")
+
     if pr.covered:
         save_plan(ctx.paths.plans, pr.plan)
         covered_msg = f"ateam: plan {pid} covered by {', '.join(pr.plan.covered_by)}"
@@ -336,7 +431,7 @@ def plan(request: str, tier: str, replaces: str | None, target: Path) -> None:
                        f"git -C \"{ctx.paths.intent}\" add plans && git -C \"{ctx.paths.intent}\" commit -m \"{covered_msg}\"")
         ctx.db.transition("feature", pid, "plan_covered", by="ateam", reason=f"covered by {', '.join(pr.plan.covered_by)}")
         click.echo(render_plan_review(pr, tiers))
-        click.echo(f"\nsession {result.res.session_id}: {result.res.num_turns} turns, ${result.res.cost_usd:.4f}")
+        _session_lines()
         return
     for c in pr.contracts:
         save_contract(ctx.paths.contracts, c)
@@ -346,7 +441,7 @@ def plan(request: str, tier: str, replaces: str | None, target: Path) -> None:
     commit_intent(ctx.paths, f"ateam: propose plan {pid}", ["plans", "contracts", "records"])
     ctx.db.transition("feature", pid, "plan_proposed", by="ateam")
     click.echo(render_plan_review(pr, tiers))
-    click.echo(f"\nsession {result.res.session_id}: {result.res.num_turns} turns, ${result.res.cost_usd:.4f}")
+    _session_lines()
 
 
 def _dependency_order(contracts: dict) -> list[str]:

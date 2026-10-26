@@ -30,3 +30,15 @@ def test_plan_new_fields_default_and_hash():
     h = p.content_hash()
     for name, value in (("depends_on_plans", ["P-0002"]), ("files_read", ["a.py"]), ("out_of_scope", ["x"]), ("verification_approach", "run tests")):
         assert p.model_copy(update={name: value}).content_hash() != h, name
+
+
+def test_review_round_trips_and_leaves_content_hash_unchanged():
+    from ateam.plans.model import PlanReview, ReviewFinding
+    p = Plan(id="P-0001", title="T", request="r", contracts=["C-0001"])
+    assert p.review is None
+    assert p.content_hash() == "9946c1c0480fa3267a955ec331f1bb809da3c07c272859dfd7cd0cc03c09087a"   # the hash before reviews existed
+    review = PlanReview(verdict="needs_revision", revised=True, session_id="s2", cost_usd=0.5,
+                        findings=[ReviewFinding(contract="C-0001", severity="blocking", finding="f", suggestion="s")])
+    q = p.model_copy(update={"review": review})
+    assert q.content_hash() == p.content_hash()
+    assert Plan.model_validate(q.model_dump(mode="json")).review == review

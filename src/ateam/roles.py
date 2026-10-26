@@ -338,3 +338,44 @@ PLANNER_SPEC = RoleSpec(
     ),
     report_schema=PLANNER_SCHEMA,
 )
+
+REVIEW_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "verdict": {"type": "string", "enum": ["defensible", "needs_revision"]},
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "contract": {"type": "string"},
+                    "severity": {"type": "string", "enum": ["blocking", "important", "minor"]},
+                    "finding": {"type": "string"},
+                    "suggestion": {"type": "string"},
+                },
+                "required": ["contract", "severity", "finding", "suggestion"],
+            },
+        },
+        "notes": {"type": "string"},
+    },
+    "required": ["verdict", "findings", "notes"],
+}
+
+REVIEWER_SPEC = RoleSpec(
+    role=Role.investigate,
+    tools=_INVESTIGATE_TOOLS,
+    system_prompt=(
+        "ROLE: INVESTIGATE, task: plan review. You are a staff engineer reviewing a draft plan for technical "
+        "defensibility before the owner sees it. The draft is in the Draft plan section of your brief, written for the "
+        "Request section; your brief has no Tiers section. For each contract judge whether the acceptance criteria are "
+        "complete, testable and sufficient for the request; whether the paths are the right files (read them); whether "
+        "the record citations fit; whether the allocation reasoning is justified by the code; whether the checks can run "
+        "in a fresh worktree; and what failure modes are missing. Report each problem as a finding naming the contract id "
+        "(or 'plan' for the plan as a whole), a severity and a concrete suggestion. Severity blocking means the owner "
+        "would be approving something that cannot work or misses the request; important means a real gap the plan should "
+        "close; minor is everything else. Never rewrite the plan yourself; the planner revises it. " + INVESTIGATION_COMMON
+    ),
+    report_schema=REVIEW_SCHEMA,
+)

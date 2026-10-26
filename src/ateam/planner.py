@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+import yaml
 from pydantic import ValidationError
 
 from ateam.allocation import budget_for, check_allocation, default_tiers, investigate_tier_for, tier_for_complexity, tier_for_test
@@ -20,7 +21,7 @@ from ateam.contracts.select import select_records
 from ateam.contracts.store import next_id as next_contract_id
 from ateam.discovery import DiscoveryResult, candidates_to_records, render_discovery_report
 from ateam.globs import is_valid_pattern, matches
-from ateam.plans.model import Plan, PlanHistoryEntry, PlanStatus
+from ateam.plans.model import Plan, PlanHistoryEntry, PlanReview, PlanStatus, ReviewFinding
 from ateam.records.graph import RecordGraph
 from ateam.records.model import Record
 from ateam.roles import Role
@@ -190,6 +191,36 @@ def report_to_plan(
     return PlanResult(plan=plan, contracts=contracts, proposed=proposed, problems=notes, bound_preview=bound_preview)
 
 
+def render_draft(result: PlanResult) -> str:
+    """The draft plan as YAML for the staff-engineer review: what the owner would see, and each contract in full."""
+    p = result.plan
+    data = {
+        "plan": p.model_dump(mode="json", include={
+            "id", "title", "request", "depends_on_plans", "unknowns", "files_read", "out_of_scope", "verification_approach"}),
+        "proposed_records": [r.model_dump(mode="json", include={"id", "kind", "statement", "rationale", "binds"})
+                             for r in result.proposed.proposed],
+        "bound_records": {cid: list(rids) for cid, rids in result.bound_preview.items()},
+        "corrections_and_warnings": list(result.problems),
+        "contracts": [c.model_dump(mode="json") for c in result.contracts],
+    }
+    return yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
+
+
+def format_finding(f: ReviewFinding) -> str:
+    return f"[{f.severity}] {f.contract}: {f.finding.strip().rstrip('.')}. Suggestion: {f.suggestion.strip()}"
+
+
+def render_review(review: PlanReview) -> list[str]:
+    head = f"Review: {review.verdict}"
+    if review.verdict == "unavailable":
+        head += " (the review session failed; this plan is unreviewed)"
+    elif review.revised:
+        head += " (the planner revised the plan once in response; findings refer to the first draft)"
+    lines = [head]
+    lines.extend(f"  - {format_finding(f)}" for f in review.findings)
+    return lines
+
+
 def render_plan_review(result: PlanResult, tiers) -> str:
     p = result.plan
     lines = [f"Plan {p.id}: {p.title}", f"Request: {p.request}", ""]
@@ -238,6 +269,9 @@ def render_plan_review(result: PlanResult, tiers) -> str:
     if p.unknowns:
         lines.append("Open questions:")
         lines.extend(f"  - {u}" for u in p.unknowns)
+        lines.append("")
+    if p.review is not None:
+        lines.extend(render_review(p.review))
         lines.append("")
     if result.problems:
         lines.append("Notes (corrections applied or warnings):")

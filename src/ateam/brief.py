@@ -182,6 +182,23 @@ def _demote_headings(text: str, levels: int = 2) -> str:
     return "\n".join("#" * levels + line if line.startswith("#") else line for line in text.splitlines())
 
 
+def _context_sections(
+    target_root: Path, config: TargetConfig, records: dict[str, Record], plans: dict[str, Plan],
+    contracts: dict[str, Contract], exclude_plans: set[str],
+) -> list[tuple[str, str]]:
+    return [
+        ("Rules", _rules(target_root, config)),
+        (
+            "Records",
+            "Approved (binding; do not re-propose):\n"
+            + _record_lines(records, "approved")
+            + "\n\nProposed, not yet approved (not binding; do not re-propose):\n"
+            + _record_lines(records, "proposed"),
+        ),
+        ("Existing plans and contracts", _plans(plans, contracts, exclude_plans)),
+    ]
+
+
 def assemble_investigation_brief(
     *,
     kind: Literal["discovery", "planning"],
@@ -196,17 +213,7 @@ def assemble_investigation_brief(
     exclude_plans: set[str] = frozenset(),
 ) -> str:
     """The brief an INVESTIGATE session starts with: the target's rules, records, plan index, checks and handoff path."""
-    sections = [
-        ("Rules", _rules(target_root, config)),
-        (
-            "Records",
-            "Approved (binding; do not re-propose):\n"
-            + _record_lines(records, "approved")
-            + "\n\nProposed, not yet approved (not binding; do not re-propose):\n"
-            + _record_lines(records, "proposed"),
-        ),
-        ("Existing plans and contracts", _plans(plans, contracts, exclude_plans)),
-    ]
+    sections = _context_sections(target_root, config, records, plans, contracts, exclude_plans)
     if kind == "planning":
         sections.append(("Request", _demote_headings((request or "").strip())))
     else:
@@ -215,6 +222,30 @@ def assemble_investigation_brief(
     sections += [
         ("Checks", "\n".join(f"{c.name}: {c.cmd}" for c in config.checks) or "none configured"),
         ("Tiers", "light, standard, careful; investigate may also be none."),
+        ("Rubric", _demote_headings(rubric_text().strip())),
+        ("Handoff file", str(scratch_dir / "handoff.yaml")),
+    ]
+    return "\n\n".join(f"## {h}\n{body}" for h, body in sections) + "\n"
+
+
+def assemble_review_brief(
+    *,
+    target_root: Path,
+    config: TargetConfig,
+    records: dict[str, Record],
+    plans: dict[str, Plan],
+    contracts: dict[str, Contract],
+    scratch_dir: Path,
+    request: str,
+    draft: str,
+    exclude_plans: set[str] = frozenset(),
+) -> str:
+    """The brief for the staff-engineer review: the planner's context, the draft plan, and no Tiers section."""
+    sections = _context_sections(target_root, config, records, plans, contracts, exclude_plans)
+    sections += [
+        ("Request", _demote_headings(request.strip())),
+        ("Draft plan", _demote_headings(draft.strip())),
+        ("Checks", "\n".join(f"{c.name}: {c.cmd}" for c in config.checks) or "none configured"),
         ("Rubric", _demote_headings(rubric_text().strip())),
         ("Handoff file", str(scratch_dir / "handoff.yaml")),
     ]
