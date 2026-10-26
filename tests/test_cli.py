@@ -2179,3 +2179,13 @@ def test_refresh_result_file(monkeypatch, cli_target, tmp_path):
     _mark_verified(p, cli_target, "C-0002")
     r = run("contracts", "refresh", "--result-file", str(out), "--target", str(cli_target))
     assert r.exit_code == 0 and _read(out) == {"code": 0, "promoted": ["C-0003"], "drifted": []}
+
+
+def test_result_file_records_an_interrupt(tmp_path):
+    import json
+    from ateam.cli import _Result
+    out = tmp_path / "i.json"
+    with pytest.raises(KeyboardInterrupt):
+        with _Result(out, {"outcome": "refused", "status": "refused"}):
+            raise KeyboardInterrupt
+    assert json.loads(out.read_text()) == {"code": 130, "outcome": "interrupted", "status": "interrupted"}

@@ -86,6 +86,9 @@ class _Result:
 
             code = (exc.code if exc.code is not None else 0) if isinstance(exc, SystemExit) else (0 if exc is None else 1)
             data = {"code": code, **self.data}
+            if isinstance(exc, KeyboardInterrupt):   # Ctrl-C: never to be read as a refusal (owner, 2026-10-26)
+                data["code"] = 130
+                data.update({k: "interrupted" for k in ("outcome", "status") if k in data})
             if _LAST_FAIL and "reasons" in data and not data["reasons"]:
                 data["reasons"] = list(_LAST_FAIL)
             if _LAST_FAIL and "error" in data and data["error"] is None:
