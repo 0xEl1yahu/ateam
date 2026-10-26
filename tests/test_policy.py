@@ -212,7 +212,7 @@ INVESTIGATE_MUST_ALLOW = [
     "find src -name '*.py'",
 ]
 
-CD_WORKTREE_REASON = "workers may cd only to an absolute path inside the worktree"
+CD_WORKTREE_REASON = "workers may cd only to an absolute path inside the worktree or its scratch directory"
 
 INVESTIGATE_CD_DENY = [
     "cd",
@@ -375,13 +375,12 @@ def test_shell_writes_to_own_scratch_allowed_under_real_home_layout(real_layout)
         f"cat > {scratch}/handoff.yaml <<'EOF'\nprogress: x\nEOF",
         f"python3 -m pytest > {scratch}/pytest.log",
         f"mkdir -p {scratch}/out",
+        f"cd {scratch} && ls",
         f"cat {scratch}/handoff.yaml",
     ):
         ok, reason = pol.command_allowed(cmd)
         assert ok, f"{cmd!r}: {reason}"
     assert pol.path_writable_abs(str(scratch / "handoff.yaml"))[0]
-    # Owner, 2026-10-26: BUILD and TEST cd only inside the worktree; the scratch dir is reached by absolute paths
-    assert pol.command_allowed(f"cd {scratch} && ls") == (False, CD_WORKTREE_REASON)
 
 
 def test_home_denial_covers_env_tilde_traversal_and_spelling(real_layout, tmp_path):
@@ -1195,3 +1194,54 @@ def test_build_residual_lookalikes_allowed(policy_build, cmd):
 @pytest.mark.parametrize("cmd", ["c=rm; $c x", "$(echo rm) x"])
 def test_build_runtime_residuals(policy_build, cmd):
     assert policy_build.command_allowed(cmd) == (False, RM_REASON)
+
+
+# ---- Task 11 follow-up (controller ruling, 2026-10-26): the worker's scratch dir is a cd target for every role,
+# alongside the worktree; relative paths from it meet the home check.
+
+SCRATCH_LEAVE_REASON = "paths that leave your scratch directory are not allowed"
+
+
+@pytest.fixture(params=[Role_ for Role_ in ("build", "test", "investigate")])
+def scratch_layout(request, tmp_path, monkeypatch):
+    from ateam.paths import TargetPaths
+    from ateam.roles import Role
+    from ateam.runner.policy import Policy
+
+    monkeypatch.setenv("ATEAM_HOME", str(tmp_path / ".ateam"))
+    target = tmp_path / "proj"; (target / "src").mkdir(parents=True)
+    paths = TargetPaths.from_root(target)
+    scratch = paths.scratch_root / "C-0001"; (scratch / "out").mkdir(parents=True)
+    paths.intent.mkdir(parents=True, exist_ok=True)
+    (paths.intent / "config.yaml").write_text("x: 1")
+    pol = Policy(worktree=target, role=Role(request.param), allowed_paths=["src/**"], protected=[".claude/**"], bound={},
+                 scratch_dir=scratch, ateam_home=tmp_path / ".ateam")
+    return pol, paths, scratch
+
+
+def test_cd_into_scratch_allowed_for_every_role(scratch_layout):
+    pol, paths, scratch = scratch_layout
+    for cmd in (f"cd {scratch} && ls", f"cd {scratch}/out && ls", f"pushd {scratch}; ls"):
+        ok, reason = pol.command_allowed(cmd)
+        assert ok, (pol.role, cmd, reason)
+
+
+def test_cd_leaving_scratch_or_into_home_denied(scratch_layout):
+    pol, paths, scratch = scratch_layout
+    assert pol.command_allowed(f"cd {scratch}/.. && ls") == (False, SCRATCH_LEAVE_REASON)
+    assert pol.command_allowed(f"cd {paths.intent} && ls") == (False, HOME_REASON)
+    assert pol.command_allowed(f"cd {scratch}x && ls")[0] is False      # a sibling that only shares the prefix
+
+
+def test_relative_reads_from_scratch_meet_the_home_check(scratch_layout):
+    pol, paths, scratch = scratch_layout
+    assert pol.command_allowed(f"cd {scratch} && cat ../../intent/config.yaml") == (False, HOME_REASON)
+    assert pol.command_allowed(f"cd {scratch}")[0]
+    assert pol.command_allowed("cat ../../intent/config.yaml") == (False, HOME_REASON)
+
+
+def test_cd_into_scratch_through_a_symlink_out_denied(scratch_layout, tmp_path):
+    pol, paths, scratch = scratch_layout
+    outside = tmp_path / "elsewhere"; outside.mkdir()
+    (scratch / "link").symlink_to(outside, target_is_directory=True)
+    assert pol.command_allowed(f"cd {scratch}/link && ls") == (False, CD_WORKTREE_REASON)

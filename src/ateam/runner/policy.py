@@ -78,7 +78,7 @@ _SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "mksh"}
 _NESTING_LIMIT = 8   # eval and shell -c bodies are re-lexed this deep; deeper is denied
 _READ_TOOL_HINT_WORDS = {"sed", "awk", "python", "python3", "perl", "ruby", "node"}
 _CD = re.compile(r"^\s*(?:cd|pushd)\b")
-CD_WORKTREE_REASON = "workers may cd only to an absolute path inside the worktree"  # every role; see Policy._cd_target
+CD_WORKTREE_REASON = "workers may cd only to an absolute path inside the worktree or its scratch directory"  # every role; see Policy._cd_target
 NESTING_REASON = "eval or shell -c nested too deeply to check"
 _GIT_BRANCH = re.compile(r"^\s*git\s+branch\b(?P<rest>.*)$")
 
@@ -950,7 +950,8 @@ class Policy:
         Every role (owner, 2026-10-26). Absolute paths only: the Bash tool keeps its working directory between
         calls and the policy never knows it, so a relative target (or a `..` after a symlinked cd) cannot be judged.
         Exactly one argument, no redirection, no expansion; both the textual (bash `cd -L`) and the resolved form
-        must be an existing directory inside the worktree.
+        must be an existing directory inside the worktree, or both inside the worker's scratch dir (controller
+        ruling, 2026-10-26: the one writable place outside the worktree).
         """
         args = _cd_args(seg.words)
         if args is None or len(args) != 1 or re.search(r"[<>]", seg.text):
@@ -959,12 +960,14 @@ class Policy:
         if not arg.startswith("/") or _WILDCARD.search(arg) or "$" in arg or "`" in arg:
             return None
         logical, physical = Path(os.path.normpath(arg)), Path(arg).resolve()
-        if not (self._inside_worktree(logical) and self._inside_worktree(physical)):
+        roots = [self.worktree] + ([self.scratch_dir] if self.scratch_dir is not None else [])
+        if not any(self._inside(logical, root) and self._inside(physical, root) for root in roots):
             return None
         return logical, physical
 
-    def _inside_worktree(self, path: Path) -> bool:
-        return path.is_dir() and any(r == path or r in path.parents for r in {self.worktree, self.worktree.resolve()})
+    def _inside(self, path: Path, root: Path) -> bool:
+        """path is an existing directory at or under root (either spelling of root)."""
+        return path.is_dir() and any(r == path or r in path.parents for r in {root, root.resolve()})
 
     def _all_segments(self, segments: list[_Segment], depth: int = 0) -> list[_Segment] | None:
         """The segments plus, after each, the segments of the literal shell code it runs through eval or a shell's

@@ -12,9 +12,13 @@ def test_clean_env_strips_claude(monkeypatch):
     assert e["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1" and e["PATH"] == "/usr/bin"
 
 
-def test_clean_env_strips_cdpath(monkeypatch):
+def test_clean_env_strips_cdpath_and_startup_files(monkeypatch):
+    # bash reads BASH_ENV in non-interactive shells, and ENV in sh mode: either could redefine cd or rm
     monkeypatch.setenv("CDPATH", "/tmp:/")
-    assert "CDPATH" not in clean_env()
+    monkeypatch.setenv("BASH_ENV", "/tmp/funcs.sh")
+    monkeypatch.setenv("ENV", "/tmp/funcs.sh")
+    e = clean_env()
+    assert "CDPATH" not in e and "BASH_ENV" not in e and "ENV" not in e
 
 
 def test_worker_options_clean_room(policy_build, tmp_path):

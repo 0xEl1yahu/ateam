@@ -97,7 +97,7 @@ ateam status
 
 A worker refuses to start (exit code 4) unless the contract is frozen, unchanged since the freeze, in a runnable state, and none of its frozen records have changed. `ateam contracts validate` reports hand edits and record drift; `ateam contracts freeze --force` re-freezes deliberately. Workers refuse to run in the target checkout itself: `--cwd` must be a worktree of the target, outside it.
 
-The worker's handoff notes live in its scratch directory under `~/.ateam/<repo-id>/scratch/<contract-id>/`, never in the worktree, so nothing of ATeam's ever appears in `git status` of the target. Workers may not run `rm` at all; a tracked file is removed with `git rm`, which shows in the diff, and cleanup belongs to integration. Workers run under `/bin/bash`; the policy's shell model is bash 3.2 and 5.x.
+The worker's handoff notes live in its scratch directory under `~/.ateam/<repo-id>/scratch/<contract-id>/`, never in the worktree, so nothing of ATeam's ever appears in `git status` of the target. Workers may not run `rm` at all; a tracked file is removed with `git rm`, which shows in the diff, and cleanup belongs to integration. Workers run under `/bin/bash` with `BASH_ENV` and `ENV` removed; the policy's shell model is bash 3.2 and 5.x. Functions and aliases that Claude Code carries over from your shell profile are not controlled by the policy.
 
 ## Layout
 

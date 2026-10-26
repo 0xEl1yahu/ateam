@@ -44,7 +44,7 @@ Adapted from the Claude Code team's own published practices (Boris Cherny's "how
 - Test first. Every behaviour change starts with a failing test you watched fail. Table-driven tests for the policy (`tests/test_policy.py`) are the place for new deny and allow strings.
 - Worker sessions use the clean room (`setting_sources=[]`, strict MCP config, slash commands off, auto-memory off, permission mode `default`). Never `--bare`: it does not authenticate with a claude.ai login.
 - Never `str.strip()` the output of `git status --porcelain`.
-- INVESTIGATE may `cd` only to a directory inside its worktree; `tests/test_policy.py` holds the allow and deny strings.
+- Workers may `cd` only to an absolute path inside their worktree or their scratch directory; `tests/test_policy.py` holds the allow and deny strings.
 - Approval commits in a target stage only `.ateam/` paths and use the `ateam:` message prefix.
 - This repo is nested inside an unrelated parent git repo at `~/Documents/GitHub`. Confirm `git rev-parse --show-toplevel` ends in `/ateam` before any git command; never stage the parent.
 - `docs/2026-10-25-product-*.md` were written by another session; leave them unless asked.
