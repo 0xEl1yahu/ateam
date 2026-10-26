@@ -942,7 +942,7 @@ def test_plan_blocking_review_triggers_one_revision(monkeypatch, cli_target):
     revision = calls[2]
     assert revision["name"] == "P-0001" and revision["resume"] == "plan-1" and calls[0]["resume"] is None
     assert revision["prompt"].startswith(
-        "A staff-engineer review found blocking problems with your plan. Revise the plan to address every blocking and "
+        "A staff-engineer review found problems with your plan. Revise the plan to address every blocking and "
         "important finding below, keep what was right, and return the complete report again.\n\n")
     assert "- [blocking] C-0002: no test for the error path. Suggestion: add one" in revision["prompt"]
     stored = _stored_plan(cli_target)
@@ -957,16 +957,27 @@ def test_plan_blocking_review_triggers_one_revision(monkeypatch, cli_target):
     assert "no test for the error path" in r.output
 
 
-def test_plan_important_only_review_does_not_revise(monkeypatch, cli_target):
+def test_plan_important_review_triggers_one_revision(monkeypatch, cli_target):
+    # owner, 2026-10-26: blocking or important findings earn the one revision round
     review = {"verdict": "needs_revision", "notes": "n", "findings": [
         {"contract": "C-0002", "severity": "important", "finding": "port is unstated", "suggestion": "name it"}]}
+    calls = _review_investigation(monkeypatch, [_canned_plan(), _canned_plan()], review)
+    r = run("plan", "add a health function", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert [c["kind"] for c in calls] == ["plan", "review", "plan"]
+    assert "- [important] C-0002: port is unstated. Suggestion: name it" in calls[2]["prompt"]
+    stored = _stored_plan(cli_target)
+    assert stored.review.revised is True and stored.review.findings[0].finding == "port is unstated"
+
+
+def test_plan_minor_only_review_is_not_revised(monkeypatch, cli_target):
+    review = {"verdict": "needs_revision", "notes": "n", "findings": [
+        {"contract": "C-0002", "severity": "minor", "finding": "terse title", "suggestion": "rename"}]}
     calls = _review_investigation(monkeypatch, [_canned_plan()], review)
     r = run("plan", "add a health function", "--target", str(cli_target))
     assert r.exit_code == 0, r.output
     assert [c["kind"] for c in calls] == ["plan", "review"]
-    stored = _stored_plan(cli_target)
-    assert stored.review.revised is False and stored.review.findings[0].finding == "port is unstated"
-    assert "[important] C-0002: port is unstated" in r.output
+    assert _stored_plan(cli_target).review.revised is False and "[minor] C-0002: terse title" in r.output
 
 
 @pytest.mark.parametrize("failure", ["tamper", "crash", "no_report", "malformed"])

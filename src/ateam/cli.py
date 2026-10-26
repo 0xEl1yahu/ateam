@@ -453,10 +453,11 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
             review = PlanReview(verdict="unavailable", notes=reason, session_id=review_res.session_id if review_res else None,
                                 cost_usd=review_res.cost_usd if review_res else 0.0)
         progress["review"] = review
-        if review.verdict != "needs_revision" or not any(f.severity == "blocking" for f in review.findings):
+        # one revision round for blocking or important findings (owner, 2026-10-26); minor ones travel with the plan
+        if review.verdict != "needs_revision" or not any(f.severity in ("blocking", "important") for f in review.findings):
             return pr, review
         revision_note = ""
-        prompt = ("A staff-engineer review found blocking problems with your plan. Revise the plan to address every "
+        prompt = ("A staff-engineer review found problems with your plan. Revise the plan to address every "
                   "blocking and important finding below, keep what was right, and return the complete report again.\n\n"
                   + "\n".join(f"- {format_finding(f)}" for f in review.findings))
         try:
