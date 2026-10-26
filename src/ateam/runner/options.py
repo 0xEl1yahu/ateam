@@ -13,9 +13,11 @@ from ateam.tiers import TierSpec
 
 
 def clean_env() -> dict[str, str]:
-    """The parent environment minus every CLAUDE* variable and CDPATH, with auto-memory disabled."""
+    """The parent environment minus every CLAUDE* variable and CDPATH, with auto-memory disabled and the Bash tool
+    on /bin/bash (the policy models bash grammar; the login shell may be zsh)."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE") and k != "CDPATH"}  # CDPATH would redirect a bare `cd name`
     env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
+    env["SHELL"] = env["CLAUDE_CODE_SHELL"] = "/bin/bash"   # CLAUDE_CODE_SHELL overrides Claude Code's shell detection
     return env
 
 

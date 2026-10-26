@@ -104,6 +104,7 @@ Three failure classes, each with its own mechanism:
 - **A request already covered by an existing plan is a `plan_covered` outcome, not a rejection.** `ateam plan --replaces P-xxxx` hides that plan from the planner and marks it `superseded` when the new plan is approved. (Owner, 2026-10-25.)
 - **BUILD and TEST `cd` only to an absolute path inside the worktree**, like INVESTIGATE, so the home check can resolve relative paths from every directory a worker enters. A relative `cd`, `cd` alone, `cd -` and any target outside the worktree are denied for every role with one reason: "workers may cd only to an absolute path inside the worktree". (Owner, 2026-10-26.)
 - **Three INVESTIGATE allow rows from the lexer round stand**: an escaped `"\$(x)"`, an escaped `` "\`" `` inside double quotes, and a `$(...)` inside a comment are text, not substitutions. (Owner, 2026-10-26.)
+- **Workers run under `/bin/bash`.** The policy's shell model is bash (3.2 and 5.x); the worker environment sets `SHELL` and `CLAUDE_CODE_SHELL` to `/bin/bash` so the Bash tool does not run the login shell (zsh on macOS). (Owner, 2026-10-26.)
 - **`c=rm; $c x` and `$(echo rm) x` stay BUILD residuals**, backed by the post-run tree check: the command word is made at run time, which no pre-run lexer can see. They are pinned as strict expected failures in the policy tests. (Owner, 2026-10-26.)
 
 ## Calls made by the assistant (owner to check)

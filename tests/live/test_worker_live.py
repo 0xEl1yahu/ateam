@@ -50,10 +50,12 @@ async def test_build_worker_end_to_end(live_target):
     wt_git = GitRepo(t["wt"])
     base = wt_git.head()
     tiers = load_tiers({"light": {"build": {"max_turns": 10, "usd": 0.5}}})
+    shell_out = t["paths"].scratch_root / t["contract"].id / "shell.txt"
     res, tree, scope, cp = await run_contract_attempt(
         paths=t["paths"], config=t["config"], git_worktree=wt_git, worktree=t["wt"], base=base,
         contract=t["contract"], records=t["records"], role=Role.build, tiers=tiers, db=t["db"],
-        prompt="Implement the contract: add the comment line as the first line of src/api/x.py, update the handoff file named in your brief, commit in this worktree, then report.",
+        prompt=("First run exactly this Bash command: echo \"$BASH_VERSION|$ZSH_VERSION\" > " + str(shell_out) + "\n"
+                "Then implement the contract: add the comment line as the first line of src/api/x.py, update the handoff file named in your brief, commit in this worktree, then report."),
     )
     print("\nsubtype", res.subtype, "turns", res.num_turns, "cost", res.cost_usd, "denials", res.denials)
     print("report", res.report)
@@ -63,3 +65,6 @@ async def test_build_worker_end_to_end(live_target):
     assert t["db"].telemetry_rows()[-1]["outcome"] == "completed"
     assert cp.notes is not None
     assert res.cost_usd < 0.05
+    # workers run under /bin/bash (owner, 2026-10-26): the shell itself wrote this line, not the model
+    bash_version, zsh_version = shell_out.read_text().strip().split("|")
+    assert bash_version and bash_version[0].isdigit() and zsh_version == "", shell_out.read_text()

@@ -29,3 +29,14 @@ def test_worker_options_clean_room(policy_build, tmp_path):
     assert o.model == "haiku" and o.effort == "low" and o.max_turns == 10 and o.max_budget_usd == 0.5
     assert o.env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1" and o.resume is None
     assert worker_options(cwd=tmp_path, spec=spec, brief_text="B", policy=policy_build, tier=TierSpec("haiku", "low", 10, 0.5), resume="s1").resume == "s1"
+
+
+def test_clean_env_runs_workers_under_bash(monkeypatch, policy_build, tmp_path):
+    # The Bash tool otherwise runs the login shell (zsh on macOS); the policy models bash grammar. CLAUDE_CODE_SHELL overrides
+    # Claude Code's own shell detection, which need not follow SHELL; both are set after the CLAUDE* scrub. Owner, 2026-10-26.
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    monkeypatch.setenv("CLAUDE_CODE_SHELL", "/bin/zsh")
+    e = clean_env()
+    assert e["SHELL"] == "/bin/bash" and e["CLAUDE_CODE_SHELL"] == "/bin/bash"
+    o = worker_options(cwd=tmp_path, spec=ROLE_SPECS[Role.build], brief_text="B", policy=policy_build, tier=TierSpec("haiku", "low", 10, 0.5))
+    assert o.env["SHELL"] == "/bin/bash" and o.env["CLAUDE_CODE_SHELL"] == "/bin/bash"
