@@ -20,6 +20,15 @@ acceptance:
   - id: A3
     statement: No code path infers reading state (R-0001)
     check: {type: judgment}     # decided by the TEST worker with evidence
+interfaces:                     # exact shapes this contract produces and consumes; frozen with it, so a worker follows them as written
+  - kind: produces
+    name: set_reading_state
+    signature: "set_reading_state(book_id: int, state: str) -> Book"
+    note: raises ValueError for an unknown state
+  - kind: consumes
+    name: get_book
+    signature: "get_book(book_id: int) -> Book"
+    note: existing, src/data/books.py
 checks:                         # deterministic checks run in the worktree
   - {name: unit, cmd: "python -m pytest -q"}
 allocation:

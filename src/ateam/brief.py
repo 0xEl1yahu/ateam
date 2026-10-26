@@ -51,6 +51,10 @@ def _task(contract: Contract, scratch_dir: Path | None) -> str:
     for a in contract.acceptance:
         how = f"{a.check.type}" + (f" {a.check.ref}" if a.check.ref else "")
         lines.append(f"- {a.id}: {a.statement}  [{how}]")
+    if contract.interfaces:
+        lines.append("")
+        lines.append("Interfaces (follow these exactly; other contracts depend on them):")
+        lines += [f"- {i.kind}: {_one_line(i.signature)}" + (f"  ({_one_line(i.note)})" if i.note else "") for i in contract.interfaces]
     if contract.checks:
         lines.append("")
         lines.append("Deterministic checks:")
@@ -164,6 +168,7 @@ def _plan_block(p: Plan, contracts: dict[str, Contract]) -> str:
         lines.append(f"  {c.id} {c.status}  {_one_line(c.title)}")
         lines.append(f"    paths: {', '.join(c.paths)}")
         lines += [f"    {a.id}: {_one_line(a.statement)}" for a in c.acceptance]
+        lines += [f"    {i.kind}: {_one_line(i.signature)}" for i in c.interfaces]
     text = "\n".join(lines)
     if len(text) > PLAN_INDEX_CAP:
         text = text[:PLAN_INDEX_CAP] + f"\n[truncated at {PLAN_INDEX_CAP} characters]"

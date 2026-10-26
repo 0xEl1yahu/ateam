@@ -27,7 +27,7 @@ def test_discovery_and_planner_specs_are_investigate_and_strict():
     assert set(PLANNER_SCHEMA["properties"]) == {"title", "contracts", "proposed_records", "unknowns", "notes",
                                                          "depends_on_plans", "files_read", "out_of_scope", "verification_approach"}
     c = PLANNER_SCHEMA["properties"]["contracts"]["items"]["properties"]
-    assert set(c) == {"title", "paths", "incidental", "depends_on", "acceptance", "checks", "allocation", "budget"}
+    assert set(c) == {"title", "paths", "incidental", "depends_on", "acceptance", "checks", "allocation", "budget", "interfaces"}
     assert c["depends_on"]["items"]["type"] == "integer"
 
 

@@ -15,7 +15,7 @@ from ateam.config import NamedCheck
 CONTRACT_ID_RE = re.compile(r"^C-\d{4}$")
 
 __all__ = [
-    "Acceptance", "Allocation", "Budget", "Check", "Contract", "ContractStatus", "Level", "NamedCheck", "RecordRef",
+    "Acceptance", "Allocation", "Budget", "Check", "Contract", "ContractStatus", "Interface", "Level", "NamedCheck", "RecordRef",
 ]
 
 
@@ -47,6 +47,13 @@ class Acceptance(BaseModel):
     check: Check
 
 
+class Interface(BaseModel):
+    kind: Literal["produces", "consumes"]
+    name: str
+    signature: str
+    note: str = ""
+
+
 class Allocation(BaseModel):
     complexity: Level
     risk: Level
@@ -76,12 +83,14 @@ class Contract(BaseModel):
     incidental: list[str] = Field(default_factory=list)
     records: list[RecordRef] = Field(default_factory=list)
     acceptance: list[Acceptance]
+    interfaces: list[Interface] = Field(default_factory=list)
     checks: list[NamedCheck] = Field(default_factory=list)
     allocation: Allocation
     budget: Budget = Field(default_factory=Budget)
 
     def content_hash(self) -> str:
-        data = json.loads(self.model_dump_json(exclude={"status"}))
+        # interfaces are binding; an empty list is left out so contracts frozen before the field existed keep their hash
+        data = json.loads(self.model_dump_json(exclude={"status"} | (set() if self.interfaces else {"interfaces"})))
         return hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     def slug(self) -> str:

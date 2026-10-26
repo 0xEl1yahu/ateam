@@ -45,3 +45,8 @@ def test_plan_example_loads():
 
     p = Plan.model_validate(yaml.safe_load((EXAMPLES / "plan.example.yaml").read_text()))
     assert p.id == "P-0001" and p.contracts and p.status == "plan_proposed"
+
+
+def test_examples_carry_interfaces():
+    c = Contract.model_validate(yaml.safe_load((EXAMPLES / "contract.example.yaml").read_text()))
+    assert {i.kind for i in c.interfaces} == {"produces", "consumes"}

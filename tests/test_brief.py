@@ -241,3 +241,25 @@ def test_review_brief_excludes_replaced_plan(target_repo, tmp_path):
     text = _review(target_repo, tmp_path, plans=plans, exclude_plans=frozenset({"P-0001"}))
     index = text.split("## Existing plans and contracts\n")[1].split("\n## ")[0]
     assert "P-0001" not in index and "P-0002" in index
+
+
+def _with_interfaces(c):
+    from ateam.contracts.model import Interface
+    return c.model_copy(update={"interfaces": [
+        Interface(kind="produces", name="integrate", signature="integrate(plan_id: str) -> MergeProposal"),
+        Interface(kind="consumes", name="load_plan", signature="load_plan(id: str)\n -> Plan")]})
+
+
+def test_worker_brief_lists_interfaces(sample_contract):
+    text = render_brief(assemble_brief(_with_interfaces(sample_contract), [], None, Role.build))
+    assert "Interfaces (follow these exactly" in text
+    assert "- produces: integrate(plan_id: str) -> MergeProposal" in text
+    assert "- consumes: load_plan(id: str) -> Plan" in text
+    assert "Interfaces" not in render_brief(assemble_brief(sample_contract, [], None, Role.build))
+
+
+def test_plan_index_lists_interfaces(target_repo, tmp_path, sample_contract):
+    c = _with_interfaces(sample_contract)
+    plan = _plan_with_unknowns().model_copy(update={"contracts": [c.id]})
+    text = _inv(target_repo, tmp_path, plans={plan.id: plan}, contracts={c.id: c})
+    assert "    produces: integrate(plan_id: str) -> MergeProposal\n    consumes: load_plan(id: str) -> Plan" in text

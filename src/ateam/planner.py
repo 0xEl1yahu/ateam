@@ -16,7 +16,7 @@ from pydantic import ValidationError
 
 from ateam.allocation import budget_for, check_allocation, default_tiers, investigate_tier_for, tier_for_complexity, tier_for_test
 from ateam.config import TargetConfig
-from ateam.contracts.model import Acceptance, Allocation, Budget, Contract, ContractStatus, Level
+from ateam.contracts.model import Acceptance, Allocation, Budget, Contract, ContractStatus, Interface, Level
 from ateam.contracts.select import select_records
 from ateam.contracts.store import next_id as next_contract_id
 from ateam.discovery import DiscoveryResult, candidates_to_records, render_discovery_report
@@ -63,6 +63,63 @@ def _has_cycle(raw: list[dict]) -> bool:
             if indeg[j] == 0:
                 queue.append(j)
     return seen != n
+
+
+_TEXT_SEARCH_CAP = 2_000_000
+
+
+def _search_text(repo_root: Path, globs: list[str], files: list[str]) -> str:
+    """Plain text of the files a name could live in: the contract's paths plus the files the planner read."""
+    seen: dict[Path, None] = {}
+    root = repo_root.resolve()
+    for g in globs:
+        pattern = g[:-2] + "**/*" if g.endswith("**") else g   # pathlib's trailing ** matches directories only
+        try:
+            for f in root.glob(pattern):
+                if f.is_file():
+                    seen[f] = None
+        except (ValueError, NotImplementedError, OSError):
+            continue
+    for rel in files:
+        f = (root / rel).resolve()
+        if f.is_relative_to(root) and f.is_file():
+            seen[f] = None
+    parts: list[str] = []
+    total = 0
+    for f in seen:
+        try:
+            text = f.read_text(errors="replace")
+        except OSError:
+            continue
+        total += len(text)
+        if total > _TEXT_SEARCH_CAP:
+            break
+        parts.append(text)
+    return "\n".join(parts)
+
+
+def _interface_notes(raw: list[dict], ids: list[str], interfaces: list[list[Interface]], repo_root: Path, files_read: list[str]) -> list[str]:
+    notes: list[str] = []
+    produced: dict[str, tuple[str, str]] = {}   # name -> (contract id, signature), from earlier contracts only
+    for i, ifs in enumerate(interfaces):
+        text: str | None = None
+        for itf in ifs:
+            if itf.kind != "consumes":
+                continue
+            prior = produced.get(itf.name)
+            if prior is not None:
+                if " ".join(prior[1].split()) != " ".join(itf.signature.split()):
+                    notes.append(f"{ids[i]} consumes `{itf.signature}` but {prior[0]} produces `{prior[1]}`")
+                continue
+            if text is None:
+                scope = [*raw[i].get("paths", []), *raw[i].get("incidental", [])]
+                text = _search_text(repo_root, scope, files_read)
+            if itf.name not in text:
+                notes.append(f"{ids[i]} consumes `{itf.name}` which no contract produces and the code does not define")
+        for itf in ifs:
+            if itf.kind == "produces":
+                produced[itf.name] = (ids[i], itf.signature)
+    return notes
 
 
 def report_to_plan(
@@ -128,12 +185,14 @@ def report_to_plan(
     start = int(next_contract_id(contracts_dir).split("-")[1])
     ids = [f"C-{start + i:04d}" for i in range(len(raw))]
     contracts: list[Contract] = []
+    all_interfaces: list[list[Interface]] = []
     for i, c in enumerate(raw):
         cid = ids[i]
         try:
             alloc = Allocation.model_validate(c["allocation"])
             acceptance = [Acceptance.model_validate(a) for a in c.get("acceptance", [])]
             given_budget = Budget.model_validate(c["budget"]) if c.get("budget") else None
+            interfaces = [Interface.model_validate(x) for x in c.get("interfaces", [])]
         except (ValidationError, KeyError) as e:
             raise PlanError([f"{cid} ({c.get('title', '?')}): {str(e).splitlines()[0]}"]) from e
         defaults = default_tiers(alloc)
@@ -167,11 +226,14 @@ def report_to_plan(
                 file_part = a.check.ref.split("::")[0]
                 if not any(matches(g, file_part) for g in scope):
                     notes.append(f"{cid}: acceptance {a.id} names {file_part}, outside the contract's paths; a BUILD worker could not write it")
+        all_interfaces.append(interfaces)
         contracts.append(Contract(
             id=cid, plan=plan_id, title=c["title"], status=ContractStatus.draft,
             depends_on=list(dict.fromkeys(ids[d] for d in c.get("depends_on", []))), paths=list(c["paths"]), incidental=list(c.get("incidental", [])),
-            acceptance=acceptance, checks=[known_checks[n] for n in c.get("checks", [])], allocation=alloc, budget=budget,
+            acceptance=acceptance, interfaces=interfaces, checks=[known_checks[n] for n in c.get("checks", [])], allocation=alloc, budget=budget,
         ))
+
+    notes.extend(_interface_notes(raw, ids, all_interfaces, repo_root, list(report.get("files_read") or [])))
 
     proposed = candidates_to_records(
         list(report.get("proposed_records") or []), list(report.get("unknowns") or []), records, repo_root, records_dir,
@@ -246,6 +308,9 @@ def render_plan_review(result: PlanResult, tiers) -> str:
         for acc in c.acceptance:
             how = acc.check.type + (f" {acc.check.ref}" if acc.check.ref else "")
             lines.append(f"  - {acc.id}: {acc.statement}  [{how}]")
+        if c.interfaces:
+            lines.append("  interfaces:")
+            lines += [f"    {itf.kind}: {itf.signature}" + (f"  ({itf.note})" if itf.note else "") for itf in c.interfaces]
         lines.append("  checks: " + (", ".join(ch.name for ch in c.checks) or "none"))
         lines.append(f"  complexity: {a.complexity}   risk: {a.risk}   uncertainty: {a.uncertainty}")
         lines.append(f"  reasoning: {a.reasoning.strip()}")
