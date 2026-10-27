@@ -47,6 +47,7 @@ Adapted from the Claude Code team's own published practices (Boris Cherny's "how
 - Workers may `cd` only to an absolute path inside their worktree or their scratch directory; `tests/test_policy.py` holds the allow and deny strings.
 - Scheduler worktrees live under ATeam's home (<home>/worktrees/<cid>); policy tests for home reads must include a worktree under the home, not only one outside it.
 - Never signal a process group ATeam did not create; the scheduler interrupts its own children by pid.
+- A test of a failed git commit must fail it after staging (a real failing hook), not before `git add`; a commit that fails before staging hides the case where files stay staged and `git checkout --` restores nothing.
 - The policy pre-guard guards against slop and accidents, not adversaries. Grade a bypass by ordinary usage: a careless session's path to `rm`, a write outside its paths or a read of ATeam's home is Important; a contrived encoding is Minor and a listed residual unless the fix is a few lines. One fix round on exotic shell grammar, then ask the owner.
 - A new worktree's `.venv` comes from the python.org interpreter (`/Library/Frameworks/Python.framework/Versions/3.14/bin/python3.14 -m venv`); the `python3.14` first on PATH here makes venvs without a standard library.
 - In `cli_target`, C-0001 is the seed fixture: its `plan` says P-0001 but no plan lists it. Contracts of a plan made in a test start at C-0002; never test a plan's contracts through C-0001.
