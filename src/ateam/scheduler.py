@@ -257,27 +257,30 @@ def run_plan(ctx_factory: Callable[[], object], plan_id: str, echo: Callable[[st
     launch = launch if launch is not None else default_launch   # resolved now, so a test's replacement is honoured
     investigate = investigate if investigate is not None else default_investigate
     ctx = ctx_factory()
-    say = LockedEcho(echo)
-    acquired = False
-    if not dry_run:
-        if not ctx.db.acquire_run_lock(plan_id):
-            info = ctx.db.run_lock_info() or {}
-            raise RunRefused(f"the run lock is held by {info.get('plan_id')} (pid {info.get('pid')}, since {info.get('acquired_at')}); "
-                             "if that process is gone, remove the lock by hand")
-        acquired = True
-        ctx.db.clear_stop(plan_id)   # a request left from before this run is not this run's
     try:
+        say = LockedEcho(echo)
+        acquired = False
         if not dry_run:
-            from ateam.exclusion import live_planning
-            for planning_id, planning_pid in live_planning(ctx.db):
-                raise RunRefused(f"{planning_id} is being planned (pid {planning_pid}); wait for it to finish")
-        plan, cs, cids = _preflight(ctx, plan_id, say, dry_run)
-        if dry_run:
-            return _dry_run(ctx, plan_id, cs, cids, say)
-        return _Run(ctx_factory, ctx, plan_id, cids, say, stop, launch, child, investigate).execute()
+            if not ctx.db.acquire_run_lock(plan_id):
+                info = ctx.db.run_lock_info() or {}
+                raise RunRefused(f"the run lock is held by {info.get('plan_id')} (pid {info.get('pid')}, since {info.get('acquired_at')}); "
+                                 "if that process is gone, remove the lock by hand")
+            acquired = True
+            ctx.db.clear_stop(plan_id)   # a request left from before this run is not this run's
+        try:
+            if not dry_run:
+                from ateam.exclusion import live_planning
+                for planning_id, planning_pid in live_planning(ctx.db):
+                    raise RunRefused(f"{planning_id} is being planned (pid {planning_pid}); wait for it to finish")
+            plan, cs, cids = _preflight(ctx, plan_id, say, dry_run)
+            if dry_run:
+                return _dry_run(ctx, plan_id, cs, cids, say)
+            return _Run(ctx_factory, ctx, plan_id, cids, say, stop, launch, child, investigate).execute()
+        finally:
+            if acquired:
+                ctx.db.release_run_lock(plan_id)
     finally:
-        if acquired:
-            ctx.db.release_run_lock(plan_id)
+        ctx.close()   # after the lock is released, in the thread that made it
 
 
 def _preflight(ctx, plan_id: str, say, dry_run: bool):
@@ -558,6 +561,12 @@ class _Run:
 
     def _pipeline(self, cid: str) -> _Outcome:
         ctx = self.ctx_factory()
+        try:
+            return self._contract(ctx, cid)
+        finally:
+            ctx.close()   # in this pipeline's own thread: sqlite connections are thread-bound
+
+    def _contract(self, ctx, cid: str) -> _Outcome:
         db = ctx.db
         if db.contract_status(cid) == "verified":
             return self._merge(ctx, cid)

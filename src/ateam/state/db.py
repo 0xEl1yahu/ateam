@@ -93,6 +93,19 @@ class StateDB:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=10000")   # worker processes and the scheduler write attempts concurrently
+        self._closed = False
+
+    def close(self) -> None:
+        """Close the connection; a second call is a no-op. Only the thread that opened it may (check_same_thread)."""
+        if not self._closed:
+            self.conn.close()
+            self._closed = True
+
+    def __enter__(self) -> StateDB:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
     # -- schema -------------------------------------------------------------
 

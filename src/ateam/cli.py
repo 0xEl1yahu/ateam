@@ -31,6 +31,12 @@ class Context:
         self.config: TargetConfig = load_config(self.paths)
         self.db = StateDB(home_dir(target) / "state.db")
         self.db.init_schema()
+        command = click.get_current_context(silent=True)   # thread-local: a scheduler thread's Context has none
+        if command is not None:
+            command.call_on_close(self.close)   # closed when the command ends, including on sys.exit
+
+    def close(self) -> None:
+        self.db.close()
 
 
 def _previous_home(target: Path) -> tuple[dict, Path] | None:
@@ -53,7 +59,7 @@ def _context(target: Path, require_ateam: bool = True) -> Context:
         else:
             click.echo(f"No intent repo for {target}. Run: ateam intent init")
         sys.exit(2)
-    return Context(target)
+    return Context(target)   # closed by click when the command ends (Context.__init__)
 
 
 _LAST_FAIL: list[str] = []   # the message of the last _fail, for --result-file
@@ -310,9 +316,9 @@ def _require_no_live_run_at(target: Path) -> None:
 
     state = home_dir(target) / "state.db"
     if state.exists():
-        db = StateDB(state)
-        db.init_schema()
-        require_no_live_run(SimpleNamespace(db=db))
+        with StateDB(state) as db:
+            db.init_schema()
+            require_no_live_run(SimpleNamespace(db=db))
 
 
 def _reject_stale_planning(ctx: Context) -> None:
@@ -988,11 +994,11 @@ def _release_own_run_lock(target: Path, plan_id: str) -> None:
     """Release the run lock only when this process holds it for this plan (a second Ctrl-C; owner, 2026-10-26)."""
     import os
 
-    db = StateDB(home_dir(target) / "state.db")
-    db.init_schema()
-    info = db.run_lock_info()
-    if info and info["plan_id"] == plan_id and info["pid"] == os.getpid():
-        db.release_run_lock(plan_id)
+    with StateDB(home_dir(target) / "state.db") as db:
+        db.init_schema()
+        info = db.run_lock_info()
+        if info and info["plan_id"] == plan_id and info["pid"] == os.getpid():
+            db.release_run_lock(plan_id)
 
 
 def _interrupt_handler(stop, say):
