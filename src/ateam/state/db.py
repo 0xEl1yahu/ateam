@@ -64,6 +64,16 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS run_lock (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1), plan_id TEXT NOT NULL, acquired_at TEXT NOT NULL, pid INTEGER);
+CREATE TABLE IF NOT EXISTS pauses (
+    pause_id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id TEXT NOT NULL, reason TEXT NOT NULL, detail TEXT NOT NULL,
+    conflict INTEGER NOT NULL DEFAULT 0, at TEXT NOT NULL, resumed_at TEXT);
+CREATE TABLE IF NOT EXISTS pause_contracts (
+    pause_id INTEGER NOT NULL, contract_id TEXT NOT NULL, reason TEXT NOT NULL, detail TEXT NOT NULL,
+    contract_hash TEXT NOT NULL, evidence TEXT, attempt_id INTEGER, findings TEXT, note TEXT,
+    PRIMARY KEY (pause_id, contract_id));
+CREATE TABLE IF NOT EXISTS attempt_windows (
+    window_id INTEGER PRIMARY KEY AUTOINCREMENT, contract_id TEXT NOT NULL, after_attempt_id INTEGER NOT NULL,
+    pause_id INTEGER, at TEXT NOT NULL);
 """
 
 
@@ -378,3 +388,83 @@ class StateDB:
     def run_lock_holder(self) -> str | None:
         row = self.conn.execute("SELECT plan_id FROM run_lock LIMIT 1").fetchone()
         return row["plan_id"] if row else None
+
+    # -- pauses, attempt windows, stop requests -----------------------------
+
+    def record_pause(self, plan_id: str, reason: str, detail: str, contracts: list[dict[str, Any]],
+                     conflict: bool = False) -> int:
+        with self.conn:
+            cur = self.conn.execute(
+                "INSERT INTO pauses (plan_id, reason, detail, conflict, at) VALUES (?, ?, ?, ?, ?)",
+                (plan_id, reason, detail, 1 if conflict else 0, _now()),
+            )
+            pause_id = int(cur.lastrowid)
+            for c in contracts:
+                ev = c.get("evidence")
+                self.conn.execute(
+                    "INSERT INTO pause_contracts (pause_id, contract_id, reason, detail, contract_hash, evidence) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (pause_id, c["contract_id"], c["reason"], c["detail"], c["contract_hash"],
+                     None if ev is None else json.dumps(ev, default=str)),
+                )
+            return pause_id
+
+    def open_pause(self, plan_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM pauses WHERE plan_id=? AND resumed_at IS NULL ORDER BY pause_id DESC LIMIT 1", (plan_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        out = {k: row[k] for k in ("pause_id", "plan_id", "reason", "detail", "at")}
+        out["conflict"] = bool(row["conflict"])
+        contracts = []
+        for r in self.conn.execute(
+            "SELECT * FROM pause_contracts WHERE pause_id=? ORDER BY contract_id", (row["pause_id"],),
+        ):
+            contracts.append({
+                "contract_id": r["contract_id"], "reason": r["reason"], "detail": r["detail"],
+                "contract_hash": r["contract_hash"],
+                "evidence": None if r["evidence"] is None else json.loads(r["evidence"]),
+                "attempt_id": r["attempt_id"],
+                "findings": None if r["findings"] is None else json.loads(r["findings"]),
+                "note": r["note"],
+            })
+        out["contracts"] = contracts
+        return out
+
+    def set_pause_findings(self, pause_id: int, contract_id: str, attempt_id: int | None,
+                           findings: dict[str, Any] | None, note: str | None) -> None:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE pause_contracts SET attempt_id=?, findings=?, note=? WHERE pause_id=? AND contract_id=?",
+                (attempt_id, None if findings is None else json.dumps(findings, default=str), note,
+                 pause_id, contract_id),
+            )
+
+    def resume_pause(self, pause_id: int | None, contract_ids: list[str]) -> None:
+        with self.conn:
+            newest = self.conn.execute("SELECT COALESCE(MAX(attempt_id), 0) FROM attempts").fetchone()[0]
+            now = _now()
+            for cid in contract_ids:
+                self.conn.execute(
+                    "INSERT INTO attempt_windows (contract_id, after_attempt_id, pause_id, at) VALUES (?, ?, ?, ?)",
+                    (cid, newest, pause_id, now),
+                )
+            if pause_id is not None:
+                self.conn.execute("UPDATE pauses SET resumed_at=? WHERE pause_id=?", (now, pause_id))
+
+    def window_start(self, contract_id: str) -> int:
+        row = self.conn.execute(
+            "SELECT after_attempt_id FROM attempt_windows WHERE contract_id=? ORDER BY window_id DESC LIMIT 1",
+            (contract_id,),
+        ).fetchone()
+        return int(row["after_attempt_id"]) if row else 0
+
+    def request_stop(self, plan_id: str) -> None:
+        self.set_meta(f"stop-request:{plan_id}", _now())
+
+    def stop_requested(self, plan_id: str) -> bool:
+        return self.get_meta(f"stop-request:{plan_id}") is not None
+
+    def clear_stop(self, plan_id: str) -> None:
+        self.delete_meta(f"stop-request:{plan_id}")

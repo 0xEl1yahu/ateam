@@ -314,3 +314,41 @@ def test_latest_checkpoint_by_role(tmp_path):
 
 def test_busy_timeout_is_set(tmp_path):
     assert fresh(tmp_path).conn.execute("PRAGMA busy_timeout").fetchone()[0] >= 10000
+
+
+def test_pause_record_round_trip(tmp_path):
+    db = fresh(tmp_path)
+    pid = db.record_pause("P-0001", "budget_exhausted", "C-0002 has used all 2 BUILD attempts",
+                          [{"contract_id": "C-0002", "reason": "budget_exhausted", "detail": "d", "contract_hash": "h1",
+                            "evidence": {"code": 1}}])
+    p = db.open_pause("P-0001")
+    assert p["pause_id"] == pid and p["conflict"] is False and p["contracts"][0]["evidence"] == {"code": 1}
+    db.set_pause_findings(pid, "C-0002", 7, {"summary": "s"}, None)
+    assert db.open_pause("P-0001")["contracts"][0]["findings"] == {"summary": "s"}
+    db.resume_pause(pid, ["C-0002"])
+    assert db.open_pause("P-0001") is None
+
+
+def test_window_starts_after_the_newest_attempt(tmp_path):
+    db = fresh(tmp_path)
+    assert db.window_start("C-0002") == 0
+    a = db.start_attempt("C-0002", "build", "light", "haiku", {})
+    db.start_attempt("C-0003", "build", "light", "haiku", {})
+    db.resume_pause(None, ["C-0002"])
+    assert db.window_start("C-0002") == a + 1 and db.window_start("C-0003") == 0
+
+
+def test_stop_request_flag(tmp_path):
+    db = fresh(tmp_path)
+    assert not db.stop_requested("P-0001")
+    db.request_stop("P-0001"); assert db.stop_requested("P-0001")
+    db.clear_stop("P-0001"); assert not db.stop_requested("P-0001")
+
+
+def test_existing_store_gains_the_pause_tables(tmp_path):
+    db = fresh(tmp_path)
+    with db.conn:
+        for t in ("pauses", "pause_contracts", "attempt_windows"):
+            db.conn.execute(f"DROP TABLE {t}")
+    db.init_schema()
+    assert db.open_pause("P-0001") is None and db.window_start("C-0001") == 0
