@@ -83,8 +83,30 @@ class FakeWorkers:
         return [c[2] for c in self.calls if c[0] == cid and c[1] == role]
 
 
+class FakeInvestigator:
+    """Stands in for `ateam worker pause-investigate`: writes findings (or a note) on the open pause record."""
+
+    def __init__(self, report=None, outcome="completed", write=True):
+        self.calls, self.outcome, self.write = [], outcome, write
+        self.report = report or {"summary": "s", "evidence": [], "failure_class": "implementation",
+                                 "needs_owner_decision": None, "suggested_instruction": "use x"}
+
+    def __call__(self, target, plan_id, cid, worktree, result_file):
+        db = StateDB(home_dir(target) / "state.db"); db.init_schema()
+        self.calls.append((cid, db.feature_status(plan_id), worktree))
+        if self.write:
+            pause = db.open_pause(plan_id)
+            findings = self.report if self.outcome == "completed" else None
+            db.set_pause_findings(pause["pause_id"], cid, None, findings, None if findings else f"{self.outcome}: x")
+        r = {"code": 0 if self.outcome == "completed" else 1, "outcome": self.outcome, "attempt_id": None,
+             "cost_usd": 0.2, "error": None}
+        result_file.write_text(json.dumps(r))
+        return r
+
+
 def _run(p, launch, stop=None, **kw):
     from ateam.scheduler import run_plan
+    kw.setdefault("investigate", FakeInvestigator())
     out: list[str] = []
     summary = run_plan(lambda: Context(p.root), "P-0001", out.append, stop or threading.Event(), launch=launch, **kw)
     return summary, out
@@ -545,3 +567,69 @@ def test_a_runs_directory_is_never_reused_within_one_second(tmp_path):
     from ateam.scheduler import fresh_dir
     a, b = fresh_dir(tmp_path, "20261027T100000Z-1"), fresh_dir(tmp_path, "20261027T100000Z-1")
     assert a != b and a.is_dir() and b.is_dir() and a.name == "20261027T100000Z-1"
+
+
+# ---- automatic pause investigations (pause and resume, task 6)
+
+_REQUIREMENTS = {("C-0001", "test"): {"code": 5, "test_outcome": "failed", "test_class": "requirements"}}
+
+
+def test_an_ateam_pause_investigates_each_paused_contract_once(plan3):
+    inv = FakeInvestigator()
+    s, out = _run(plan3, FakeWorkers(_REQUIREMENTS), investigate=inv)
+    assert s.outcome == "paused" and [c[0] for c in inv.calls] == ["C-0001"] and inv.calls[0][1] == "paused"
+    assert inv.calls[0][2] == home_dir(plan3.root) / "worktrees" / "C-0001"
+    assert _db(plan3).open_pause("P-0001")["contracts"][0]["findings"]["suggested_instruction"] == "use x"
+    assert any("C-0001 investigate completed" in line for line in out)
+
+
+def test_owner_stop_is_not_investigated(plan3):
+    inv = FakeInvestigator()
+
+    def owner_stop(fake, cid, role, worktree, n):
+        _db(plan3).request_stop("P-0001"); time.sleep(0.8)
+        return {"code": 130, "outcome": "interrupted", "commit": False}
+
+    s, out = _run(plan3, FakeWorkers({("C-0001", "build", 0): owner_stop}), investigate=inv)
+    assert s.outcome == "paused" and _last_reason(plan3).startswith("owner_stopped") and inv.calls == []
+
+
+def test_a_tampered_investigation_leaves_the_pause_standing(plan3):
+    s, out = _run(plan3, FakeWorkers(_REQUIREMENTS), investigate=FakeInvestigator(outcome="tamper"))
+    c = _db(plan3).open_pause("P-0001")["contracts"][0]
+    assert s.outcome == "paused" and c["findings"] is None and c["note"].startswith("tamper")
+    assert _db(plan3).feature_status("P-0001") == "paused"
+
+
+def test_a_crashed_investigation_gets_a_note(plan3):
+    s, out = _run(plan3, FakeWorkers(_REQUIREMENTS), investigate=FakeInvestigator(outcome="failed", write=False))
+    c = _db(plan3).open_pause("P-0001")["contracts"][0]
+    assert c["findings"] is None and c["note"] == "investigation failed: no findings written"
+
+
+def test_investigation_that_does_not_fit_the_budget_leaves_a_note(plan3):
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1, run_budget_usd=2.0)
+    inv = FakeInvestigator()
+    s, out = _run(plan3, FakeWorkers(_REQUIREMENTS), investigate=inv)
+    c = _db(plan3).open_pause("P-0001")["contracts"][0]
+    assert s.outcome == "paused" and inv.calls == [] and c["note"].startswith("run budget $2.00 would be exceeded")
+
+
+def test_no_worktree_means_no_investigation(plan3, monkeypatch):
+    from ateam import worktrees as wt_mod
+    from ateam.worktrees import WorktreeError
+
+    def no_worktree(*a, **kw):
+        raise WorktreeError("cannot make it")
+
+    monkeypatch.setattr("ateam.scheduler.contract_worktree", no_worktree)
+    inv = FakeInvestigator()
+    s, out = _run(plan3, FakeWorkers(), investigate=inv)
+    c = next(c for c in _db(plan3).open_pause("P-0001")["contracts"] if c["contract_id"] == "C-0001")
+    assert inv.calls == [] and c["note"] == "no worktree to investigate"
+
+
+def test_unit_tests_cannot_start_a_real_investigation(tmp_path):
+    from ateam import scheduler
+    with pytest.raises(AssertionError, match="real pause investigation"):
+        scheduler.default_investigate(tmp_path, "P-0001", "C-0001", tmp_path, tmp_path / "r.json")

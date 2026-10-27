@@ -46,6 +46,7 @@ STOP_POLL_S = 0.5   # how often the main loop reads a stop request from the stor
 RUNNABLE = ("ready", "failed", "verified")   # verified: merged at the next step (an interrupted run stopped before)
 
 Launch = Callable[[Path, str, str, Path, str, "str | None", "str | None", Path], dict]
+Investigate = Callable[[Path, str, str, Path, Path], dict]   # (target, plan_id, cid, worktree, result_file) -> result
 
 
 class RunRefused(Exception):
@@ -221,6 +222,15 @@ def default_launch(target: Path, cid: str, role: str, worktree: Path, base: str,
     return {"log": str(log), **_read_result(result_file, code, {"outcome": "failed", "subtype": None})}
 
 
+def default_investigate(target: Path, plan_id: str, cid: str, worktree: Path, result_file: Path) -> dict:
+    """`ateam worker pause-investigate` as a registered child, like a session: Ctrl-C and an owner stop reach it."""
+    argv = [*ateam_argv(), "worker", "pause-investigate", plan_id, cid, "--cwd", str(worktree), "--result-file", str(result_file),
+            "--target", str(target)]
+    log = result_file.with_suffix(".log")
+    code = _run_registered(argv, log)
+    return {"log": str(log), **_read_result(result_file, code, {"outcome": "failed", "cost_usd": None})}
+
+
 def run_child(argv: list[str], result_file: Path) -> dict:
     """verify or refresh, in its own process session so a terminal Ctrl-C lets it finish."""
     log = result_file.with_suffix(".log")
@@ -243,8 +253,9 @@ class _Outcome:
 
 def run_plan(ctx_factory: Callable[[], object], plan_id: str, echo: Callable[[str], None], stop: threading.Event,
              launch: Launch | None = None, dry_run: bool = False,
-             child: Callable[[list[str], Path], dict] = run_child) -> RunSummary:
+             child: Callable[[list[str], Path], dict] = run_child, investigate: Investigate | None = None) -> RunSummary:
     launch = launch if launch is not None else default_launch   # resolved now, so a test's replacement is honoured
+    investigate = investigate if investigate is not None else default_investigate
     ctx = ctx_factory()
     say = LockedEcho(echo)
     acquired = False
@@ -263,7 +274,7 @@ def run_plan(ctx_factory: Callable[[], object], plan_id: str, echo: Callable[[st
         plan, cs, cids = _preflight(ctx, plan_id, say, dry_run)
         if dry_run:
             return _dry_run(ctx, plan_id, cs, cids, say)
-        return _Run(ctx_factory, ctx, plan_id, cids, say, stop, launch, child).execute()
+        return _Run(ctx_factory, ctx, plan_id, cids, say, stop, launch, child, investigate).execute()
     finally:
         if acquired:
             ctx.db.release_run_lock(plan_id)
@@ -349,9 +360,10 @@ def _dry_run(ctx, plan_id: str, cs, cids: list[str], say) -> RunSummary:
 
 
 class _Run:
-    def __init__(self, ctx_factory, ctx, plan_id: str, cids: list[str], say, stop: threading.Event, launch: Launch, child) -> None:
+    def __init__(self, ctx_factory, ctx, plan_id: str, cids: list[str], say, stop: threading.Event, launch: Launch, child,
+                 investigate: Investigate) -> None:
         self.ctx_factory, self.ctx, self.plan_id, self.cids = ctx_factory, ctx, plan_id, cids
-        self.say, self.stop, self.launch, self.child = say, stop, launch, child
+        self.say, self.stop, self.launch, self.child, self.investigate = say, stop, launch, child, investigate
         self.gate, self.halt, self.results = Gate(), threading.Event(), queue.Queue()
         self.budget = Budget(ctx.config.run_budget_usd)
         self.tiers = load_tiers(ctx.config.tiers)
@@ -444,11 +456,12 @@ class _Run:
             self._close_open_attempts()
             with self.gate.exclusive():
                 set_plan_status(ctx.paths, db, load_plans(ctx.paths.plans)[self.plan_id], ["paused"], by="run", why=why)
-                db.record_pause(self.plan_id, first.reason, first.detail or "", [
+                pause_id = db.record_pause(self.plan_id, first.reason, first.detail or "", [
                     {"contract_id": o.cid, "reason": o.reason, "detail": o.detail or "", "contract_hash": db.contract_hash(o.cid),
                      "evidence": o.evidence} for o in pauses], conflict=any(o.conflict for o in pauses))
                 db.clear_stop(self.plan_id)
             self.say(f"{self.plan_id} -> paused ({why})")
+            self._investigate_pauses(ctx, pause_id, sorted({o.cid for o in pauses}))
             return self._summary("paused", statuses, [why])
         if all(s == "integrated" for s in statuses.values()):
             rf = self._result_path("final", "integrate")   # its own session, so Ctrl-C cannot fail its setup
@@ -465,6 +478,41 @@ class _Run:
         message = "nothing more can run; unfinished: " + ", ".join(blockers)
         self.say(f"{self.plan_id}: stalled; {message}")
         return self._summary("stalled", statuses, [message])
+
+    def _investigate_pauses(self, ctx, pause_id: int, cids: list[str]) -> None:
+        """One read-only INVESTIGATE session per paused contract, after the plan is paused, at `careful` and within the
+        run budget; its findings (or a note saying why there are none) wait on the pause record for the owner."""
+        db = ctx.db
+        usd = self.tiers["careful"][Role.investigate].usd
+        for cid in cids:
+            def note(text: str) -> None:
+                db.set_pause_findings(pause_id, cid, None, None, text)
+
+            worktree = home_dir(ctx.paths.root) / "worktrees" / cid
+            if self.stop.is_set():
+                note("interrupted"); continue
+            if not worktree.exists():
+                note("no worktree to investigate"); continue
+            verdict = self.budget.reserve(usd, self.stop)   # self.halt is already set by the pause
+            if verdict == "exhausted":
+                note(f"run budget ${self.budget.limit:.2f} would be exceeded by the investigation"); continue
+            if verdict == "halted":
+                note("interrupted"); continue
+            actual = usd
+            try:
+                with self.gate.shared():
+                    with self._counter_lock:
+                        self.sessions += 1
+                    r = self.investigate(ctx.paths.root, self.plan_id, cid, worktree, self._result_path(cid, "investigate"))
+                cost = r.get("cost_usd")
+                actual = usd if cost is None else float(cost)
+            finally:
+                self.budget.settle(usd, actual)
+            outcome = r.get("outcome") or "failed"
+            self.say(f"{cid} investigate {outcome} ${actual:.2f}")
+            recorded = next((c for c in (db.open_pause(self.plan_id) or {}).get("contracts", []) if c["contract_id"] == cid), None)
+            if recorded is not None and recorded["findings"] is None and recorded["note"] is None:
+                note(f"investigation {outcome}: {r.get('error') or 'no findings written'}")
 
     def _startable(self, db, cs, cid: str) -> bool:
         """Ready or failed contracts start only when every in-plan dependency is integrated, so a dependent is never

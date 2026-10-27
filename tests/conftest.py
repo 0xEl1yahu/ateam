@@ -171,3 +171,13 @@ def policy_investigate(target_repo, records_three):
     from ateam.roles import Role
 
     return _policy(target_repo, records_three, Role.investigate)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_pause_investigation(monkeypatch):
+    """A unit test never starts a real INVESTIGATE session: `ateam run` resolves its investigator at call time, and this
+    default raises unless the test supplies its own."""
+    def refuse(*a, **kw):
+        raise AssertionError("a unit test tried to start a real pause investigation; pass investigate= or patch default_investigate")
+
+    monkeypatch.setattr("ateam.scheduler.default_investigate", refuse, raising=False)

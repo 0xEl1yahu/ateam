@@ -9,8 +9,10 @@ from test_integrate import _set_config, run
 from test_scheduler import FakeWorkers, plan3  # noqa: F401  (fixture)
 
 
-def _fake(monkeypatch, fake):
+def _fake(monkeypatch, fake, investigate=None):
+    from test_scheduler import FakeInvestigator
     monkeypatch.setattr("ateam.scheduler.default_launch", fake)
+    monkeypatch.setattr("ateam.scheduler.default_investigate", investigate or FakeInvestigator())
 
 
 def test_run_exit_codes(plan3, monkeypatch):

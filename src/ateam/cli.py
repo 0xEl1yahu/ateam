@@ -1026,7 +1026,8 @@ def run_cmd(plan_id: str, dry_run: bool, target: Path) -> None:
     def work() -> None:
         try:
             box["summary"] = scheduler.run_plan(lambda: Context(target), plan_id, click.echo, stop,
-                                                launch=scheduler.default_launch, dry_run=dry_run)
+                                                launch=scheduler.default_launch, dry_run=dry_run,
+                                                investigate=scheduler.default_investigate)
         except BaseException as e:  # noqa: BLE001  (reported below, in the main thread)
             box["error"] = e
 
