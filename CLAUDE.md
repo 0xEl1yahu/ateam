@@ -36,6 +36,7 @@ Adapted from the Claude Code team's own published practices (Boris Cherny's "how
 - **Pre-allow permissions, never skip them.** Known-safe commands go in `.claude/settings.json` so they are shared; no `--dangerously-skip-permissions`.
 - **Make the model justify changes.** Ask why a fix is right, and ask for a rewrite when a fix is mediocre rather than patching it further. Detailed specs beat clever prompts.
 - **Parallel work is one worktree per session.** Never two sessions in one checkout.
+- **Integrate, don't duplicate.** A change extends the modules that already own its concern; it adds no parallel subsystem (no second store, brief builder, runner, policy or config path). A new module is allowed only when no existing one owns the concern, and the change says which existing modules it wires into. Code that works on its own beside the real system is contract debt. (Owner, 2026-10-27.)
 - **Model choice is the owner's.** Default to the strongest model with thinking for design, review and policy work; a smaller model is fine for mechanical, well-specified tasks and for live tests.
 
 ## Conventions
