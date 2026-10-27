@@ -20,7 +20,7 @@ This design gives a pause a way out that keeps the owner in charge. When a run g
 ## Non-goals
 
 - Event logs, `ateam watch`, doctor and medic. A stale lock is still removed by hand.
-- `serialize_checks`, the rebase BUILD after a merge conflict, INVESTIGATE before BUILD for uncertain contracts, downstream revalidation, and native session resume by ID. They stay recorded deviations.
+- `serialize_checks`, the rebase BUILD after a merge conflict *(built 2026-10-27 by `2026-10-27-lanes-design.md`)*, INVESTIGATE before BUILD for uncertain contracts, downstream revalidation, and native session resume by ID. They stay recorded deviations.
 - Investigating a pause that happens during final integration (`integrating -> paused`).
 - Abandoning a plan (`paused -> abandoned`). The transition exists; a command for it is separate work.
 

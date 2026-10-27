@@ -25,7 +25,7 @@ Most of the time in P-0018 went to waiting, not working: 2 h 10 min wall clock a
 |---|---|---|---|---|
 | T1 | Verify runs the full suite for every contract, and nothing else may run meanwhile | Each verify took 4-9 min. Final integrate took 9 min. Four contracts meant four full suites back to back | Per-contract verify runs the contract's own checks plus the tests its acceptance names. The full `config.checks` runs once, at integration (it already does). Needs a way to mark a config check "integration only" | Yes: changes what "verified" means per contract |
 | T2 | A verified contract waits for running sessions before it can merge | C-0079 was verified at 15:25 and merged at 15:44, because C-0080's TEST held the gate | Merge-at-verify commits to the intent repo, which would trip running sessions' tamper check. Option: the tamper check accepts intent commits the coordinator itself recorded during the session, so merges and sessions can overlap | Yes: changes a tamper check |
-| T3 | Two workers left capacity idle: C-0079 and C-0080 waited ~50 min while C-0078's Opus BUILD (26 min) and the verifies ran | Run log timestamps | Lanes (being built) plus T1 and T2; maybe raise `max_workers` | No for `max_workers`; yes for T1 and T2 |
+| T3 | Two workers left capacity idle: C-0079 and C-0080 waited ~50 min while C-0078's Opus BUILD (26 min) and the verifies ran | Run log timestamps | Lanes (merged 2026-10-27, 0649102) plus T1 and T2; maybe raise `max_workers` | No for `max_workers`; yes for T1 and T2 |
 
 ## Open: visibility
 
@@ -40,7 +40,7 @@ Most of the time in P-0018 went to waiting, not working: 2 h 10 min wall clock a
 | # | Finding | Evidence | Proposed fix | Owner's call? |
 |---|---|---|---|---|
 | C1 | Planning cost $5.58 at `careful` for four small changes; the whole run cost $3.13 | `ateam plan` output | Claude triage of planning effort (request drafted; project memory note) | Yes: changes the 2025-10-25 ruling |
-| C2 | Each contract worktree is ~337 MB (its own `.venv`) and is never removed | `du` of `~/.ateam/.../worktrees` | A cleanup command after merge or reject, already deferred in the spec. Lanes cut setups per plan | No |
+| C2 | Each contract worktree is ~337 MB (its own `.venv`) and is never removed | `du` of `~/.ateam/.../worktrees` | A cleanup command after merge or reject, already deferred in the spec. Lanes cut it to one worktree per lane; setup still runs on each new base | No |
 | C3 | Haiku's pause diagnosis misjudged the class and said setup needs a re-freeze | Live test findings | None needed: real pause investigations run at `careful`. Keep in mind if triage lowers tiers | No |
 
 ## Open: process lessons

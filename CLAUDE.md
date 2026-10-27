@@ -47,7 +47,7 @@ Adapted from the Claude Code team's own published practices (Boris Cherny's "how
 - Worker sessions use the clean room (`setting_sources=[]`, strict MCP config, slash commands off, auto-memory off, permission mode `default`). Never `--bare`: it does not authenticate with a claude.ai login.
 - Never `str.strip()` the output of `git status --porcelain`.
 - Workers may `cd` only to an absolute path inside their worktree or their scratch directory; `tests/test_policy.py` holds the allow and deny strings.
-- Scheduler worktrees live under ATeam's home (<home>/worktrees/<cid>); policy tests for home reads must include a worktree under the home, not only one outside it.
+- Scheduler worktrees live under ATeam's home (<home>/worktrees/<lane's first cid>); policy tests for home reads must include a worktree under the home, not only one outside it.
 - A lane's contracts share <home>/worktrees/<first cid>; find a contract's worktree with `worktrees.worktree_path`, never from its id.
 - Never signal a process group ATeam did not create; the scheduler interrupts its own children by pid.
 - A test of a failed git commit must fail it after staging (a real failing hook), not before `git add`; a commit that fails before staging hides the case where files stay staged and `git checkout --` restores nothing.

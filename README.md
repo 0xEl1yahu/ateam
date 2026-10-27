@@ -124,12 +124,12 @@ Override the home with `$ATEAM_HOME`.
 ## Tests
 
 ```bash
-.venv/bin/pytest                      # unit suite, no API calls
+.venv/bin/pytest -n auto              # unit suite in parallel, no API calls
 ATEAM_LIVE_TESTS=1 .venv/bin/pytest tests/live -s   # one real haiku session, a few cents
 ```
 
 ## Status
 
-Done: records, contracts, config, the private intent repo, state store, git operations, brief assembly, the worker policy gate, the clean-room runner, a single verified worker run, discovery (`ateam init`), the planner (`ateam plan`), plan approval, and the scheduler with lanes and conflict recovery (`docs/superpowers/plans/2026-10-27-lanes.md`). Next: the scheduler and worktree pool, the verifier (deterministic checks plus the TEST role as a gate), the integrator with the merge gate, event logs with the tmux viewer, the doctor's repair modes, calibration.
+Done: records, contracts, config, the private intent repo, state store, git operations, brief assembly, the worker policy gate, the clean-room runner, a single verified worker run, discovery (`ateam init`), the planner (`ateam plan`), plan approval, the scheduler (`ateam run`) with verify, the TEST role and merge at verify, pause, stop, investigate and resume, lanes and conflict recovery (`docs/superpowers/plans/2026-10-27-lanes.md`), and the merge gate (`ateam merge`). Next: event logs with the tmux viewer, the doctor's repair modes, calibration, and the open findings in `docs/dogfood/2026-10-27-first-self-runs.md`.
 
 The spike that validated the SDK integration is in `spikes/2026-10-24-sdk-bare-hooks/`.

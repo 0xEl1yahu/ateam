@@ -1879,7 +1879,7 @@ def _require_isolated_worktree(ctx: Context, worktree: Path) -> GitRepo:
 
 @main.group()
 def worker() -> None:
-    """Run a single worker (low-level; the scheduler arrives in pass two)."""
+    """Run a single worker or pause investigation (low-level; `ateam run` launches these)."""
 
 
 @worker.command("run")
