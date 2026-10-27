@@ -2440,3 +2440,22 @@ def test_verify_result_file_names_the_refusal(cli_target, tmp_path):
     commit_intent(paths, "hand edit", ["contracts"])
     r = run("verify", "C-0001", "--cwd", str(wt), "--target", str(cli_target), "--result-file", str(rf))
     assert r.exit_code == 4 and json.loads(rf.read_text())["refusal"] == "not_binding"
+
+
+# ---- owner instructions reach BUILD briefs (pause and resume, task 3)
+
+def test_brief_command_carries_only_live_guidance(cli_target):
+    from datetime import UTC, datetime
+
+    from ateam.contracts.store import load_contracts
+    from ateam.guidance import GuidanceEntry, append_guidance
+    _frozen_target(cli_target)
+    p = TargetPaths.from_root(cli_target)
+    h = load_contracts(p.contracts)["C-0001"].content_hash()
+    append_guidance(p.guidance, "C-0001", GuidanceEntry(at=datetime(2026, 10, 27, tzinfo=UTC), source="owner", contract_hash=h, text="use the live helper"))
+    append_guidance(p.guidance, "C-0001", GuidanceEntry(at=datetime(2026, 10, 27, tzinfo=UTC), source="owner", contract_hash="stale", text="stale advice"))
+    build = run("brief", "C-0001", "--role", "build", "--target", str(cli_target))
+    assert build.exit_code == 0, build.output
+    assert "owner: use the live helper" in build.output and "stale advice" not in build.output
+    test = run("brief", "C-0001", "--role", "test", "--target", str(cli_target))
+    assert "Owner's instructions" not in test.output

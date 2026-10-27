@@ -17,6 +17,7 @@ from ateam.checkpoint import Checkpoint, collect
 from ateam.config import TargetConfig
 from ateam.contracts.model import Contract
 from ateam.gitops import GitRepo
+from ateam.guidance import live_guidance, load_guidance
 from ateam.intent import intent_git
 from ateam.paths import TargetPaths
 from ateam.records.model import Record
@@ -181,7 +182,8 @@ async def run_contract_attempt(
     # A BUILD retry reads BUILD's own notes; TEST sees facts only (its brief drops notes).
     prev_raw = db.latest_checkpoint(contract.id, role="build") if role is Role.build else db.latest_checkpoint(contract.id)
     prev = Checkpoint.from_dict(prev_raw) if prev_raw else None
-    brief_text = render_brief(assemble_brief(contract, selected, prev, role, scratch_dir=scratch))
+    instructions = live_guidance(load_guidance(paths.guidance, contract.id), contract.content_hash()) if role is Role.build else []
+    brief_text = render_brief(assemble_brief(contract, selected, prev, role, scratch_dir=scratch, instructions=instructions))
     predicted = {k: contract.allocation.model_dump()[k] for k in ("complexity", "risk", "uncertainty")}
     attempt_id = db.start_attempt(contract.id, role.value, tier_name, tier.model, predicted)
 

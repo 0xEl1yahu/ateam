@@ -85,6 +85,11 @@ class TargetPaths:
             scratch_root=home / "scratch",
         )
 
+    @property
+    def guidance(self) -> Path:
+        """The owner's instructions per contract (guidance/<contract-id>.yaml), committed in the intent repo."""
+        return self.intent / "guidance"
+
     def exists(self) -> bool:
         """True when the intent repo has been initialised."""
         return (self.intent / ".git").exists()

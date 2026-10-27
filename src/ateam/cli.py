@@ -1573,6 +1573,7 @@ def brief(contract_id: str, role: str, target: Path) -> None:
     from ateam.brief import assemble_brief, render_brief
     from ateam.checkpoint import Checkpoint
     from ateam.contracts.store import load_contracts
+    from ateam.guidance import live_guidance, load_guidance
     from ateam.records.store import load_records
     from ateam.roles import Role
 
@@ -1585,7 +1586,10 @@ def brief(contract_id: str, role: str, target: Path) -> None:
     prev_raw = ctx.db.latest_checkpoint(contract_id, role="build") if Role(role) is Role.build else ctx.db.latest_checkpoint(contract_id)
     prev = Checkpoint.from_dict(prev_raw) if prev_raw else None
     scratch = ctx.paths.scratch_root / (f"{contract_id}-test" if Role(role) is Role.test else contract_id)
-    click.echo(render_brief(assemble_brief(cs[contract_id], selected, prev, Role(role), scratch_dir=scratch)))
+    instructions = (live_guidance(load_guidance(ctx.paths.guidance, contract_id), cs[contract_id].content_hash())
+                    if Role(role) is Role.build else [])
+    click.echo(render_brief(assemble_brief(cs[contract_id], selected, prev, Role(role), scratch_dir=scratch,
+                                           instructions=instructions)))
 
 
 def _require_isolated_worktree(ctx: Context, worktree: Path) -> GitRepo:

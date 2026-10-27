@@ -272,3 +272,22 @@ def test_build_and_test_briefs_keep_the_handoff_file_and_investigate_does_not(sa
         assert f"Handoff file: {scratch / 'handoff.yaml'}" in assemble_brief(sample_contract, [], None, role, scratch_dir=scratch).task
     inv = assemble_brief(sample_contract, [], None, Role.investigate, scratch_dir=scratch).task
     assert "handoff" not in inv.lower() and f"Scratch directory: {scratch}" in inv
+
+
+# --- owner instructions (pause and resume) ---
+
+
+def test_owner_instructions_reach_build_only(sample_contract, records_three):
+    from datetime import UTC, datetime
+
+    from ateam.guidance import GuidanceEntry
+
+    e = GuidanceEntry(at=datetime(2026, 10, 27, tzinfo=UTC), source="A-42", contract_hash="h", text="use the helper")
+    o = GuidanceEntry(at=datetime(2026, 10, 28, tzinfo=UTC), source="owner", contract_hash="h", text="mind the cache")
+    build = render_brief(assemble_brief(sample_contract, [records_three["R-0001"]], _cp({"next": "x"}), Role.build, instructions=[e, o]))
+    assert "## Owner's instructions" in build
+    assert "- 2026-10-27, adopted from investigation A-42: use the helper" in build
+    assert "- 2026-10-28, owner: mind the cache" in build
+    assert build.index("## Verified prior work") < build.index("## Owner's instructions") < build.index("## Previous worker's notes (unverified)")
+    assert "Owner's instructions" not in render_brief(assemble_brief(sample_contract, [], None, Role.test, instructions=[e]))
+    assert "Owner's instructions" not in render_brief(assemble_brief(sample_contract, [], None, Role.build))

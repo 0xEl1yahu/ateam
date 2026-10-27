@@ -381,3 +381,25 @@ async def test_build_retry_brief_uses_build_notes(monkeypatch, target_repo, targ
     await _attempt(run_mod, target_repo, target_paths, contract, records_three, db, Role.test)
     await _attempt(run_mod, target_repo, target_paths, contract, records_three, db, Role.build)
     assert seen["prev"][2] is not None and seen["prev"][2].notes == {"progress": "half done"}
+
+
+@pytest.mark.asyncio
+async def test_build_attempt_brief_carries_only_live_guidance(monkeypatch, target_repo, target_paths, sample_contract, records_three):
+    from datetime import UTC, datetime
+
+    from ateam.guidance import GuidanceEntry, append_guidance
+    from ateam.roles import Role
+    run_mod, db, contract, seen = _attempt_harness(monkeypatch, target_repo, target_paths, sample_contract, records_three)
+    briefs: list = []
+    spied = run_mod.assemble_brief
+
+    def capture(*a, **kw):
+        briefs.append(kw.get("instructions")); return spied(*a, **kw)
+
+    monkeypatch.setattr(run_mod, "assemble_brief", capture)
+    at = datetime(2026, 10, 27, tzinfo=UTC)
+    append_guidance(target_paths.guidance, contract.id, GuidanceEntry(at=at, source="owner", contract_hash=contract.content_hash(), text="live"))
+    append_guidance(target_paths.guidance, contract.id, GuidanceEntry(at=at, source="owner", contract_hash="stale", text="old"))
+    await _attempt(run_mod, target_repo, target_paths, contract, records_three, db, Role.build)
+    await _attempt(run_mod, target_repo, target_paths, contract, records_three, db, Role.test)
+    assert [e.text for e in briefs[0]] == ["live"] and list(briefs[1]) == []

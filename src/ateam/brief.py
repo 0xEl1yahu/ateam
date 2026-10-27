@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -12,6 +13,7 @@ from ateam.allocation import rubric_text
 from ateam.checkpoint import Checkpoint
 from ateam.config import TargetConfig
 from ateam.contracts.model import Contract
+from ateam.guidance import GuidanceEntry
 from ateam.plans.model import Plan
 from ateam.records.model import Record
 from ateam.roles import Role
@@ -23,6 +25,7 @@ class Brief:
     task: str
     prior_work: str
     notes: str | None
+    instructions: str | None = None
 
 
 def render_record(r: Record) -> str:
@@ -82,14 +85,29 @@ def _prior(cp: Checkpoint | None) -> str:
     return "\n".join(lines)
 
 
+INSTRUCTIONS_NOTE = ("Guidance from the owner for meeting this contract. It does not change the contract or any binding record; "
+                     "if it ever seems to, the contract and records win.")
+
+
+def render_instructions(entries: Sequence[GuidanceEntry]) -> str:
+    lines = [INSTRUCTIONS_NOTE]
+    for e in entries:
+        who = "owner" if e.source == "owner" else f"adopted from investigation {e.source}"
+        lines.append(f"- {e.at:%Y-%m-%d}, {who}: {_one_line(e.text)}")
+    return "\n".join(lines)
+
+
 def assemble_brief(
-    contract: Contract, records: list[Record], checkpoint: Checkpoint | None, role: Role, scratch_dir: Path | None = None
+    contract: Contract, records: list[Record], checkpoint: Checkpoint | None, role: Role, scratch_dir: Path | None = None,
+    instructions: Sequence[GuidanceEntry] = (),
 ) -> Brief:
     binding = "\n\n".join(render_record(r) for r in records) or "No binding records apply to this contract."
     notes = None
     if role != Role.test and checkpoint is not None and checkpoint.notes:
         notes = yaml.safe_dump(checkpoint.notes, sort_keys=False).strip()
-    return Brief(binding=binding, task=_task(contract, scratch_dir, role), prior_work=_prior(checkpoint), notes=notes)
+    owner = render_instructions(instructions) if role is Role.build and instructions else None   # never TEST (owner, 2026-10-26)
+    return Brief(binding=binding, task=_task(contract, scratch_dir, role), prior_work=_prior(checkpoint), notes=notes,
+                 instructions=owner)
 
 
 def render_brief(b: Brief) -> str:
@@ -98,6 +116,8 @@ def render_brief(b: Brief) -> str:
         "## Task\n" + b.task,
         "## Verified prior work\n" + b.prior_work,
     ]
+    if b.instructions:
+        parts.append("## Owner's instructions\n" + b.instructions)
     if b.notes:
         parts.append("## Previous worker's notes (unverified)\n" + b.notes)
     return "\n\n".join(parts) + "\n"
