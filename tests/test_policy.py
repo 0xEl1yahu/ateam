@@ -1593,6 +1593,7 @@ def test_searches_that_do_not_follow_links_stay_allowed(cmd, policy_investigate)
 # <home>/<id>/worktrees/<cid>. A path that resolves inside the worker's own worktree is not "home"; nothing else
 # under the home becomes readable.
 
+SUBSTITUTION_REASON = "INVESTIGATE may not use command or process substitution"
 READ_HOME_REASON = "ATeam's home (intent repo, state store, logs) is not readable by workers; only your scratch directory is"
 OWN_WT_ID = "repo-0123abcd"
 
@@ -1643,7 +1644,28 @@ OWN_WT_DENIED_CMDS = [
     "ls {wt} {base}/intent",
     "X=a:{wt}/../../intent/config.yaml cat src/x.py",   # a path list, not a path token: the text check is the net
     "cat a:{wt}-evil/x",
+    # $PWD and other expansions: a base-relative read that steps out of the worktree (review, fix round 1).
+    # Doubled braces are str.format escapes for a literal ${...}.
+    "cat $PWD/../C-0002/src/x.py",
+    "cat ${{PWD}}/../../intent/config.yaml",
+    "cat ${{PWD}}/../C-0002/x",
+    "ls $PWD/..",
+    "cat $OLDPWD/../C-0002/src/x.py",
+    "cat $X/../C-0002/src/x.py",
+    "cat ${{X}}/../../intent/config.yaml",
+    "cat $(pwd)/../C-0002/src/x.py",           # INVESTIGATE meets its substitution rule first
+    "cat `pwd`/../C-0002/src/x.py",
 ]
+# A wildcard followed by `..`: the walk up is judged, not only the literal prefix (review, fix round 1).
+OWN_WT_DENIED_WILDCARDS = [
+    "cat src/*/../../../../intent/config.yaml",
+    "cat src/s?b/../../../C-0002/x",
+    "cat ./*/../../C-0002/x",
+    "cat src/{{a,b}}/../../../C-0002/x",
+    "ls */../..",
+]
+OWN_WT_ALLOWED_WILDCARDS = ["ls src/*", "cat src/*.py", "ls {wt}/src/*.py", "ls src/*/..", "ls */..", "ls $PWD/src/*",
+                            "ls ${{PWD}}/src/*.py"]
 OWN_WT_DENIED_TOOLS = [
     ("Read", {"file_path": "{wt}/lnk/config.yaml"}),
     ("Read", {"file_path": "lnk/config.yaml"}),
@@ -1673,17 +1695,30 @@ def test_own_worktree_under_home_readable_by_shell(own_worktree, cmd):
 
 
 @pytest.mark.parametrize("cmd", OWN_WT_ALLOWED_GIT)
+@pytest.mark.parametrize("own_worktree", ["build", "test"], indirect=True)
 def test_own_worktree_under_home_git_dash_c_for_writers(own_worktree, cmd):
     pol, home, base, wt = own_worktree
-    if pol.role.value == "investigate":
-        pytest.skip("git -C is a BUILD/TEST row")
     assert pol.command_allowed(_fmt(cmd, base, wt)) == (True, ""), pol.role
+
+
+@pytest.mark.parametrize("cmd", OWN_WT_ALLOWED_WILDCARDS)
+def test_own_worktree_wildcards_that_stay_inside_allowed(own_worktree, cmd):
+    pol, home, base, wt = own_worktree
+    assert pol.command_allowed(_fmt(cmd, base, wt)) == (True, ""), pol.role
+
+
+@pytest.mark.parametrize("cmd", OWN_WT_DENIED_WILDCARDS)
+def test_own_worktree_wildcard_then_dotdot_judged_by_the_walk_up(own_worktree, cmd):
+    pol, home, base, wt = own_worktree
+    assert pol.command_allowed(_fmt(cmd, base, wt)) == (False, WILDCARD_HOME_REASON), pol.role
 
 
 @pytest.mark.parametrize("cmd", OWN_WT_DENIED_CMDS)
 def test_own_worktree_rule_keeps_the_rest_of_home_closed_to_shell(own_worktree, cmd):
     pol, home, base, wt = own_worktree
-    assert pol.command_allowed(_fmt(cmd, base, wt)) == (False, HOME_REASON), pol.role
+    substitutes = "$(" in cmd or "`" in cmd
+    expected = SUBSTITUTION_REASON if pol.role.value == "investigate" and substitutes else HOME_REASON
+    assert pol.command_allowed(_fmt(cmd, base, wt)) == (False, expected), pol.role
 
 
 @pytest.mark.parametrize("tool,inp", OWN_WT_DENIED_TOOLS)

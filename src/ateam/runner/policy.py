@@ -931,6 +931,14 @@ def _git_config_option(words: list[str]) -> bool:
     return any(o.startswith("-c") or o.startswith("--config-env") for o in opts)
 
 
+# Shell expansions in a path token. $PWD/$OLDPWD stand for a directory the command may run from; any other unexpanded
+# expansion followed by a `..` step is unknowable and treated as reaching ATeam's home (review, 2026-10-27).
+_PWD_VAR = re.compile(r"\$(?:\{(?:OLD)?PWD\}|(?:OLD)?PWD(?![A-Za-z0-9_]))")
+_BRACED_VAR = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
+_EXPANSION = re.compile(r"[$`]")
+_DOTDOT_STEP = re.compile(r"(?:^|/)\.\.(?:/|$)")
+
+
 # Where a spelling of the worker's own worktree ends in a command: end of text, a shell delimiter, or a `/` that does
 # not start a `..` step.
 _OWN_WORKTREE_END = r"""(?=$|[\s'"`;&|<>()]|/(?!\.\.(?:$|[/\s'"`;&|<>()])))"""
@@ -1081,54 +1089,82 @@ class Policy:
         joined = [base / candidate for base in self._bases()]
         return [*joined, *(Path(os.path.normpath(j)) for j in joined)]
 
-    def _under_home_not_scratch(self, file_path: str) -> bool:
-        """True when a path resolves into ATeam's home but not into this worker's scratch dir or own worktree."""
-        home = self.ateam_home or Path(os.environ.get("ATEAM_HOME") or (Path.home() / ".ateam"))
-        raw = file_path.strip().strip("'\"")
+    def _home(self) -> Path:
+        return self.ateam_home or Path(os.environ.get("ATEAM_HOME") or (Path.home() / ".ateam"))
+
+    def _expanded(self, text: str) -> list[str] | None:
+        """The spellings a path token takes once the shell expands ~, $HOME, $ATEAM_HOME, $PWD and $OLDPWD: one per
+        base for $PWD/$OLDPWD (the policy cannot know which applies). None when another expansion ($NAME, ${NAME},
+        $(...), `...`) is followed by a `..` step: where that lands cannot be judged, so it counts as reaching home."""
+        home = self._home()
+        raw = text.strip().strip("'\"")
         if raw.startswith("~"):
             raw = os.path.expanduser(raw)
-        raw = raw.replace("$HOME", str(Path.home())).replace("${HOME}", str(Path.home()))
-        raw = raw.replace("$ATEAM_HOME", str(home)).replace("${ATEAM_HOME}", str(home))
-        candidate = Path(raw)
-        candidates = self._candidates(candidate)
-        for cand in candidates:
-            try:
-                resolved = cand.resolve()
-            except OSError:
-                continue
-            try:
-                resolved.relative_to(home.resolve())
-            except ValueError:
-                continue
-            if self._in_scratch(str(resolved)):
-                continue
-            if self._in_own_worktree(resolved) and not self._in_own_worktree(home):   # a home nested in the worktree stays home
-                continue
+        for name, value in (("HOME", str(Path.home())), ("ATEAM_HOME", str(home))):
+            raw = re.sub(r"\$(?:\{%s\}|%s(?![A-Za-z0-9_]))" % (name, name), lambda _m, v=value: v, raw)
+        variants = [_PWD_VAR.sub(lambda _m, b=str(base): b, raw) for base in self._bases()] if _PWD_VAR.search(raw) else [raw]
+        for v in variants:
+            m = _EXPANSION.search(v)
+            if m and _DOTDOT_STEP.search(v[m.start():]):
+                return None
+        return variants
+
+    def _under_home_not_scratch(self, file_path: str) -> bool:
+        """True when a path resolves into ATeam's home but not into this worker's scratch dir or own worktree."""
+        home = self._home()
+        variants = self._expanded(file_path)
+        if variants is None:
             return True
+        home_in_worktree = self._in_own_worktree(home)   # a home nested in the worktree stays home
+        for raw in variants:
+            for cand in self._candidates(Path(raw)):
+                try:
+                    resolved = cand.resolve()
+                except OSError:
+                    continue
+                try:
+                    resolved.relative_to(home.resolve())
+                except ValueError:
+                    continue
+                if self._in_scratch(str(resolved)):
+                    continue
+                if self._in_own_worktree(resolved) and not home_in_worktree:
+                    continue
+                return True
         return False
 
     def _wildcard_reaches_home(self, token: str) -> bool:
-        """A wildcard token whose literal directory part is ATeam's home or one of its ancestors could expand into it."""
-        m = _WILDCARD.search(token)
-        if not m:
-            return False
-        literal = token[: m.start()]
-        directory = literal.rsplit("/", 1)[0] if "/" in literal else "."
-        home = (self.ateam_home or Path(os.environ.get("ATEAM_HOME") or (Path.home() / ".ateam"))).resolve()
-        raw = directory.strip().strip("'\"")
-        if raw.startswith("~"):
-            raw = os.path.expanduser(raw)
-        raw = raw.replace("$HOME", str(Path.home())).replace("${HOME}", str(Path.home()))
-        raw = raw.replace("$ATEAM_HOME", str(home)).replace("${ATEAM_HOME}", str(home))
-        candidate = Path(raw)
-        candidates = self._candidates(candidate)
-        for cand in candidates:
-            try:
-                resolved = cand.resolve()
-            except OSError:
+        """A wildcard token could expand into ATeam's home: its literal directory part, walked up by the `..` steps
+        that follow the wildcard component, is the home, one of its ancestors, or a home path."""
+        variants = self._expanded(token)
+        if variants is None:
+            return True
+        home = self._home().resolve()
+        for word in (w for v in variants for w in _brace_expand(v)):
+            m = _WILDCARD.search(_BRACED_VAR.sub("", word))
+            if not m:
+                if self._under_home_not_scratch(word):
+                    return True
                 continue
-            if resolved == home or resolved in home.parents or self._under_home_not_scratch(str(resolved)):
-                return True
+            m = _WILDCARD.search(word)
+            literal = word[: m.start()]
+            directory = literal.rsplit("/", 1)[0] if "/" in literal else "."
+            rest = word[len(directory) + 1:] if "/" in literal else word
+            depth = lowest = 0
+            for comp in rest.split("/"):
+                if comp in ("", "."):
+                    continue
+                depth += -1 if comp == ".." else 1
+                lowest = min(lowest, depth)
+            for cand in self._candidates(Path(directory or "/")):
+                try:
+                    resolved = cand.resolve()
+                except OSError:
+                    continue
+                for _ in range(-lowest):
+                    resolved = resolved.parent
+                if resolved == home or resolved in home.parents or self._under_home_not_scratch(str(resolved)):
+                    return True
         return False
 
     def _token_paths(self, token: str) -> list[str]:
@@ -1145,7 +1181,7 @@ class Policy:
         return [p for p in pieces if "/" in p or p.startswith((".", "~", "$"))]
 
     def _home_spellings(self) -> list[str]:
-        home = self.ateam_home or Path(os.environ.get("ATEAM_HOME") or (Path.home() / ".ateam"))
+        home = self._home()
         out = set(self._spellings(home)) | {"$ATEAM_HOME", "${ATEAM_HOME}", "~/.ateam", "$HOME/.ateam", "${HOME}/.ateam"}
         return sorted(out, key=len, reverse=True)
 
@@ -1262,7 +1298,7 @@ class Policy:
                 decoded = [e for w in words for e in _brace_expand(w)]   # a $'...' or quoted spelling of a home path
                 for tok in seg.replace('"', "").replace("'", "").split() + decoded:
                     for piece in self._token_paths(tok):
-                        if _WILDCARD.search(piece):
+                        if _WILDCARD.search(_BRACED_VAR.sub("", piece)):   # ${NAME} is an expansion, not a brace
                             if self._wildcard_reaches_home(piece):
                                 return False, "wildcard paths that could reach ATeam's home are not allowed"
                         elif self._under_home_not_scratch(piece):
