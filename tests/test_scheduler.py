@@ -53,7 +53,7 @@ class FakeWorkers:
     def __call__(self, target, cid, role, worktree, base, tier, prompt, result_file):
         with self.lock:
             n = sum(1 for c in self.calls if c[0] == cid and c[1] == role)
-            self.calls.append((cid, role, tier, prompt))
+            self.calls.append((cid, role, tier, prompt, worktree, base))
         paths = TargetPaths.from_root(target)
         db = StateDB(home_dir(target) / "state.db"); db.init_schema()
         intent = GitRepo(paths.intent)
@@ -127,7 +127,9 @@ def test_happy_path_merges_at_verify_and_stops_at_merge_proposed(plan3):
     cs = load_contracts(plan3.paths.contracts)
     assert all(cs[c].status == "integrated" for c in NAMES) and all(_db(plan3).contract_status(c) == "integrated" for c in NAMES)
     assert load_plans(plan3.paths.plans)["P-0001"].status == "merge_proposed" and s.proposal and s.proposal.is_file()
-    assert (home_dir(plan3.root) / "worktrees" / "C-0002" / "src" / "a" / "a.py").is_file()   # b cut after a merged
+    lane = home_dir(plan3.root) / "worktrees" / "C-0001"   # b depends on a: one lane, one worktree
+    assert (lane / "src" / "a" / "a.py").is_file() and (lane / "src" / "b" / "b.py").is_file()
+    assert not (home_dir(plan3.root) / "worktrees" / "C-0002").exists()
     assert GitRepo(plan3.root).rev_parse("main") == plan3.main and _db(plan3).run_lock_info() is None
     assert any("C-0001 build completed" in line for line in out)
 
@@ -176,7 +178,7 @@ def test_dry_run_writes_nothing_and_shows_worst_case(plan3):
     s, out = _run(plan3, fake, dry_run=True)
     text = "\n".join(out)
     assert s.outcome == "dry_run" and fake.calls == []
-    assert "wave 1: C-0001, C-0003" in text and "wave 2: C-0002" in text
+    assert "2 lane(s), up to 2 at once" in text and "lane 1: C-0001 -> C-0002" in text and "lane 2: C-0003" in text
     attempts = load_contracts(plan3.paths.contracts)["C-0001"].budget.attempts   # the planner's light-tier budget
     per_contract = (1.0 + 1.0) + (attempts - 1) * (2.0 + 2.0)   # first attempt light, the rest escalated to standard
     assert f"worst case ${3 * per_contract:.2f}" in text and "run budget $10.00" in text
@@ -255,7 +257,7 @@ def test_merge_conflict_pauses_environment_failure_contract_verified(plan3):
 
     _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
     s, out = _run(plan3, FakeWorkers({("C-0001", "build"): conflicting_merge_lands_first}))
-    assert s.outcome == "paused" and _last_reason(plan3) == "environment_failure: C-0001 conflicts in src/a/a.py"
+    assert s.outcome == "paused" and _last_reason(plan3) == "environment_failure: C-0001 conflicts in src/a/a.py; blocks C-0002 (same lane)"
     assert _db(plan3).contract_status("C-0001") == "verified"
 
 
@@ -383,7 +385,7 @@ def test_dependent_waits_for_its_dependency_to_be_integrated(plan3, monkeypatch)
         m.setattr(sch, "merge_contract", slow_merge)
         s, out = _run(plan3, FakeWorkers())
     assert s.outcome == "merge_proposed", out
-    assert (home_dir(plan3.root) / "worktrees" / "C-0002" / "src" / "a" / "a.py").is_file()
+    assert (home_dir(plan3.root) / "worktrees" / "C-0001" / "src" / "b" / "b.py").is_file()   # b ran in a's lane worktree
 
 
 def test_a_verified_result_without_the_store_agreeing_is_not_merged(plan3):
@@ -709,3 +711,115 @@ def _c(paths, incidental=(), depends_on=()):
 def test_lanes(contracts, files, expected):
     from ateam.scheduler import lanes
     assert lanes(contracts, sorted(contracts), files) == expected
+
+
+def _report_lanes():
+    r = _report3()
+    for c, paths in zip(r["contracts"], (["src/shared/**", "src/a/**", "tests/test_a.py"], ["src/shared/**", "src/b/**", "tests/test_b.py"],
+                                         ["src/c/**", "tests/test_c.py"])):
+        c["paths"], c["depends_on"] = paths, []
+    return r
+
+
+def _approve_lanes(target_repo, monkeypatch, check="true", max_workers=2):
+    """C-0001 and C-0002 share src/shared/** (one lane); C-0003 is a lane of one. No dependencies. The check's command
+    is frozen into the contracts at approval."""
+    paths = TargetPaths.from_root(target_repo)
+    _set_config(paths, checks=[NamedCheck(name="unit", cmd=check)], max_workers=max_workers)
+    _fake_planner(monkeypatch, _report_lanes())
+    assert run("plan", "lanes", "--no-review", "--target", str(target_repo)).exit_code == 0
+    r = run("approve", "P-0001", "--skip-records", "--target", str(target_repo))
+    assert r.exit_code == 0
+    return SimpleNamespace(root=target_repo, paths=paths, main=GitRepo(target_repo).head(), approve_output=r.output)
+
+
+@pytest.fixture
+def plan_lanes(target_repo, monkeypatch):
+    return _approve_lanes(target_repo, monkeypatch)
+
+
+def test_approve_prints_the_lanes(plan_lanes):
+    assert "2 lane(s), up to 2 at once" in plan_lanes.approve_output
+    assert "lane 1: C-0001 -> C-0002" in plan_lanes.approve_output and "lane 2: C-0003" in plan_lanes.approve_output
+
+
+def test_a_lane_runs_in_one_worktree_and_the_follower_is_based_on_the_verified_head(plan_lanes):
+    seen = {}
+
+    def note_predecessor(fake, cid, role, worktree, n):
+        seen["C-0001"] = _db(plan_lanes).contract_status("C-0001")
+        return {}
+
+    fake = FakeWorkers({("C-0002", "build", 0): note_predecessor})
+    s, out = _run(plan_lanes, fake)
+    assert s.outcome == "merge_proposed", out
+    lane = home_dir(plan_lanes.root) / "worktrees" / "C-0001"
+    b_build = next(c for c in fake.calls if c[0] == "C-0002" and c[1] == "build")
+    assert b_build[4] == lane and b_build[5] == _db(plan_lanes).latest_checkpoint("C-0001")["head"] == _db(plan_lanes).get_meta("base:C-0002")
+    assert _db(plan_lanes).get_meta("lane:C-0002") == "C-0001" and not (home_dir(plan_lanes.root) / "worktrees" / "C-0002").exists()
+    assert seen == {"C-0001": "integrated"}
+
+
+def test_disjoint_lanes_overlap_in_time(plan_lanes):
+    fake = FakeWorkers(delay=0.3)
+    s, out = _run(plan_lanes, fake)
+    assert s.outcome == "merge_proposed", out
+    span = {cid: (t0, t1) for cid, role, t0, t1, *_ in fake.intervals if role == "build"}
+    (a0, a1), (c0, c1) = span["C-0001"], span["C-0003"]
+    assert a0 < c1 and c0 < a1
+
+
+def test_a_failure_mid_lane_blocks_the_rest_of_that_lane(plan_lanes):
+    fake = FakeWorkers({("C-0001", "test"): {"code": 5, "outcome": "failed", "test_class": "requirements"}})
+    s, out = _run(plan_lanes, fake)
+    assert s.outcome == "paused", out
+    assert not any(c[0] == "C-0002" for c in fake.calls)
+    pause = _db(plan_lanes).open_pause("P-0001")
+    assert pause["reason"] == "decision_change_needed" and pause["detail"].endswith("; blocks C-0002 (same lane)")
+
+
+def test_a_follower_with_untracked_leftovers_pauses(target_repo, monkeypatch):
+    plan_lanes = _approve_lanes(target_repo, monkeypatch, check="touch leftover.txt", max_workers=1)
+    fake = FakeWorkers()
+    s, out = _run(plan_lanes, fake)
+    assert s.outcome == "paused", out
+    assert not any(c[0] == "C-0002" for c in fake.calls)
+    pause = _db(plan_lanes).open_pause("P-0001")
+    assert pause["reason"] == "environment_failure"
+    assert pause["detail"] == "C-0002: the lane worktree has files left by an earlier contract (leftover.txt)"
+
+
+def test_setup_reruns_on_each_new_base(plan_lanes, tmp_path):
+    from ateam.config import load_config
+    from ateam.runner.run import ensure_setup
+
+    counter = tmp_path / "setup-count"
+    _set_config(plan_lanes.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=2, setup=[f"echo x >> {counter}"])
+
+    def with_setup(extra):
+        def build(fake, cid, role, worktree, n):
+            base = _db(plan_lanes).get_meta(f"base:{cid}")
+            ensure_setup(worktree, load_config(plan_lanes.paths), _db(plan_lanes), base)
+            return dict(extra)
+        return build
+
+    scope = {"code": 3, "outcome": "scope_breach", "commit": False}
+    fake = FakeWorkers({("C-0001", "build"): with_setup({}), ("C-0002", "build"): with_setup({}),
+                        ("C-0003", "build", 0): with_setup(scope), ("C-0003", "build", 1): with_setup({})})
+    s, out = _run(plan_lanes, fake)
+    assert s.outcome == "merge_proposed", out
+    # C-0001, C-0002 on its new base, C-0003 once for two attempts, and the integration worktree at the end
+    assert len(fake.tiers("C-0003")) == 2 and counter.read_text().count("x") == 4
+
+
+def test_investigation_runs_in_the_lane_worktree_and_status_names_it(plan_lanes):
+    inv = FakeInvestigator()
+    fake = FakeWorkers({("C-0002", "test"): {"code": 5, "outcome": "failed", "test_class": "requirements"}})
+    _set_config(plan_lanes.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    s, out = _run(plan_lanes, fake, investigate=inv)
+    assert s.outcome == "paused", out
+    lane = home_dir(plan_lanes.root) / "worktrees" / "C-0001"
+    assert [(c[0], c[2]) for c in inv.calls] == [("C-0002", lane)]
+    r = run("status", "P-0001", "--target", str(plan_lanes.root))
+    assert f"worktree: {lane}" in r.output
+    assert "lane 1: C-0001 -> C-0002" in r.output and "lane 2: C-0003" in r.output

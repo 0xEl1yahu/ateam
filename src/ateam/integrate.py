@@ -128,7 +128,8 @@ def integrate(ctx, plan_id: str, echo: Callable[[str], None]) -> IntegrateResult
 
     wt = _prepare(paths, db, owner, config, plan_id, branch, target_tip, echo)
     try:
-        ensure_setup(wt.root, config, db, on_command=lambda c: echo(f"setup: {c}"))
+        ensure_setup(wt.root, config, db, json.loads(db.get_meta(f"integration:{plan_id}"))["start"],
+                     on_command=lambda c: echo(f"setup: {c}"))
     except SetupError as e:
         return _pause(paths, db, plan, "setup_failed", f"environment_failure: setup failed: {e.cmd}",
                       [line for line in e.output.splitlines()[-20:]], echo)

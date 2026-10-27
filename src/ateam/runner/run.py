@@ -105,19 +105,20 @@ class SetupError(Exception):
 SETUP_TIMEOUT_S = 600
 
 
-def setup_key(worktree: Path) -> str:
-    """The state-store key that marks setup done for this worktree: its resolved path plus the identity (inode and
-    change time) of its `.git` entry, so a worktree removed and recreated at the same path runs setup again."""
+def setup_key(worktree: Path, base: str) -> str:
+    """The state-store key that marks setup done for this worktree on this base: its resolved path plus the identity
+    (inode and change time) of its `.git` entry, so a worktree removed and recreated at the same path runs setup again,
+    plus the base, so a lane's worktree runs it again for each contract on a new base (owner, 2026-10-27)."""
     resolved = worktree.resolve()
     marker = resolved / ".git"
     st = marker.stat() if marker.exists() else resolved.stat()
-    return f"setup:{resolved}:{st.st_ino}:{st.st_ctime_ns}"
+    return f"setup:{resolved}:{st.st_ino}:{st.st_ctime_ns}:{base}"
 
 
-def ensure_setup(worktree: Path, config: TargetConfig, db: StateDB, on_command=None) -> list[str]:
-    """Run config.setup once per worktree; return the commands run ([] when already done or none configured).
+def ensure_setup(worktree: Path, config: TargetConfig, db: StateDB, base: str, on_command=None) -> list[str]:
+    """Run config.setup once per worktree and base; return the commands run ([] when already done or none configured).
     Each command has SETUP_TIMEOUT_S seconds; a timeout is a SetupError."""
-    key = setup_key(worktree)
+    key = setup_key(worktree, base)
     if not config.setup or db.get_meta(key):
         return []
     env = {**os.environ, **config.env}

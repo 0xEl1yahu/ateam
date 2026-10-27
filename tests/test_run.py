@@ -190,11 +190,11 @@ def test_ensure_setup_runs_commands_once_per_worktree(target_repo, ateam_home, t
 
     db = _setup_db(tmp_path)
     cfg = TargetConfig(setup=["touch setup-ran", "echo second"], env={"ATEAM_X": "1"})
-    ran = ensure_setup(target_repo, cfg, db)
+    ran = ensure_setup(target_repo, cfg, db, "b")
     assert ran == cfg.setup and (target_repo / "setup-ran").exists()
-    assert db.get_meta(setup_key(target_repo))
+    assert db.get_meta(setup_key(target_repo, "b"))
     (target_repo / "setup-ran").unlink()
-    assert ensure_setup(target_repo, cfg, db) == [] and not (target_repo / "setup-ran").exists()
+    assert ensure_setup(target_repo, cfg, db, "b") == [] and not (target_repo / "setup-ran").exists()
 
 
 def test_ensure_setup_passes_config_env(target_repo, ateam_home, tmp_path):
@@ -202,7 +202,7 @@ def test_ensure_setup_passes_config_env(target_repo, ateam_home, tmp_path):
     from ateam.runner.run import ensure_setup, setup_key
 
     cfg = TargetConfig(setup=["echo $ATEAM_X > env-out"], env={"ATEAM_X": "seen"})
-    ensure_setup(target_repo, cfg, _setup_db(tmp_path))
+    ensure_setup(target_repo, cfg, _setup_db(tmp_path), "b")
     assert (target_repo / "env-out").read_text().strip() == "seen"
 
 
@@ -211,8 +211,8 @@ def test_ensure_setup_with_no_commands_records_nothing(target_repo, ateam_home, 
     from ateam.runner.run import ensure_setup, setup_key
 
     db = _setup_db(tmp_path)
-    assert ensure_setup(target_repo, TargetConfig(), db) == []
-    assert db.get_meta(setup_key(target_repo)) is None
+    assert ensure_setup(target_repo, TargetConfig(), db, "b") == []
+    assert db.get_meta(setup_key(target_repo, "b")) is None
 
 
 def test_ensure_setup_failure_records_nothing(target_repo, ateam_home, tmp_path):
@@ -222,9 +222,9 @@ def test_ensure_setup_failure_records_nothing(target_repo, ateam_home, tmp_path)
     db = _setup_db(tmp_path)
     cfg = TargetConfig(setup=["echo before", "echo boom >&2; exit 3", "echo never"])
     with pytest.raises(SetupError) as e:
-        ensure_setup(target_repo, cfg, db)
+        ensure_setup(target_repo, cfg, db, "b")
     assert e.value.cmd == "echo boom >&2; exit 3" and e.value.returncode == 3 and "boom" in e.value.output
-    assert db.get_meta(setup_key(target_repo)) is None
+    assert db.get_meta(setup_key(target_repo, "b")) is None
 
 
 @pytest.mark.parametrize("verdicts,flag,expected", [
@@ -281,14 +281,14 @@ def test_ensure_setup_runs_again_for_a_worktree_recreated_at_the_same_path(targe
     wt = tmp_path / "wt-again"
     g = GitRepo(target_repo)
     g.worktree_add(wt, "wt-again", "main")
-    first = setup_key(wt)
-    assert ensure_setup(wt, cfg, db) == cfg.setup
-    assert ensure_setup(wt, cfg, db) == []
+    first = setup_key(wt, "b")
+    assert ensure_setup(wt, cfg, db, "b") == cfg.setup
+    assert ensure_setup(wt, cfg, db, "b") == []
     g.run("worktree", "remove", "--force", str(wt))
     g.run("branch", "-D", "wt-again")
     g.worktree_add(wt, "wt-again", "main")
-    assert setup_key(wt) != first and not (wt / "setup-ran").exists()
-    assert ensure_setup(wt, cfg, db) == cfg.setup and (wt / "setup-ran").exists()
+    assert setup_key(wt, "b") != first and not (wt / "setup-ran").exists()
+    assert ensure_setup(wt, cfg, db, "b") == cfg.setup and (wt / "setup-ran").exists()
 
 
 # Item 20: a setup command that hangs is a SetupError, not a hung run.
@@ -299,9 +299,9 @@ def test_ensure_setup_times_out(target_repo, ateam_home, tmp_path, monkeypatch):
     monkeypatch.setattr(run_mod, "SETUP_TIMEOUT_S", 0.5)
     db = _setup_db(tmp_path)
     with pytest.raises(run_mod.SetupError) as e:
-        run_mod.ensure_setup(target_repo, TargetConfig(setup=["sleep 5"]), db)
+        run_mod.ensure_setup(target_repo, TargetConfig(setup=["sleep 5"]), db, "b")
     assert e.value.cmd == "sleep 5" and "timed out after 0.5 s" in e.value.output
-    assert db.get_meta(run_mod.setup_key(target_repo)) is None
+    assert db.get_meta(run_mod.setup_key(target_repo, "b")) is None
 
 
 def test_setup_timeout_is_ten_minutes():
@@ -403,3 +403,16 @@ async def test_build_attempt_brief_carries_only_live_guidance(monkeypatch, targe
     await _attempt(run_mod, target_repo, target_paths, contract, records_three, db, Role.build)
     await _attempt(run_mod, target_repo, target_paths, contract, records_three, db, Role.test)
     assert [e.text for e in briefs[0]] == ["live"] and list(briefs[1]) == []
+
+
+def test_setup_key_covers_the_base(target_repo, ateam_home, tmp_path):
+    """Owner ruling 10 (2026-10-27): a lane worktree runs setup again for each new base, once per base."""
+    from ateam.config import TargetConfig
+    from ateam.runner.run import ensure_setup
+
+    db = _setup_db(tmp_path)
+    cfg = TargetConfig(setup=["echo x >> setup-count"])
+    assert ensure_setup(target_repo, cfg, db, "base-one") == cfg.setup
+    assert ensure_setup(target_repo, cfg, db, "base-one") == []
+    assert ensure_setup(target_repo, cfg, db, "base-two") == cfg.setup
+    assert (target_repo / "setup-count").read_text().count("x") == 2

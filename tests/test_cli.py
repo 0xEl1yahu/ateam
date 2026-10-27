@@ -1721,7 +1721,7 @@ def test_worker_run_checks_binding_before_setup(cli_target, tmp_path):
     wt = tmp_path / "wt-unbound"; GitRepo(cli_target).worktree_add(wt, "wt-unbound", "main")
     r = run("worker", "run", "C-0001", "--role", "build", "--cwd", str(wt), "--target", str(cli_target))
     assert r.exit_code == 4 and "not frozen" in r.output
-    assert not (wt / "setup-ran").exists() and _db(cli_target).get_meta(setup_key(wt)) is None
+    assert not (wt / "setup-ran").exists() and _db(cli_target).get_meta(setup_key(wt, GitRepo(cli_target).rev_parse("main"))) is None
 
 
 

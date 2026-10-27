@@ -7,6 +7,10 @@ Every child reports through a --result-file. Sessions run in parallel up to conf
 commits to the intent repo or creates refs runs alone under a writer-preferring gate, so the tamper checks of
 sessions and verifies never see another step's commit (owner, 2026-10-26). Retries follow ateam.retry; a run spends
 at most config.run_budget_usd on sessions. `ateam run` never merges into the target branch.
+
+Contracts whose declared paths overlap, or that depend on each other, form a lane (design 2026-10-27): a lane runs
+its contracts one after another in one shared worktree, each starting from the previous contract's verified head once
+that contract is integrated, and lanes run in parallel up to config.max_workers.
 """
 
 from __future__ import annotations
@@ -40,7 +44,7 @@ from ateam.records.store import load_records
 from ateam.retry import StepOutcome, classify, decide, next_tier
 from ateam.roles import Role
 from ateam.tiers import at_least, load_tiers
-from ateam.worktrees import WorktreeError, contract_worktree
+from ateam.worktrees import WorktreeError, contract_worktree, worktree_path
 
 LIVE = ("plan_approved", "executing", "integrating")
 STOP_POLL_S = 0.5   # how often the main loop reads a stop request from the store
@@ -373,21 +377,23 @@ def lanes(contracts: dict, cids: list[str], files: list[str]) -> list[list[str]]
     return sorted((dependency_order({c: contracts[c] for c in g}) for g in groups.values()), key=lambda lane: lane[0])
 
 
+def plan_lanes(ctx, plan_id: str, cs: dict, cids: list[str]) -> list[list[str]]:
+    """The plan's lanes, from the files at its recorded integration start (the target tip before a run started)."""
+    raw = ctx.db.get_meta(f"integration:{plan_id}")
+    rev = json.loads(raw)["start"] if raw else ctx.config.target_branch
+    return lanes(cs, cids, ctx.git.files_at(rev))
+
+
+def lane_lines(groups: list[list[str]], max_workers: int) -> list[str]:
+    return [f"{len(groups)} lane(s), up to {max_workers} at once",
+            *(f"lane {n}: {' -> '.join(lane)}" for n, lane in enumerate(groups, 1))]
+
+
 def _dry_run(ctx, plan_id: str, cs, cids: list[str], say) -> RunSummary:
     tiers = load_tiers(ctx.config.tiers)
-    level: dict[str, int] = {}
-
-    def depth(cid: str) -> int:
-        if cid not in level:
-            level[cid] = 1 + max((depth(d) for d in cs[cid].depends_on if d in cids), default=0)
-        return level[cid]
-
-    waves: dict[int, list[str]] = {}
-    for cid in sorted(cids):
-        waves.setdefault(depth(cid), []).append(cid)
-    say(f"dry run {plan_id}: {len(cids)} contract(s), up to {ctx.config.max_workers} at once; nothing is launched or written")
-    for n in sorted(waves):
-        say(f"wave {n}: {', '.join(waves[n])}")
+    say(f"dry run {plan_id}: {len(cids)} contract(s); nothing is launched or written")
+    for line in lane_lines(plan_lanes(ctx, plan_id, cs, cids), ctx.config.max_workers):
+        say(line)
     total = 0.0
     for cid in dependency_order({c: cs[c] for c in cids}):
         c = cs[cid]
@@ -414,6 +420,8 @@ class _Run:
         self._counter, self._counter_lock = 0, threading.Lock()
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         self.runs_dir = fresh_dir(home_dir(ctx.paths.root) / "runs" / plan_id, f"{stamp}-{os.getpid()}")   # never reused
+        self.lanes: list[list[str]] = []
+        self.prev: dict[str, str | None] = {}
 
     # -- the main loop -------------------------------------------------------
 
@@ -431,6 +439,8 @@ class _Run:
             except IntegrateRefused as e:
                 raise RunRefused(str(e)) from None
             self._refresh(ctx)
+            self.lanes = plan_lanes(ctx, self.plan_id, load_contracts(ctx.paths.contracts), self.cids)
+            self.prev = {cid: (lane[i - 1] if i else None) for lane in self.lanes for i, cid in enumerate(lane)}
 
         running: dict[str, threading.Thread] = {}
         settled: set[str] = set()
@@ -494,6 +504,8 @@ class _Run:
                      "re-run with a larger run_budget_usd to continue")
             return self._summary("budget", statuses, [message])
         if pauses:
+            for o in pauses:
+                o.detail = (o.detail or "") + self._blocks(db, o.cid)
             first = pauses[0]
             why = f"{first.reason}: {first.detail}"
             self._close_open_attempts()
@@ -531,7 +543,7 @@ class _Run:
             def note(text: str) -> None:
                 db.set_pause_findings(pause_id, cid, None, None, text)
 
-            worktree = home_dir(ctx.paths.root) / "worktrees" / cid
+            worktree = worktree_path(ctx.paths, db, cid)
             if self.stop.is_set():
                 note("interrupted"); continue
             if not worktree.exists():
@@ -558,12 +570,14 @@ class _Run:
                 note(f"investigation {outcome}: {r.get('error') or 'no findings written'}")
 
     def _startable(self, db, cs, cid: str) -> bool:
-        """Ready or failed contracts start only when every in-plan dependency is integrated, so a dependent is never
-        cut before its dependency's merge; a verified contract (stopped before its merge) is merged at once."""
+        """Ready or failed contracts start only when every in-plan dependency, and the contract before them in their
+        lane, is integrated, so nothing is cut before the work it builds on is merged; a verified contract (stopped
+        before its merge) is merged at once."""
         status = db.contract_status(cid)
         if status == "verified":
             return True
-        return status in ("ready", "failed") and all(db.contract_status(d) == "integrated" for d in cs[cid].depends_on if d in self.cids)
+        before = [d for d in cs[cid].depends_on if d in self.cids] + ([self.prev[cid]] if self.prev.get(cid) else [])
+        return status in ("ready", "failed") and all(db.contract_status(d) == "integrated" for d in before)
 
     def _summary(self, outcome, statuses, messages, proposal=None) -> RunSummary:
         self.say(f"summary: {outcome}; {self.sessions} session(s), ${self.budget.spent:.2f} spent; "
@@ -595,9 +609,15 @@ class _Run:
         c = load_contracts(ctx.paths.contracts)[cid]
         with self.gate.exclusive():
             try:
-                w = contract_worktree(ctx.paths, db, ctx.git, self.plan_id, cid)
+                w = contract_worktree(ctx.paths, db, ctx.git, self.plan_id, cid, after=self.prev.get(cid))
             except WorktreeError as e:
                 return _Outcome(cid, "pause", "environment_failure", f"{cid}: {e}", evidence={"error": str(e)})
+            if self.prev.get(cid) and not db.attempts_for(cid, role="build"):   # a follower's first BUILD (owner, 2026-10-27)
+                left = [path for _, path in GitRepo(w.path).status_porcelain()]
+                if left:
+                    return _Outcome(cid, "pause", "environment_failure",
+                                    f"{cid}: the lane worktree has files left by an earlier contract ({', '.join(left)})",
+                                    evidence={"paths": left})
         frozen = c.allocation.tier["build"]
         builds = self._counted_builds(db, cid)
         tier = builds[-1]["tier"] if builds and builds[-1]["tier"] in self.tiers else frozen
@@ -681,6 +701,12 @@ class _Run:
                 return _Outcome(cid, "pause", "environment_failure",
                                 f"{cid} verify reported verified but the state store says {db.contract_status(cid)}", evidence=v)
             return self._merge(ctx, cid)
+
+    def _blocks(self, db, cid: str) -> str:
+        """`; blocks C-x, C-y (same lane)` for the unfinished contracts after `cid` in its lane, which build on it."""
+        lane = next((lane for lane in self.lanes if cid in lane), [cid])
+        later = [c for c in lane[lane.index(cid) + 1:] if db.contract_status(c) != "integrated"]
+        return f"; blocks {', '.join(later)} (same lane)" if later else ""
 
     def _counted_builds(self, db, cid: str) -> list[dict]:
         """BUILD attempts that count toward budget.attempts: those since the contract's latest resume window, and never

@@ -856,6 +856,7 @@ def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, force
             ctx.db.set_record_hash(r.id, r.content_hash())
     ctx.db.transition("feature", plan_id, "plan_approved", by="owner")
     click.echo(f"{plan_id} -> plan_approved")
+    _echo_lanes(ctx, plan_)
     if superseded_id is None:
         return
     if old_approved:
@@ -1697,8 +1698,22 @@ def status(plan_id: str | None, target: Path) -> None:
             click.echo(f"  {pid} paused ({reason}): ateam status {pid}")
 
 
+def _echo_lanes(ctx: Context, plan) -> None:
+    """The plan's lanes (design 2026-10-27): contracts that run one after another in one worktree."""
+    from ateam.contracts.store import load_contracts
+    from ateam.plans.ops import plan_contract_ids
+    from ateam.scheduler import lane_lines, plan_lanes
+
+    cids = plan_contract_ids(ctx.db, plan)
+    cs = load_contracts(ctx.paths.contracts)
+    if cids and all(c in cs for c in cids):
+        for line in lane_lines(plan_lanes(ctx, plan.id, cs, cids), ctx.config.max_workers):
+            click.echo(line)
+
+
 def _status_plan(ctx: Context, plan) -> None:
     from ateam.plans.ops import plan_contract_ids
+    from ateam.worktrees import worktree_path
 
     pid = plan.id
     live = ctx.db.feature_status(pid) or str(plan.status)
@@ -1706,6 +1721,7 @@ def _status_plan(ctx: Context, plan) -> None:
     for cid in plan_contract_ids(ctx.db, plan):
         last = ctx.db.latest_attempt(cid)
         click.echo(f"  {cid}  {ctx.db.contract_status(cid)}" + (f"  last attempt: {last['role']} {last['outcome'] or 'running'}" if last else ""))
+    _echo_lanes(ctx, plan)
     if live != "paused":
         return
     pause = ctx.db.open_pause(pid)
@@ -1716,7 +1732,7 @@ def _status_plan(ctx: Context, plan) -> None:
     click.echo(f"\npaused ({pause['reason']}): {pause['detail']}")
     for c in pause["contracts"]:
         click.echo(f"\n{c['contract_id']} ({c['reason']}): {c['detail']}")
-        click.echo(f"  worktree: {home_dir(ctx.paths.root) / 'worktrees' / c['contract_id']}")
+        click.echo(f"  worktree: {worktree_path(ctx.paths, ctx.db, c['contract_id'])}")
         f = c["findings"]
         if not f:
             click.echo(f"  no findings: {c['note'] or 'no investigation ran'}")
@@ -1874,15 +1890,16 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
         tiers = load_tiers(ctx.config.tiers)
         if tier and tier not in tiers:
             _fail(f"unknown tier {tier!r}; known: {', '.join(tiers)}")
+        base = base or default_base(wt_git, ctx.config.target_branch)
         try:
-            ensure_setup(worktree, ctx.config, ctx.db, on_command=lambda c: click.echo(f"setup: {c}"))
+            ensure_setup(worktree, ctx.config, ctx.db, base, on_command=lambda c: click.echo(f"setup: {c}"))
         except SetupError as e:
             out["outcome"] = "setup_failed"
             _fail(f"setup failed: {e.cmd} (exit {e.returncode})\n{e.output}")
         try:
             res, tree, scope, cp = asyncio.run(run_contract_attempt(
                 paths=ctx.paths, config=ctx.config, git_worktree=wt_git, worktree=worktree,
-                base=base or default_base(wt_git, ctx.config.target_branch),
+                base=base,
                 contract=contract, records=records, role=Role(role), tiers=tiers,
                 db=ctx.db, resume=resume, prompt=prompt, tier_override=tier,
             ))
