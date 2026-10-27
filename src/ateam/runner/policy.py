@@ -936,6 +936,9 @@ def _git_config_option(words: list[str]) -> bool:
 _PWD_VAR = re.compile(r"\$(?:\{(?:OLD)?PWD\}|(?:OLD)?PWD(?![A-Za-z0-9_]))")
 _BRACED_VAR = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
 _EXPANSION = re.compile(r"[$`]")
+_BRACED_ANY = re.compile(r"\$\{([^}]*)\}")
+_BRACED_NAME = re.compile(r"[#!]?([A-Za-z_][A-Za-z0-9_]*)")
+_PATH_VAR_NAMES = frozenset({"PWD", "OLDPWD", "HOME", "ATEAM_HOME"})
 _DOTDOT_STEP = re.compile(r"(?:^|/)\.\.(?:/|$)")
 
 
@@ -1095,13 +1098,22 @@ class Policy:
     def _expanded(self, text: str) -> list[str] | None:
         """The spellings a path token takes once the shell expands ~, $HOME, $ATEAM_HOME, $PWD and $OLDPWD: one per
         base for $PWD/$OLDPWD (the policy cannot know which applies). None when another expansion ($NAME, ${NAME},
-        $(...), `...`) is followed by a `..` step: where that lands cannot be judged, so it counts as reaching home."""
+        $(...), `...`) is followed by a `..` step: where that lands cannot be judged, so it counts as reaching home.
+        Likewise an operator ${...} (anything but a plain ${NAME}) of PWD, OLDPWD, HOME or ATEAM_HOME, or of any other
+        name with a `/` right before or after it outside the braces (R-0021)."""
         home = self._home()
         raw = text.strip().strip("'\"")
         if raw.startswith("~"):
             raw = os.path.expanduser(raw)
         for name, value in (("HOME", str(Path.home())), ("ATEAM_HOME", str(home))):
             raw = re.sub(r"\$(?:\{%s\}|%s(?![A-Za-z0-9_]))" % (name, name), lambda _m, v=value: v, raw)
+        for m in _BRACED_ANY.finditer(raw):
+            if _BRACED_NAME.fullmatch(m.group(1)):
+                continue   # a plain ${NAME}: taken literally
+            name = _BRACED_NAME.match(m.group(1))
+            before, after = raw[max(m.start() - 1, 0):m.start()], raw[m.end():m.end() + 1]
+            if (name and name.group(1) in _PATH_VAR_NAMES) or "/" in (before, after):
+                return None
         variants = [_PWD_VAR.sub(lambda _m, b=str(base): b, raw) for base in self._bases()] if _PWD_VAR.search(raw) else [raw]
         for v in variants:
             m = _EXPANSION.search(v)
