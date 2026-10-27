@@ -430,3 +430,118 @@ def test_run_refuses_while_a_plan_is_being_planned(plan3):
     with pytest.raises(RunRefused, match=r"P-0009 is being planned \(pid \d+\); wait for it to finish"):
         _run(plan3, fake)
     assert fake.calls == [] and db.run_lock_info() is None      # the lock is released afterwards
+
+
+# ---- pause records, attempt windows, owner stop (pause and resume, task 4)
+
+def test_a_pause_is_recorded_with_its_contract_and_evidence(plan3):
+    fake = FakeWorkers({("C-0001", "test"): {"code": 5, "test_outcome": "failed", "test_class": "requirements"}})
+    s, out = _run(plan3, fake)
+    db = _db(plan3); p = db.open_pause("P-0001")
+    assert s.outcome == "paused" and p["reason"] == "decision_change_needed" and not p["conflict"]
+    [c] = p["contracts"]
+    assert c["contract_id"] == "C-0001" and c["evidence"]["test_class"] == "requirements"
+    assert c["contract_hash"] == db.contract_hash("C-0001") and db.contract_status("C-0001") == "ready"
+
+
+def test_merge_conflict_pause_is_marked_conflict(plan3):
+    from ateam.integrate import integration_worktree
+
+    def conflicting_merge_lands_first(fake, cid, role, worktree, n):
+        wt = GitRepo(integration_worktree(plan3.paths, "P-0001"))
+        (wt.root / "src" / "a").mkdir(parents=True, exist_ok=True)
+        (wt.root / "src" / "a" / "a.py").write_text("A = 'someone else'\n")
+        wt.run("add", "-A"); wt.run("commit", "-q", "-m", "a conflicting merge")
+        return {}
+
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    s, out = _run(plan3, FakeWorkers({("C-0001", "build"): conflicting_merge_lands_first}))
+    p = _db(plan3).open_pause("P-0001")
+    assert s.outcome == "paused" and p["conflict"] is True and p["contracts"][0]["contract_id"] == "C-0001"
+
+
+def test_a_window_refreshes_attempts_and_escalation(plan3):
+    from ateam.plans.ops import set_plan_status
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)   # C-0003 never starts
+    turns = {"code": 1, "outcome": "failed", "subtype": "error_max_turns", "commit": False}
+    s, out = _run(plan3, FakeWorkers({("C-0001", "build"): turns}))     # escalates once, then budget_exhausted
+    assert s.outcome == "paused" and _last_reason(plan3).startswith("budget_exhausted: C-0001")
+    db = _db(plan3); pause = db.open_pause("P-0001")
+    used = len(db.attempts_for("C-0001", role="build"))
+    db.resume_pause(pause["pause_id"], ["C-0001"])
+    set_plan_status(plan3.paths, db, load_plans(plan3.paths.plans)["P-0001"], ["executing"], by="t")
+    fake2 = FakeWorkers()
+    s2, out2 = _run(plan3, fake2)
+    assert s2.outcome == "merge_proposed", out2
+    assert fake2.tiers("C-0001")[0] is None                               # the frozen tier again
+    assert len(_db(plan3).attempts_for("C-0001", role="build")) == used + 1
+
+
+def test_owner_stop_pauses_owner_stopped(plan3):
+    def owner_stop(fake, cid, role, worktree, n):
+        _db(plan3).request_stop("P-0001")
+        time.sleep(0.8)                                                    # the loop polls within 0.5 s
+        return {"code": 130, "outcome": "interrupted", "commit": False}
+
+    s, out = _run(plan3, FakeWorkers({("C-0001", "build", 0): owner_stop}))
+    db = _db(plan3)
+    assert s.outcome == "paused" and _last_reason(plan3) == "owner_stopped: stopped by the owner"
+    assert db.open_pause("P-0001")["contracts"] == [] and not db.stop_requested("P-0001")
+    assert db.open_attempts(list(NAMES)) == [] and db.run_lock_info() is None
+
+
+def test_owner_stop_during_an_exclusive_step_finishes_it_without_tamper(plan3):
+    from ateam.integrate import integration_worktree
+    from ateam.scheduler import run_child
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+
+    def child(argv, result_file):
+        if "verify" in argv:
+            _db(plan3).request_stop("P-0001")
+            time.sleep(0.8)                                                # the loop sees the request while verify runs
+        return run_child(argv, result_file)
+
+    s, out = _run(plan3, FakeWorkers(), child=child)
+    db = _db(plan3)
+    assert s.outcome == "paused" and _last_reason(plan3) == "owner_stopped: stopped by the owner", out
+    assert db.contract_status("C-0001") in ("verified", "integrated")      # the verify finished and was recorded
+    assert all(a["outcome"] != "tamper" for a in db.telemetry_rows())
+    git_dir = GitRepo(integration_worktree(plan3.paths, "P-0001")).run("rev-parse", "--git-dir").strip()
+    from pathlib import Path
+    assert not (Path(git_dir) / "index.lock").exists()
+
+
+def test_a_stop_request_left_from_before_the_run_is_cleared(plan3):
+    _db(plan3).request_stop("P-0001")
+    s, out = _run(plan3, FakeWorkers())
+    assert s.outcome == "merge_proposed" and not _db(plan3).stop_requested("P-0001")
+
+
+def test_default_launch_registers_and_interrupt_all_signals_only_children(plan3, monkeypatch, tmp_path):
+    import signal
+    from ateam import scheduler
+    monkeypatch.setattr(scheduler, "ateam_argv", lambda: ["/bin/sh", "-c", "sleep 30", "child"])
+    box = {}
+    t = threading.Thread(target=lambda: box.update(r=scheduler.default_launch(plan3.root, "C-0001", "build", plan3.root, "x",
+                                                                              None, None, tmp_path / "r.json")))
+    t.start()
+    deadline = time.monotonic() + 5
+    while not scheduler._Children.interrupt_all() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    t.join(5)
+    assert not t.is_alive() and box["r"]["outcome"] == "failed" and str(-signal.SIGINT) in box["r"]["error"]
+    assert scheduler._Children.interrupt_all() == 0
+
+
+def test_paused_plan_refusal_names_resume(plan3):
+    from ateam.scheduler import RunRefused
+    fake = FakeWorkers({("C-0001", "test"): {"code": 5, "test_outcome": "failed", "test_class": "requirements"}})
+    _run(plan3, fake)
+    with pytest.raises(RunRefused, match=r"resume it with: ateam resume P-0001"):
+        _run(plan3, FakeWorkers())
+
+
+def test_a_runs_directory_is_never_reused_within_one_second(tmp_path):
+    from ateam.scheduler import fresh_dir
+    a, b = fresh_dir(tmp_path, "20261027T100000Z-1"), fresh_dir(tmp_path, "20261027T100000Z-1")
+    assert a != b and a.is_dir() and b.is_dir() and a.name == "20261027T100000Z-1"

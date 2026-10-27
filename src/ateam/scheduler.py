@@ -14,9 +14,11 @@ from __future__ import annotations
 import json
 import os
 import queue
+import signal
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -40,6 +42,7 @@ from ateam.tiers import at_least, load_tiers
 from ateam.worktrees import WorktreeError, contract_worktree
 
 LIVE = ("plan_approved", "executing", "integrating")
+STOP_POLL_S = 0.5   # how often the main loop reads a stop request from the store
 RUNNABLE = ("ready", "failed", "verified")   # verified: merged at the next step (an interrupted run stopped before)
 
 Launch = Callable[[Path, str, str, Path, str, "str | None", "str | None", Path], dict]
@@ -137,6 +140,19 @@ class Budget:
             self._cond.notify_all()
 
 
+def fresh_dir(parent: Path, name: str) -> Path:
+    """A new directory under `parent`: `name`, or `name-2`, `name-3`... when two runs start in the same second."""
+    parent.mkdir(parents=True, exist_ok=True)
+    for n in range(1, 1000):
+        path = parent / (name if n == 1 else f"{name}-{n}")
+        try:
+            path.mkdir()
+            return path
+        except FileExistsError:
+            continue
+    raise RuntimeError(f"no free run directory for {name} under {parent}")
+
+
 def ateam_argv() -> list[str]:
     exe = Path(sys.executable).with_name("ateam")
     return [str(exe)] if exe.exists() else [sys.executable, "-m", "ateam.cli"]
@@ -149,9 +165,51 @@ def _read_result(path: Path, code: int, missing: dict) -> dict:
         return {"code": code, **missing, "error": f"no result file (exit {code})"}
 
 
+class _Children:
+    """The session processes this scheduler launched. An owner stop interrupts them by pid; ATeam never signals a
+    process group it did not create (owner, 2026-10-26). verify, refresh and integrate are not registered: they run
+    in their own sessions and finish."""
+
+    _procs: set[subprocess.Popen] = set()
+    _lock = threading.Lock()
+
+    @classmethod
+    def add(cls, proc: subprocess.Popen) -> None:
+        with cls._lock:
+            cls._procs.add(proc)
+
+    @classmethod
+    def discard(cls, proc: subprocess.Popen) -> None:
+        with cls._lock:
+            cls._procs.discard(proc)
+
+    @classmethod
+    def interrupt_all(cls) -> int:
+        """SIGINT to every registered child still running; the number signalled."""
+        with cls._lock:
+            live = [p for p in cls._procs if p.poll() is None]
+        for proc in live:
+            try:
+                proc.send_signal(signal.SIGINT)
+            except ProcessLookupError:
+                pass
+        return len(live)
+
+
+def _run_registered(argv: list[str], log: Path) -> int:
+    with log.open("w") as out:
+        proc = subprocess.Popen(argv, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        _Children.add(proc)
+        try:
+            return proc.wait()
+        finally:
+            _Children.discard(proc)
+
+
 def default_launch(target: Path, cid: str, role: str, worktree: Path, base: str, tier: str | None, prompt: str | None,
                    result_file: Path) -> dict:
-    """`ateam worker run` as a subprocess in this process group; its output goes to a log next to the result file."""
+    """`ateam worker run` as a subprocess in this process group (a terminal Ctrl-C reaches it), registered so an
+    owner stop can interrupt it; its output goes to a log next to the result file."""
     argv = [*ateam_argv(), "worker", "run", cid, "--role", role, "--cwd", str(worktree), "--base", base,
             "--result-file", str(result_file), "--target", str(target)]
     if tier:
@@ -159,9 +217,8 @@ def default_launch(target: Path, cid: str, role: str, worktree: Path, base: str,
     if prompt:
         argv += ["--prompt", prompt]
     log = result_file.with_suffix(".log")
-    with log.open("w") as out:
-        proc = subprocess.run(argv, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
-    return {"log": str(log), **_read_result(result_file, proc.returncode, {"outcome": "failed", "subtype": None})}
+    code = _run_registered(argv, log)
+    return {"log": str(log), **_read_result(result_file, code, {"outcome": "failed", "subtype": None})}
 
 
 def run_child(argv: list[str], result_file: Path) -> dict:
@@ -180,11 +237,14 @@ class _Outcome:
     reason: str | None = None
     detail: str | None = None
     exc: BaseException | None = None
+    evidence: dict | None = None     # the result of the step that paused, kept on the pause record
+    conflict: bool = False           # a merge conflict: resume refuses it until the rebase BUILD exists
 
 
 def run_plan(ctx_factory: Callable[[], object], plan_id: str, echo: Callable[[str], None], stop: threading.Event,
-             launch: Launch = default_launch, dry_run: bool = False,
+             launch: Launch | None = None, dry_run: bool = False,
              child: Callable[[list[str], Path], dict] = run_child) -> RunSummary:
+    launch = launch if launch is not None else default_launch   # resolved now, so a test's replacement is honoured
     ctx = ctx_factory()
     say = LockedEcho(echo)
     acquired = False
@@ -194,6 +254,7 @@ def run_plan(ctx_factory: Callable[[], object], plan_id: str, echo: Callable[[st
             raise RunRefused(f"the run lock is held by {info.get('plan_id')} (pid {info.get('pid')}, since {info.get('acquired_at')}); "
                              "if that process is gone, remove the lock by hand")
         acquired = True
+        ctx.db.clear_stop(plan_id)   # a request left from before this run is not this run's
     try:
         if not dry_run:
             from ateam.exclusion import live_planning
@@ -216,7 +277,7 @@ def _preflight(ctx, plan_id: str, say, dry_run: bool):
     stored = db.feature_status(plan_id)
     if "paused" in (stored, str(plan.status)):
         last = (db.transitions("feature", plan_id) or [{}])[-1].get("reason") or "no reason recorded"
-        raise RunRefused(f"{plan_id} is paused ({last}); resuming a paused plan is not built yet")
+        raise RunRefused(f"{plan_id} is paused ({last}); resume it with: ateam resume {plan_id}")
     if stored not in LIVE and str(plan.status) not in LIVE:
         raise RunRefused(f"{plan_id} is {plan.status}; ateam run needs an approved plan (merge a proposal with ateam merge)")
     try:
@@ -297,8 +358,7 @@ class _Run:
         self.sessions = 0
         self._counter, self._counter_lock = 0, threading.Lock()
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        self.runs_dir = home_dir(ctx.paths.root) / "runs" / plan_id / f"{stamp}-{os.getpid()}"   # never reused across runs
-        self.runs_dir.mkdir(parents=True, exist_ok=True)
+        self.runs_dir = fresh_dir(home_dir(ctx.paths.root) / "runs" / plan_id, f"{stamp}-{os.getpid()}")   # never reused
 
     # -- the main loop -------------------------------------------------------
 
@@ -324,7 +384,14 @@ class _Run:
         budget_stops: list[_Outcome] = []
         cs = load_contracts(ctx.paths.contracts)
         order = dependency_order({c: cs[c] for c in self.cids})
+        polled = 0.0
         while True:
+            if not self.stop.is_set() and time.monotonic() - polled >= STOP_POLL_S:
+                polled = time.monotonic()
+                if db.stop_requested(self.plan_id):   # `ateam stop` from another terminal
+                    self.say(f"{self.plan_id}: stop requested by the owner; interrupting running sessions")
+                    self.stop.set()
+                    _Children.interrupt_all()
             try:
                 while True:
                     o = self.results.get(timeout=0.05 if running else 0)
@@ -353,7 +420,16 @@ class _Run:
         if errors:
             self._close_open_attempts()
             raise errors[0].exc
-        if self.stop.is_set():
+        if self.stop.is_set() and db.stop_requested(self.plan_id) and not pauses:
+            self._close_open_attempts()
+            why = "owner_stopped: stopped by the owner"
+            with self.gate.exclusive():
+                set_plan_status(ctx.paths, db, load_plans(ctx.paths.plans)[self.plan_id], ["paused"], by="owner", why=why)
+                db.record_pause(self.plan_id, "owner_stopped", "stopped by the owner", [])
+                db.clear_stop(self.plan_id)
+            self.say(f"{self.plan_id} -> paused ({why})")
+            return self._summary("paused", {cid: db.contract_status(cid) for cid in self.cids}, [why])
+        if self.stop.is_set() and not pauses:
             self._close_open_attempts()
             self.say(f"{self.plan_id}: interrupted; worktrees are kept and a re-run continues")
             return self._summary("interrupted", statuses, ["interrupted"])
@@ -365,8 +441,13 @@ class _Run:
         if pauses:
             first = pauses[0]
             why = f"{first.reason}: {first.detail}"
+            self._close_open_attempts()
             with self.gate.exclusive():
                 set_plan_status(ctx.paths, db, load_plans(ctx.paths.plans)[self.plan_id], ["paused"], by="run", why=why)
+                db.record_pause(self.plan_id, first.reason, first.detail or "", [
+                    {"contract_id": o.cid, "reason": o.reason, "detail": o.detail or "", "contract_hash": db.contract_hash(o.cid),
+                     "evidence": o.evidence} for o in pauses], conflict=any(o.conflict for o in pauses))
+                db.clear_stop(self.plan_id)
             self.say(f"{self.plan_id} -> paused ({why})")
             return self._summary("paused", statuses, [why])
         if all(s == "integrated" for s in statuses.values()):
@@ -425,7 +506,7 @@ class _Run:
             try:
                 w = contract_worktree(ctx.paths, db, ctx.git, self.plan_id, cid)
             except WorktreeError as e:
-                return _Outcome(cid, "pause", "environment_failure", f"{cid}: {e}")
+                return _Outcome(cid, "pause", "environment_failure", f"{cid}: {e}", evidence={"error": str(e)})
         frozen = c.allocation.tier["build"]
         builds = self._counted_builds(db, cid)
         tier = builds[-1]["tier"] if builds and builds[-1]["tier"] in self.tiers else frozen
@@ -448,7 +529,8 @@ class _Run:
                             refusal=r.get("refusal"))
             d = decide(classify(o), used, allowed, tier, escalated, o.subtype)
             if d.action == "pause":
-                return _Outcome(cid, "pause", d.reason, f"{cid} build {o.outcome}" + (f" ({r['error']})" if r.get("error") else ""))
+                return _Outcome(cid, "pause", d.reason, f"{cid} build {o.outcome}" + (f" ({r['error']})" if r.get("error") else ""),
+                                evidence=r)
             if d.action == "retry":
                 escalated, tier = escalated or d.tier != tier, d.tier
                 prompt = _retry_prompt(c, f"the BUILD attempt ended {o.outcome}" + (f": {r['error']}" if r.get("error") else ""))
@@ -472,7 +554,7 @@ class _Run:
                 if d.action == "retry_stage":
                     continue
                 if d.action == "pause":
-                    return _Outcome(cid, "pause", d.reason, f"{cid} test {r.get('test_outcome') or o.outcome}")
+                    return _Outcome(cid, "pause", d.reason, f"{cid} test {r.get('test_outcome') or o.outcome}", evidence=r)
                 if d.action == "retry":
                     prompt = _retry_prompt(c, "the TEST worker judged these criteria not met:\n" + _unmet(r.get("report")))
                     retry_build = True
@@ -494,7 +576,8 @@ class _Run:
                 if d.action == "retry_stage":
                     continue
                 if d.action == "pause":
-                    return _Outcome(cid, "pause", d.reason, f"{cid} verify {v.get('status')}: " + "; ".join(v.get("reasons") or []))
+                    return _Outcome(cid, "pause", d.reason, f"{cid} verify {v.get('status')}: " + "; ".join(v.get("reasons") or []),
+                                    evidence=v)
                 if d.action == "retry":
                     prompt = _retry_prompt(c, "verify failed: " + "; ".join(v.get("reasons") or ["no reason given"]))
                     retry_build = True
@@ -503,12 +586,14 @@ class _Run:
                 continue
             if db.contract_status(cid) != "verified":   # the store, not the child's report, decides what is merged
                 return _Outcome(cid, "pause", "environment_failure",
-                                f"{cid} verify reported verified but the state store says {db.contract_status(cid)}")
+                                f"{cid} verify reported verified but the state store says {db.contract_status(cid)}", evidence=v)
             return self._merge(ctx, cid)
 
     def _counted_builds(self, db, cid: str) -> list[dict]:
-        """BUILD attempts that count toward budget.attempts: an interrupted one does not (owner, 2026-10-26)."""
-        return [a for a in db.attempts_for(cid, role="build") if a.get("outcome") != "interrupted"]
+        """BUILD attempts that count toward budget.attempts: those since the contract's latest resume window, and never
+        an interrupted one (owner, 2026-10-26)."""
+        start = db.window_start(cid)
+        return [a for a in db.attempts_for(cid, role="build") if a["attempt_id"] > start and a.get("outcome") != "interrupted"]
 
     def _session(self, ctx, cid: str, role: str, w, tier: str | None, prompt: str | None, usd: float) -> dict | _Outcome:
         verdict = self.budget.reserve(usd, self.halt)
@@ -541,7 +626,8 @@ class _Run:
             try:
                 merge_contract(ctx, wt, self.plan_id, cid, self.say)
             except MergeConflict as e:
-                return _Outcome(cid, "pause", "environment_failure", f"{cid} conflicts in {', '.join(e.paths)}")
+                return _Outcome(cid, "pause", "environment_failure", f"{cid} conflicts in {', '.join(e.paths)}",
+                                evidence={"paths": list(e.paths)}, conflict=True)
             self._refresh(ctx)
         return _Outcome(cid, "done")
 

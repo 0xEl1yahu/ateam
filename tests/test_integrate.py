@@ -374,3 +374,18 @@ def test_merge_contract_conflict_records_nothing(verified):
         merge_contract(ctx, wt, "P-0001", "C-0001", lambda m: None)
     assert load_contracts(verified.paths.contracts)["C-0001"].status == "verified" == ctx.db.contract_status("C-0001")
     assert GitRepo(verified.paths.intent).head() == intent_head and wt.status_porcelain() == []
+
+
+def test_integration_conflict_records_a_conflict_pause(verified):
+    _commit_on_main(verified.root, "src/a/a.py", "A = 'main'\n")
+    res, out, ctx = _integrate(verified.root)
+    p = ctx.db.open_pause("P-0001")
+    assert res.outcome == "conflict" and p["conflict"] is True and p["reason"] == "environment_failure"
+    assert [c["contract_id"] for c in p["contracts"]] == ["C-0001"] and p["contracts"][0]["evidence"] == {"paths": ["src/a/a.py"]}
+
+
+def test_failed_final_checks_record_a_pause_that_is_not_a_conflict(verified):
+    _set_config(verified.paths, checks=[NamedCheck(name="unit", cmd="true"), NamedCheck(name="lint", cmd="false")])
+    res, out, ctx = _integrate(verified.root)
+    p = ctx.db.open_pause("P-0001")
+    assert p["conflict"] is False and p["reason"] == "verification_unresolvable" and p["detail"] == "lint failed" and p["contracts"] == []

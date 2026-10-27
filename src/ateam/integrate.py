@@ -139,7 +139,10 @@ def integrate(ctx, plan_id: str, echo: Callable[[str], None]) -> IntegrateResult
         try:
             merge_contract(ctx, wt, plan_id, cid, echo)
         except MergeConflict as e:
-            return _pause(paths, db, plan, "conflict", f"environment_failure: {cid} conflicts in {', '.join(e.paths)}", [], echo)
+            why = f"environment_failure: {cid} conflicts in {', '.join(e.paths)}"
+            paused = [{"contract_id": cid, "reason": "environment_failure", "detail": why.split(": ", 1)[1],
+                       "contract_hash": db.contract_hash(cid), "evidence": {"paths": list(e.paths)}}]
+            return _pause(paths, db, plan, "conflict", why, [], echo, contracts=paused)
 
     _require_heads(db, wt, cids, "HEAD", branch)
     if not wt.is_ancestor(target_tip, "HEAD"):
@@ -318,8 +321,10 @@ def _prepare(paths, db, owner: GitRepo, config, plan_id: str, branch: str, targe
     return wt
 
 
-def _pause(paths, db, plan: Plan, outcome, why: str, messages: list[str], echo) -> IntegrateResult:
+def _pause(paths, db, plan: Plan, outcome, why: str, messages: list[str], echo, contracts: list[dict] = ()) -> IntegrateResult:
     set_plan_status(paths, db, plan, ["paused"], by="integrate", why=why)
+    reason, _, detail = why.partition(": ")
+    db.record_pause(plan.id, reason, detail, list(contracts), conflict=(outcome == "conflict"))
     echo(f"{plan.id} -> paused ({why})")
     return IntegrateResult(outcome, plan.id, messages=[why, *messages])
 
