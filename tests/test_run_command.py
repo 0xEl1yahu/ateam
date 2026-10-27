@@ -297,11 +297,13 @@ def test_stop_from_another_process_pauses_a_running_scheduler(plan3):
                                                               launch=FakeWorkers({("C-0001", "build", 0): blocks_until_stopped}),
                                                               investigate=FakeInvestigator())))
     t.start()
-    deadline = time.monotonic() + 10
+    started = time.monotonic()
+    deadline = started + 60   # under full xdist load the run's setup steps (refresh is a child process) can take >10 s
     while not _sdb(plan3).open_attempts(["C-0001"]) and time.monotonic() < deadline:
         time.sleep(0.05)
+    assert _sdb(plan3).open_attempts(["C-0001"]), "the run never started C-0001's BUILD"
     r = run("stop", "P-0001", "--target", str(plan3.root))
-    t.join(15)
+    t.join(60)
     db = _sdb(plan3)
     assert r.exit_code == 0 and "stop requested" in r.output, r.output
     assert box["s"].outcome == "paused" and db.transitions("feature", "P-0001")[-1]["reason"] == "owner_stopped: stopped by the owner"
