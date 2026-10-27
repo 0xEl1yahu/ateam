@@ -40,7 +40,7 @@ Adapted from the Claude Code team's own published practices (Boris Cherny's "how
 
 ## Conventions
 
-- Python 3.14, `.venv/` in the repo. Run everything with `.venv/bin/...`. Tests: `.venv/bin/pytest` (unit, no API calls). Live: `ATEAM_LIVE_TESTS=1 .venv/bin/pytest tests/live -s` (one real haiku session, opt in only).
+- Python 3.14, `.venv/` in the repo. Run everything with `.venv/bin/...`. Tests: `.venv/bin/pytest -n auto` (unit, no API calls; pytest-xdist runs them in parallel, about 3 minutes against 9 serially). Live: `ATEAM_LIVE_TESTS=1 .venv/bin/pytest tests/live -s` (one real haiku session, opt in only).
 - Test first. Every behaviour change starts with a failing test you watched fail. Table-driven tests for the policy (`tests/test_policy.py`) are the place for new deny and allow strings.
 - Worker sessions use the clean room (`setting_sources=[]`, strict MCP config, slash commands off, auto-memory off, permission mode `default`). Never `--bare`: it does not authenticate with a claude.ai login.
 - Never `str.strip()` the output of `git status --porcelain`.
