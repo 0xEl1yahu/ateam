@@ -68,6 +68,11 @@ These replace the matching assistant calls above where they differ.
 12. **A conflict in a path the contract may not edit pauses at once.** If any conflicting path is outside the contract's `paths` (an incidental file such as a lock file), no rebase BUILD runs. The plan pauses `environment_failure` as a conflict and names those paths.
 13. **A target-branch conflict stays refused by resume.** A conflict from `ateam integrate` merging a moved target branch names no contract, so there is nothing to rebuild. `ateam resume` refuses it and the way out is to reject the plan. A recovery for it is separate work.
 
+## Owner rulings at the final review (2026-10-27)
+
+14. **A re-run after a concluded rebase BUILD keeps the one-attempt rule.** While the rebase's attempt window is open (no resume since), a re-run after a crash or interruption TESTs and verifies the committed resolution again, with no new BUILD and no retry; any failure pauses. An ordinary BUILD with retries comes only after the owner resumes.
+15. **A conflict in a path the contract may not edit is not resumable.** Its pause is marked so. `ateam resume` refuses it, as it does a target-branch conflict, and `ateam status` names the paths and the way out: reject the plan and plan again with those paths in a contract's paths.
+
 Mechanics decided by the builder and stated at planning: lanes are computed from the files at the plan's recorded integration start (the target tip for a dry run or at approval). A contract's lane worktree is recorded in the state store when it is first cut, so a later run never moves it.
 
 ## How it works

@@ -1155,6 +1155,11 @@ def resume(plan_id: str, adopt: bool, note: str | None, note_file: Path | None, 
     pause = ctx.db.open_pause(plan_id)
     if pause is not None and pause["conflict"] and not pause["contracts"]:   # a contract's conflict resumes into its rebase BUILD
         _fail(f"{plan_id} paused on a merge conflict of the target branch ({pause['detail']}); resume cannot rebuild it", code=4)
+    for c in pause["contracts"] if pause is not None and pause["conflict"] else []:
+        uneditable = (c["evidence"] or {}).get("uneditable")
+        if uneditable:   # owner, 2026-10-27: a rebase BUILD cannot edit these, so resuming would only pause again
+            _fail(f"{plan_id} paused on a merge conflict in {', '.join(uneditable)}, which {c['contract_id']} may not edit; resume "
+                  "cannot rebuild it. Reject the plan and plan again with those paths in a contract's paths", code=4)
     cids = plan_contract_ids(ctx.db, plan)
     problems = scheduler.binding_problems(ctx, cids)
     if problems:
@@ -1762,6 +1767,13 @@ def _status_plan(ctx: Context, plan) -> None:
             click.echo(f"  suggested instruction: {f['suggested_instruction']}")
     if pause["conflict"] and not pause["contracts"]:
         click.echo("\nthis is a merge conflict of the target branch; resume cannot rebuild it (reject the plan and plan again)")
+        return
+    blocked = [(c["contract_id"], (c["evidence"] or {}).get("uneditable")) for c in pause["contracts"]
+               if pause["conflict"] and (c["evidence"] or {}).get("uneditable")]
+    if blocked:
+        for cid, paths in blocked:
+            click.echo(f"\nthe conflict is in {', '.join(paths)}, which {cid} may not edit; resume cannot rebuild it")
+        click.echo(f"reject the plan (ateam reject {pid} \"reason\") and plan again with those paths in a contract's paths")
         return
     if pause["conflict"]:
         click.echo(f"\nresume runs the rebase BUILD for {', '.join(c['contract_id'] for c in pause['contracts'])}")

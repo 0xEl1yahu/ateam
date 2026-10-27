@@ -1041,3 +1041,50 @@ def test_run_closes_the_contexts_it_opens(plan3):
     me = threading.get_ident()
     assert [c for c, t in made if is_open(c.db, t == me)] == []
     assert _db(plan3).run_lock_info() is None
+
+
+
+# ---- final review fixes (owner rulings 14 and 15, 2026-10-27)
+
+@pytest.mark.parametrize("retest", [{}, {"code": 5, "outcome": "failed", "test_class": "implementation"}], ids=["passes", "fails"])
+def test_a_rerun_after_a_concluded_rebase_tests_and_verifies_without_a_build(plan3, retest):
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    stop = threading.Event()
+    s, out = _run(plan3, FakeWorkers({("C-0001", "build", 0): _conflict_during(plan3), ("C-0001", "test", 1): _interrupting(stop)}),
+                  stop=stop)
+    assert s.outcome == "interrupted" and _db(plan3).contract_status("C-0001") == "building", out
+    fake = FakeWorkers({("C-0001", "test"): retest})
+    s, out = _run(plan3, fake)
+    assert _builds(fake, "C-0001") == [] and [c[1] for c in fake.calls if c[0] == "C-0001"] == ["test"]
+    if retest:
+        pause = _db(plan3).open_pause("P-0001")
+        assert s.outcome == "paused" and pause["reason"] == "environment_failure", out
+        assert "after its rebase BUILD" in pause["contracts"][0]["detail"]
+    else:
+        assert s.outcome == "merge_proposed", out
+
+
+def test_a_rebase_build_that_fails_names_its_outcome(plan3):
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    fake = FakeWorkers({("C-0001", "build", 0): _conflict_during(plan3),
+                        ("C-0001", "build", 1): {"commit": False, "code": 1, "outcome": "setup_failed", "error": "setup failed: make deps"}})
+    s, out = _run(plan3, fake)
+    detail = _db(plan3).open_pause("P-0001")["contracts"][0]["detail"]
+    assert detail.startswith("C-0001 rebase BUILD did not conclude the merge (build setup_failed: setup failed: make deps)"), detail
+
+
+def test_an_uneditable_conflict_is_marked_in_the_pause(target_repo, monkeypatch):
+    report = _report_lanes()
+    report["contracts"][0]["incidental"] = ["shared.lock"]
+    p = _approve_lanes(target_repo, monkeypatch, max_workers=1, report=report)
+
+    def lock_and_conflict(fake, cid, role, worktree, n):
+        (worktree / "shared.lock").write_text("mine\n")
+        return _conflict_during(p, rel="shared.lock", text="theirs\n")(fake, cid, role, worktree, n)
+
+    _run(p, FakeWorkers({("C-0001", "build", 0): lock_and_conflict}))
+    assert _db(p).open_pause("P-0001")["contracts"][0]["evidence"]["uneditable"] == ["shared.lock"]
+    r = run("resume", "P-0001", "--no-run", "--target", str(p.root))
+    assert r.exit_code == 4 and "shared.lock" in r.output and "C-0001 may not edit" in r.output, r.output
+    out = run("status", "P-0001", "--target", str(p.root)).output
+    assert "shared.lock, which C-0001 may not edit" in out and "reject the plan" in out and "ateam resume P-0001" not in out, out

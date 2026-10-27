@@ -616,6 +616,7 @@ class _Run:
     def _contract(self, ctx, cid: str) -> _Outcome:
         db = ctx.db
         rebase: list[str] | None = None   # the conflicting paths while this pipeline runs a rebase BUILD
+        retest = False                    # a concluded rebase whose TEST or verify an interruption stopped
         prompt: str | None = None
         if db.contract_status(cid) == "verified":
             o = self._merge(ctx, cid)
@@ -628,7 +629,9 @@ class _Run:
             if isinstance(o, _Outcome):
                 return o
             rebase = o
-            if rebase is None:   # the merge was concluded; what failed after it gets an ordinary BUILD
+            if rebase is None and json.loads(db.get_meta(f"rebase:{cid}") or "{}").get("window") == db.window_start(cid):
+                rebase, retest = [], True   # concluded in this window: TEST and verify it again, no BUILD (owner, 2026-10-27)
+            elif rebase is None:   # concluded, and the owner resumed since: what failed after it gets an ordinary BUILD
                 prompt = _retry_prompt(load_contracts(ctx.paths.contracts)[cid], "the attempt after its rebase was stopped or did not pass")
         c = load_contracts(ctx.paths.contracts)[cid]
         with self.gate.exclusive():
@@ -647,38 +650,41 @@ class _Run:
         tier = builds[-1]["tier"] if builds and builds[-1]["tier"] in self.tiers else frozen
         escalated = any(a["tier"] != frozen for a in builds)
         allowed = c.budget.attempts
-        if rebase is not None:
+        if rebase is not None and not retest:
             prompt = _rebase_prompt(c, rebase)
         launched = 0   # BUILDs this pipeline launched that count: one that fails before recording an attempt still does
         while True:
             used = max(len(self._counted_builds(db, cid)), launched)
             if self.halt.is_set():
                 return _Outcome(cid, "halted")
-            if used >= allowed:
-                return _Outcome(cid, "pause", "budget_exhausted", f"{cid} has used all {allowed} BUILD attempts")
-            r = self._session(ctx, cid, "build", w, tier if tier != frozen else None, prompt, self.tiers[tier][Role.build].usd)
-            if isinstance(r, _Outcome):
-                return r
-            if r.get("outcome") == "interrupted" or self.stop.is_set():
-                return _Outcome(cid, "interrupted")
-            used += 1
-            launched = used
-            if rebase is not None and not self._merge_concluded(db, cid, w):
-                return _Outcome(cid, "pause", "environment_failure", f"{cid} rebase BUILD did not conclude the merge",
-                                evidence=r, conflict=True)
-            o = StepOutcome("build", int(r.get("code", 1)), r.get("outcome") or "failed", subtype=r.get("subtype"),
-                            refusal=r.get("refusal"))
-            d = decide(classify(o), used, allowed, tier, escalated, o.subtype)
-            if rebase is not None and d.action != "continue":   # one attempt: no retry after a rebase BUILD
-                return _Outcome(cid, "pause", "environment_failure", f"{cid} rebase build {o.outcome}", evidence=r)
-            if d.action == "pause":
-                return _Outcome(cid, "pause", d.reason, f"{cid} build {o.outcome}" + (f" ({r['error']})" if r.get("error") else ""),
-                                evidence=r)
-            if d.action == "retry":
-                escalated, tier = escalated or d.tier != tier, d.tier
-                prompt = _retry_prompt(c, f"the BUILD attempt ended {o.outcome}" + (f": {r['error']}" if r.get("error") else ""))
-                continue
+            if not retest:
+                if used >= allowed:
+                    return _Outcome(cid, "pause", "budget_exhausted", f"{cid} has used all {allowed} BUILD attempts")
+                r = self._session(ctx, cid, "build", w, tier if tier != frozen else None, prompt, self.tiers[tier][Role.build].usd)
+                if isinstance(r, _Outcome):
+                    return r
+                if r.get("outcome") == "interrupted" or self.stop.is_set():
+                    return _Outcome(cid, "interrupted")
+                used += 1
+                launched = used
+                if rebase is not None and not self._merge_concluded(db, cid, w):
+                    return _Outcome(cid, "pause", "environment_failure", f"{cid} rebase BUILD did not conclude the merge (build "
+                                    + (r.get("outcome") or "failed") + (f": {r['error']}" if r.get("error") else "") + ")",
+                                    evidence=r, conflict=True)
+                o = StepOutcome("build", int(r.get("code", 1)), r.get("outcome") or "failed", subtype=r.get("subtype"),
+                                refusal=r.get("refusal"))
+                d = decide(classify(o), used, allowed, tier, escalated, o.subtype)
+                if rebase is not None and d.action != "continue":   # one attempt: no retry after a rebase BUILD
+                    return _Outcome(cid, "pause", "environment_failure", f"{cid} rebase build {o.outcome}", evidence=r)
+                if d.action == "pause":
+                    return _Outcome(cid, "pause", d.reason, f"{cid} build {o.outcome}" + (f" ({r['error']})" if r.get("error") else ""),
+                                    evidence=r)
+                if d.action == "retry":
+                    escalated, tier = escalated or d.tier != tier, d.tier
+                    prompt = _retry_prompt(c, f"the BUILD attempt ended {o.outcome}" + (f": {r['error']}" if r.get("error") else ""))
+                    continue
 
+            retest = False
             # TEST never runs below BUILD (spec, Allocation), including after an escalation
             test_tier = at_least(tier, c.allocation.tier["test"])
             retry_build = False
@@ -801,8 +807,8 @@ class _Run:
         if d.action == "pause":
             why = (f"{', '.join(uneditable)} are outside the contract's paths" if uneditable
                    else "again after its rebase BUILD" if rebased else "no BUILD attempt left")
-            return _Outcome(cid, "pause", d.reason, f"{cid} conflicts in {', '.join(paths)}; {why}", evidence={"paths": paths},
-                            conflict=True)
+            return _Outcome(cid, "pause", d.reason, f"{cid} conflicts in {', '.join(paths)}; {why}",
+                            evidence={"paths": paths, **({"uneditable": uneditable} if uneditable else {})}, conflict=True)
         if self.halt.is_set():
             return _Outcome(cid, "halted")
         try:
