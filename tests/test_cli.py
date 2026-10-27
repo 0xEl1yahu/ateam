@@ -2385,3 +2385,38 @@ def test_release_own_run_lock_leaves_another_holder_alone(cli_target):
         db.conn.execute("INSERT INTO run_lock (singleton, plan_id, acquired_at, pid) VALUES (1, 'P-0001', 'then', 1)")
     _release_own_run_lock(cli_target, "P-0001")
     assert db.run_lock_info()["pid"] == 1
+
+
+_GUARDED = [
+    ("init",), ("plan", "add a thing"), ("approve", "P-0001"), ("reject", "P-0001", "no"),
+    ("records", "review"), ("records", "approve", "R-0001"), ("records", "reject", "R-0001", "no"),
+    ("records", "supersede", "R-0001", "--with", "R-0002"), ("records", "retire", "R-0001", "old"),
+    ("contracts", "freeze", "C-0001"), ("merge", "P-0001"), ("intent", "pull"),
+]
+
+
+def _hold_lock(cli_target, pid):
+    with _db(cli_target).conn as c:
+        c.execute("INSERT INTO run_lock (singleton, plan_id, acquired_at, pid) VALUES (1, 'P-0007', 'then', ?)", (pid,))
+
+
+@pytest.mark.parametrize("args", _GUARDED, ids=[" ".join(a[:2]) for a in _GUARDED])
+def test_intent_commands_refuse_while_a_run_holds_the_lock(args, cli_target):
+    import os
+    head = GitRepo(TargetPaths.from_root(cli_target).intent).head()
+    _hold_lock(cli_target, os.getpid())
+    r = run(*args, "--target", str(cli_target))
+    assert r.exit_code == 4, r.output
+    assert "P-0007 is running (pid" in r.output and "ateam stop P-0007" in r.output
+    assert GitRepo(TargetPaths.from_root(cli_target).intent).head() == head
+
+
+def test_stale_run_lock_refusal_names_the_dead_process(cli_target):
+    from ateam.exclusion import process_alive
+    pid = 4_000_000
+    while process_alive(pid):
+        pid += 1
+    _hold_lock(cli_target, pid)
+    r = run("reject", "P-0001", "no", "--target", str(cli_target))
+    assert r.exit_code == 4, r.output
+    assert f"the run lock names P-0007 (pid {pid}), a process that is gone; remove the lock by hand" in r.output

@@ -417,3 +417,16 @@ def test_environment_failure_at_test_retries_test_not_build(plan3):
     s, out = _run(plan3, fake)
     assert s.outcome == "merge_proposed", out
     assert len(fake.tiers("C-0001")) == 1 and len(fake.tiers("C-0001", role="test")) == 2
+
+
+def test_run_refuses_while_a_plan_is_being_planned(plan3):
+    import os
+    from ateam.scheduler import RunRefused
+    db = _db(plan3)
+    db.transition("feature", "P-0009", "requested", by="owner", reason="r")
+    db.transition("feature", "P-0009", "investigating", by="ateam")
+    db.set_meta("planning:P-0009", str(os.getpid()))
+    fake = FakeWorkers()
+    with pytest.raises(RunRefused, match=r"P-0009 is being planned \(pid \d+\); wait for it to finish"):
+        _run(plan3, fake)
+    assert fake.calls == [] and db.run_lock_info() is None      # the lock is released afterwards

@@ -14,6 +14,7 @@ from ateam.gitops import GitRepo
 from ateam.paths import TargetPaths, home_dir, lookup_target, normalise_remote, origin_url, record_target, repo_id, repo_id_source
 from ateam.intent import IntentError, commit_intent, commit_intent_files, intent_relpath, require_clean
 from ateam.runner.investigate import INTENT_TAMPER, run_investigation
+from ateam.exclusion import process_alive as _process_alive  # noqa: F401  (moved; kept importable from here)
 from ateam.state.db import StateDB
 
 TARGET_OPTION = click.option(
@@ -206,6 +207,7 @@ def intent_pull(target: Path) -> None:
     from ateam.gitops import GitError
     from ateam.intent import IntentError, pull
 
+    _require_no_live_run_at(target)
     try:
         click.echo(pull(TargetPaths.from_root(target)).strip() or "pulled")
     except (IntentError, GitError) as e:
@@ -237,6 +239,7 @@ def init(remote: str | None, max_candidates: int, tier: str, target: Path) -> No
     from ateam.roles import DISCOVERY_SPEC, Role
     from ateam.tiers import load_tiers
 
+    _require_no_live_run_at(target)
     paths = TargetPaths.from_root(target)
     if not paths.exists():
         try:
@@ -278,16 +281,35 @@ def init(remote: str | None, max_candidates: int, tier: str, target: Path) -> No
 # ---------------------------------------------------------------- plan
 
 
-def _process_alive(pid: int) -> bool:
-    import os
+def require_no_live_run(ctx) -> None:
+    """Refuse (exit 4) while a run holds the lock: planning and running exclude each other (owner, 2026-10-26)."""
+    from ateam.exclusion import run_holder
 
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    held = run_holder(ctx.db)
+    if held is None:
+        return
+    if held["alive"]:
+        _fail(f"{held['plan_id']} is running (pid {held['pid']}); wait for it or stop it: ateam stop {held['plan_id']}", code=4)
+    _fail(f"the run lock names {held['plan_id']} (pid {held['pid']}), a process that is gone; remove the lock by hand", code=4)
+
+
+def require_no_live_planning(ctx) -> None:
+    """Refuse (exit 4) while a planning session is live."""
+    from ateam.exclusion import live_planning
+
+    for plan_id, pid in live_planning(ctx.db):
+        _fail(f"{plan_id} is being planned (pid {pid}); wait for it to finish", code=4)
+
+
+def _require_no_live_run_at(target: Path) -> None:
+    """The same guard for commands that have no Context: reads the store only when it already exists."""
+    from types import SimpleNamespace
+
+    state = home_dir(target) / "state.db"
+    if state.exists():
+        db = StateDB(state)
+        db.init_schema()
+        require_no_live_run(SimpleNamespace(db=db))
 
 
 def _reject_stale_planning(ctx: Context) -> None:
@@ -401,6 +423,7 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
     from ateam.plans.model import Plan, PlanHistoryEntry, PlanReview, PlanStatus
 
     ctx = _context(target)
+    require_no_live_run(ctx)
     if replaces is not None:
         old = load_plans(ctx.paths.plans).get(replaces)
         if old is None:
@@ -714,6 +737,7 @@ def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, force
     from ateam.tiers import ORDER, at_least, load_tiers
 
     ctx = _context(target)
+    require_no_live_run(ctx)
     plans_ = load_plans(ctx.paths.plans)
     if plan_id not in plans_:
         _fail(f"unknown plan {plan_id}")
@@ -864,6 +888,7 @@ def reject(plan_id: str, reason: str, target: Path) -> None:
     from ateam.plans.store import load_plans, save_plan
 
     ctx = _context(target)
+    require_no_live_run(ctx)
     plans_ = load_plans(ctx.paths.plans)
     if plan_id not in plans_:
         _fail(f"unknown plan {plan_id}")
@@ -1041,6 +1066,7 @@ def merge_cmd(plan_id: str, target: Path) -> None:
     from ateam.merge import FastForwardImpossible, MergeRefused, merge_plan
 
     ctx = _context(target)
+    require_no_live_run(ctx)
     try:
         res = merge_plan(ctx, plan_id)
     except FastForwardImpossible as e:
@@ -1200,6 +1226,7 @@ def records_review(review_all: bool, target: Path) -> None:
     from ateam.records.store import load_records
 
     ctx = _context(target)
+    require_no_live_run(ctx)
     recs = load_records(ctx.paths.records)
     proposed = [rid for rid, r in sorted(recs.items()) if r.status == "proposed"]
     if review_all:
@@ -1258,6 +1285,7 @@ def records_approve(record_id: str, basis: str | None, target: Path) -> None:
     from ateam.records.model import Basis
 
     ctx = _context(target)
+    require_no_live_run(ctx)
     _print_overlaps(ctx, record_id)
     _lifecycle(ctx, lambda: _service(ctx).approve(record_id, Basis(basis) if basis else None))
 
@@ -1268,6 +1296,7 @@ def records_approve(record_id: str, basis: str | None, target: Path) -> None:
 @TARGET_OPTION
 def records_reject(record_id: str, reason: str, target: Path) -> None:
     ctx = _context(target)
+    require_no_live_run(ctx)
     _lifecycle(ctx, lambda: _service(ctx).reject(record_id, reason))
 
 
@@ -1277,6 +1306,7 @@ def records_reject(record_id: str, reason: str, target: Path) -> None:
 @TARGET_OPTION
 def records_supersede(old_id: str, new_id: str, target: Path) -> None:
     ctx = _context(target)
+    require_no_live_run(ctx)
     _lifecycle(ctx, lambda: _service(ctx).supersede(old_id, new_id))
 
 
@@ -1286,6 +1316,7 @@ def records_supersede(old_id: str, new_id: str, target: Path) -> None:
 @TARGET_OPTION
 def records_retire(record_id: str, reason: str, target: Path) -> None:
     ctx = _context(target)
+    require_no_live_run(ctx)
     _lifecycle(ctx, lambda: _service(ctx).retire(record_id, reason))
 
 
@@ -1325,6 +1356,7 @@ def contracts_freeze(contract_id: str, force: bool, target: Path) -> None:
     from ateam.records.store import load_records
 
     ctx = _context(target)
+    require_no_live_run(ctx)
     cs = load_contracts(ctx.paths.contracts)
     if contract_id not in cs:
         _fail(f"unknown contract {contract_id}")

@@ -195,6 +195,10 @@ def run_plan(ctx_factory: Callable[[], object], plan_id: str, echo: Callable[[st
                              "if that process is gone, remove the lock by hand")
         acquired = True
     try:
+        if not dry_run:
+            from ateam.exclusion import live_planning
+            for planning_id, planning_pid in live_planning(ctx.db):
+                raise RunRefused(f"{planning_id} is being planned (pid {planning_pid}); wait for it to finish")
         plan, cs, cids = _preflight(ctx, plan_id, say, dry_run)
         if dry_run:
             return _dry_run(ctx, plan_id, cs, cids, say)
