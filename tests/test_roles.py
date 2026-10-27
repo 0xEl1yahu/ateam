@@ -80,3 +80,15 @@ def test_review_schema_and_spec_shape():
     assert REVIEWER_SPEC.report_schema is REVIEW_SCHEMA
     assert "staff engineer" in REVIEWER_SPEC.system_prompt and INVESTIGATION_COMMON in REVIEWER_SPEC.system_prompt
     assert "never rewrite the plan" in REVIEWER_SPEC.system_prompt.lower()
+
+
+def test_pause_schema_requires_the_five_fields():
+    from ateam.roles import PAUSE_INVESTIGATE_SPEC, PAUSE_SCHEMA, Role
+    assert PAUSE_SCHEMA["type"] == "object" and PAUSE_SCHEMA["additionalProperties"] is False
+    assert set(PAUSE_SCHEMA["required"]) == set(PAUSE_SCHEMA["properties"]) == {
+        "summary", "evidence", "failure_class", "needs_owner_decision", "suggested_instruction"}
+    assert PAUSE_SCHEMA["properties"]["failure_class"]["enum"] == ["implementation", "requirements", "environment", "invariant_violation"]
+    assert set(PAUSE_SCHEMA["properties"]["evidence"]["items"]["required"]) == {"ref", "shows"}
+    assert PAUSE_INVESTIGATE_SPEC.role is Role.investigate and PAUSE_INVESTIGATE_SPEC.tools == ["Read", "Glob", "Grep", "Bash"]
+    prompt = PAUSE_INVESTIGATE_SPEC.system_prompt.lower()
+    assert "never modify files or state" in prompt and "within the frozen contract" in prompt

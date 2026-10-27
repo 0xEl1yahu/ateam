@@ -291,3 +291,25 @@ def test_owner_instructions_reach_build_only(sample_contract, records_three):
     assert build.index("## Verified prior work") < build.index("## Owner's instructions") < build.index("## Previous worker's notes (unverified)")
     assert "Owner's instructions" not in render_brief(assemble_brief(sample_contract, [], None, Role.test, instructions=[e]))
     assert "Owner's instructions" not in render_brief(assemble_brief(sample_contract, [], None, Role.build))
+
+
+def test_pause_brief_sections_in_order(sample_contract, records_three):
+    from datetime import UTC, datetime
+
+    from ateam.brief import assemble_pause_brief
+    from ateam.guidance import GuidanceEntry
+    live = GuidanceEntry(at=datetime(2026, 10, 27, tzinfo=UTC), source="owner", contract_hash=sample_contract.content_hash(), text="use x")
+    stale = GuidanceEntry(at=datetime(2026, 10, 27, tzinfo=UTC), source="owner", contract_hash="stale", text="old advice")
+    paused = {"contract_id": sample_contract.id, "reason": "budget_exhausted", "detail": "used all 2 BUILD attempts",
+              "evidence": {"error": "x" * 20_000}}
+    attempts = [{"attempt_id": 3, "role": "build", "tier": "light", "outcome": "failed", "failure_class": None, "cost_usd": 0.12}]
+    text = assemble_pause_brief(sample_contract, [records_three["R-0001"]], paused, attempts, _cp({"next": "try y"}), [live, stale])
+    heads = ["## Binding", "## Task", "## Why the plan paused", "## Attempt history",
+             "## Previous worker's notes (unverified)", "## Instructions already given"]
+    idx = [text.index(h) for h in heads]
+    assert idx == sorted(idx)
+    why = text[idx[2]:idx[3]]
+    assert "budget_exhausted" in why and "used all 2 BUILD attempts" in why and len(why) < 12_500
+    assert "build" in text[idx[3]:idx[4]] and "failed" in text[idx[3]:idx[4]] and "0.12" in text[idx[3]:idx[4]]
+    assert "try y" in text[idx[4]:idx[5]]
+    assert "use x" in text[idx[5]:] and "old advice" not in text

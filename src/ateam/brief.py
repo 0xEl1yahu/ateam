@@ -13,7 +13,7 @@ from ateam.allocation import rubric_text
 from ateam.checkpoint import Checkpoint
 from ateam.config import TargetConfig
 from ateam.contracts.model import Contract
-from ateam.guidance import GuidanceEntry
+from ateam.guidance import GuidanceEntry, live_guidance
 from ateam.plans.model import Plan
 from ateam.records.model import Record
 from ateam.roles import Role
@@ -124,6 +124,35 @@ def render_brief(b: Brief) -> str:
 
 
 DOC_CAP = 12_000
+
+
+def assemble_pause_brief(
+    contract: Contract, records: list[Record], paused: dict, attempts: list[dict], build_checkpoint: Checkpoint | None,
+    instructions: Sequence[GuidanceEntry],
+) -> str:
+    """The brief for a pause investigation: what binds the contract, what it asks, why the plan paused (with the
+    paused step's evidence), every attempt so far, the last BUILD worker's unverified notes, and the owner's live
+    instructions already given."""
+    import json
+
+    binding = "\n\n".join(render_record(r) for r in records) or "No binding records apply to this contract."
+    evidence = json.dumps(paused.get("evidence"), indent=2, default=str) if paused.get("evidence") is not None else "none recorded"
+    if len(evidence) > DOC_CAP:
+        evidence = evidence[:DOC_CAP] + f"\n[... truncated at {DOC_CAP} characters]"
+    why = f"Reason: {paused.get('reason')}\nDetail: {_one_line(str(paused.get('detail') or ''))}\nEvidence:\n{evidence}"
+    history = "\n".join(
+        f"- attempt {a.get('attempt_id')}: {a.get('role')} at {a.get('tier')}, {a.get('outcome') or 'unfinished'}"
+        + (f" ({a['failure_class']})" if a.get("failure_class") else "")
+        + (f", ${a['cost_usd']:.2f}" if a.get("cost_usd") is not None else "")
+        for a in attempts) or "No attempts recorded."
+    notes = (yaml.safe_dump(build_checkpoint.notes, sort_keys=False).strip()
+             if build_checkpoint is not None and build_checkpoint.notes else "None.")
+    live = live_guidance(list(instructions), contract.content_hash())
+    given = render_instructions(live) if live else "None."
+    sections = [("Binding", binding), ("Task", _task(contract, None, Role.investigate)), ("Why the plan paused", why),
+                ("Attempt history", history), ("Previous worker's notes (unverified)", notes), ("Instructions already given", given)]
+    return "\n\n".join(f"## {h}\n{body}" for h, body in sections) + "\n"
+
 DEFAULT_MAX_CANDIDATES = 12
 
 

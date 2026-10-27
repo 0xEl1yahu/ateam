@@ -402,3 +402,42 @@ REVIEWER_SPEC = RoleSpec(
     ),
     report_schema=REVIEW_SCHEMA,
 )
+
+PAUSE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "summary": {"type": "string"},
+        "evidence": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {"ref": {"type": "string"}, "shows": {"type": "string"}},
+                "required": ["ref", "shows"],
+            },
+        },
+        "failure_class": {"type": "string", "enum": ["implementation", "requirements", "environment", "invariant_violation"]},
+        "needs_owner_decision": {"type": ["string", "null"]},
+        "suggested_instruction": {"type": ["string", "null"]},
+    },
+    "required": ["summary", "evidence", "failure_class", "needs_owner_decision", "suggested_instruction"],
+}
+
+PAUSE_INVESTIGATE_SPEC = RoleSpec(
+    role=Role.investigate,
+    tools=_INVESTIGATE_TOOLS,
+    system_prompt=(
+        "ROLE: INVESTIGATE, task: pause diagnosis. A run of this contract paused; you are in the contract's worktree, "
+        "read-only. Your brief has the contract, why the plan paused with its evidence, the attempt history, the last "
+        "BUILD worker's unverified notes, and any instructions the owner already gave. Find out what went wrong and cite "
+        "evidence (file and line, or check output). Classify the failure. If the fix needs a binding record changed, a "
+        "re-freeze or a change to the contract itself, say so in needs_owner_decision. Otherwise suggest one short "
+        "instruction for the next BUILD worker in suggested_instruction: guidance within the frozen contract, never a "
+        "change to its acceptance criteria, paths or records. The owner reads your report and decides; nothing you "
+        "suggest is acted on without them. You never modify files or state. To read part of a file use the Read tool "
+        "with offset and limit; sed, awk and interpreters are not available to you. " + AUTHORITY
+        + " Your structured report is the only record of this session: end by producing it."
+    ),
+    report_schema=PAUSE_SCHEMA,
+)

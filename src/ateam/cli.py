@@ -1704,6 +1704,67 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
         sys.exit(code)
 
 
+@worker.command("pause-investigate")
+@click.argument("plan_id")
+@click.argument("contract_id")
+@click.option("--cwd", "worktree", type=click.Path(file_okay=False, exists=True, path_type=Path), required=True,
+              help="The paused contract's worktree.")
+@click.option("--tier", default="careful", show_default=True, help="Tier for the INVESTIGATE session.")
+@RESULT_FILE_OPTION
+@TARGET_OPTION
+def worker_pause_investigate(plan_id: str, contract_id: str, worktree: Path, tier: str, result_file: Path | None, target: Path) -> None:
+    """Investigate why a contract paused: read-only, in its worktree; the findings go on the pause record for the owner.
+
+    Exit 0 completed, 1 tamper or failed, 4 refused. `ateam run` starts this itself after a pause."""
+    import asyncio
+
+    from ateam.brief import assemble_pause_brief
+    from ateam.checkpoint import Checkpoint
+    from ateam.contracts.store import load_contracts
+    from ateam.guidance import load_guidance
+    from ateam.records.store import load_records
+    from ateam.roles import PAUSE_INVESTIGATE_SPEC, Role
+    from ateam.runner import investigate as inv
+    from ateam.tiers import load_tiers
+
+    with _Result(result_file, {"outcome": "refused", "attempt_id": None, "cost_usd": 0.0, "error": None}) as out:
+        ctx = _context(target)
+        cs = load_contracts(ctx.paths.contracts)
+        if contract_id not in cs:
+            _fail(f"unknown contract {contract_id}", code=4)
+        pause = ctx.db.open_pause(plan_id)
+        paused = next((c for c in (pause or {}).get("contracts", []) if c["contract_id"] == contract_id), None)
+        if paused is None:
+            _fail(f"{plan_id} has no open pause naming {contract_id}; nothing to investigate", code=4)
+        wt_git = _require_isolated_worktree(ctx, worktree)
+        tiers = load_tiers(ctx.config.tiers)
+        if tier not in tiers:
+            _fail(f"unknown tier {tier!r}; known: {', '.join(tiers)}", code=4)
+        contract = cs[contract_id]
+        recs = load_records(ctx.paths.records)
+        prev = ctx.db.latest_checkpoint(contract_id, role="build")
+        brief_text = assemble_pause_brief(
+            contract, [recs[ref.id] for ref in contract.records if ref.id in recs], paused, ctx.db.attempts_for(contract_id),
+            Checkpoint.from_dict(prev) if prev else None, load_guidance(ctx.paths.guidance, contract_id))
+        result = asyncio.run(inv.run_investigation(
+            paths=ctx.paths, config=ctx.config, target_git=wt_git, name=contract_id, scratch_name=f"{contract_id}-investigate",
+            spec=PAUSE_INVESTIGATE_SPEC, brief_text=brief_text, tier=tiers[tier][Role.investigate], db=ctx.db, tier_name=tier,
+            prompt=(f"Contract {contract_id} paused ({paused['reason']}). Find out why, with evidence, and end with the "
+                    "structured report."),
+        ))
+        report = result.res.report
+        note = f"tamper: {result.tampered[0]}" if result.tampered else (None if report else "no report")
+        ctx.db.set_pause_findings(pause["pause_id"], contract_id, result.attempt_id, report if not result.tampered else None, note)
+        outcome = "tamper" if result.tampered else ("completed" if report else "failed")
+        out.update(outcome=outcome, attempt_id=result.attempt_id, cost_usd=result.res.cost_usd, error=result.res.error)
+        click.echo(f"{contract_id} pause investigation: {outcome}" + (f" ({note})" if note else ""))
+        if report and not result.tampered:
+            click.echo(f"summary: {report.get('summary')}")
+            if report.get("suggested_instruction"):
+                click.echo(f"suggested instruction: {report['suggested_instruction']}")
+        sys.exit(0 if outcome == "completed" else 1)
+
+
 # ---------------------------------------------------------------- verify (minimal)
 
 

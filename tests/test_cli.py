@@ -2459,3 +2459,68 @@ def test_brief_command_carries_only_live_guidance(cli_target):
     assert "owner: use the live helper" in build.output and "stale advice" not in build.output
     test = run("brief", "C-0001", "--role", "test", "--target", str(cli_target))
     assert "Owner's instructions" not in test.output
+
+
+# ---- pause investigation session (pause and resume, task 5)
+
+def _pause_target(cli_target, tmp_path):
+    from ateam.contracts.store import load_contracts
+    _frozen_target(cli_target)
+    db = _db(cli_target)
+    h = load_contracts(TargetPaths.from_root(cli_target).contracts)["C-0001"].content_hash()
+    pid = db.record_pause("P-0001", "budget_exhausted", "C-0001 has used all 2 BUILD attempts",
+                          [{"contract_id": "C-0001", "reason": "budget_exhausted", "detail": "d", "contract_hash": h, "evidence": {"code": 1}}])
+    wt = tmp_path / "wt-p"; GitRepo(cli_target).worktree_add(wt, "wt-p", "main")
+    return db, pid, wt
+
+
+def _canned_investigation(monkeypatch, report, tampered=()):
+    from types import SimpleNamespace
+
+    from ateam.runner import investigate as inv_mod
+    calls = []
+
+    async def canned(**kw):
+        calls.append(kw)
+        res = SimpleNamespace(report=None if tampered else report, cost_usd=0.3, session_id="s", error=None)
+        return inv_mod.InvestigationResult(res=res, attempt_id=11, tampered=list(tampered))
+
+    monkeypatch.setattr(inv_mod, "run_investigation", canned)
+    return calls
+
+
+_PAUSE_REPORT = {"summary": "the helper exists", "evidence": [{"ref": "src/api/x.py:1", "shows": "ROUTES"}],
+                 "failure_class": "implementation", "needs_owner_decision": None, "suggested_instruction": "use ROUTES"}
+
+
+def test_pause_investigate_records_findings(monkeypatch, cli_target, tmp_path):
+    db, pid, wt = _pause_target(cli_target, tmp_path)
+    calls = _canned_investigation(monkeypatch, _PAUSE_REPORT)
+    out = tmp_path / "pi.json"
+    r = run("worker", "pause-investigate", "P-0001", "C-0001", "--cwd", str(wt), "--result-file", str(out), "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert _read(out)["outcome"] == "completed" and _read(out)["attempt_id"] == 11 and _read(out)["cost_usd"] == 0.3
+    c = _db(cli_target).open_pause("P-0001")["contracts"][0]
+    assert c["findings"] == _PAUSE_REPORT and c["attempt_id"] == 11 and c["note"] is None
+    kw = calls[0]
+    assert kw["name"] == "C-0001" and kw["scratch_name"] == "C-0001-investigate" and kw["target_git"].root == wt.resolve()
+    assert "## Why the plan paused" in kw["brief_text"] and kw["spec"].report_schema["required"][0] == "summary"
+
+
+def test_pause_investigate_tamper_leaves_a_note(monkeypatch, cli_target, tmp_path):
+    db, pid, wt = _pause_target(cli_target, tmp_path)
+    _canned_investigation(monkeypatch, _PAUSE_REPORT, tampered=["refs changed (a branch or tag was created, moved or deleted)"])
+    out = tmp_path / "pi.json"
+    r = run("worker", "pause-investigate", "P-0001", "C-0001", "--cwd", str(wt), "--result-file", str(out), "--target", str(cli_target))
+    c = _db(cli_target).open_pause("P-0001")["contracts"][0]
+    assert r.exit_code == 1 and _read(out)["outcome"] == "tamper"
+    assert c["findings"] is None and c["note"].startswith("tamper: refs changed")
+
+
+def test_pause_investigate_refuses_without_an_open_pause(monkeypatch, cli_target, tmp_path):
+    _frozen_target(cli_target)
+    wt = tmp_path / "wt-q"; GitRepo(cli_target).worktree_add(wt, "wt-q", "main")
+    calls = _canned_investigation(monkeypatch, _PAUSE_REPORT)
+    out = tmp_path / "pi.json"
+    r = run("worker", "pause-investigate", "P-0001", "C-0001", "--cwd", str(wt), "--result-file", str(out), "--target", str(cli_target))
+    assert r.exit_code == 4 and _read(out)["outcome"] == "refused" and calls == []

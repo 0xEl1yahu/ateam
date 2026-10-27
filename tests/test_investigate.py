@@ -129,3 +129,42 @@ async def test_concurrent_branch_creation_still_discards_valid_review(monkeypatc
     assert result.res.report is None
     assert any("refs changed" in reason for reason in result.tampered)
     assert inv_env["db"].telemetry_rows()[-1]["outcome"] == "tamper"
+
+
+@pytest.mark.asyncio
+async def test_investigation_runs_in_the_given_checkout(monkeypatch, inv_env, target_repo, tmp_path):
+    from ateam.runner import investigate as inv
+    wt = tmp_path / "wt"; GitRepo(target_repo).worktree_add(wt, "wt", "main")
+    seen = {}
+    real_policy = inv.Policy
+
+    def spy_policy(**kw):
+        seen["policy_worktree"] = kw["worktree"]; seen["scratch"] = kw["scratch_dir"]
+        return real_policy(**kw)
+
+    async def fake_query(prompt, options):
+        seen["cwd"] = options.cwd
+        yield _result({"candidates": [], "unknowns": [], "notes": "n"})
+
+    monkeypatch.setattr(inv, "Policy", spy_policy)
+    monkeypatch.setattr("ateam.runner.run.query", fake_query)
+    r = await run_investigation(paths=inv_env["paths"], config=inv_env["config"], target_git=GitRepo(wt), name="C-0001",
+                                scratch_name="C-0001-investigate", spec=DISCOVERY_SPEC, prompt="go", brief_text="B",
+                                tier=inv_env["tier"], db=inv_env["db"])
+    assert r.tampered == [] and seen["cwd"] == str(wt) and seen["policy_worktree"] == wt
+    assert seen["scratch"] == inv_env["paths"].scratch_root / "C-0001-investigate"
+    assert inv_env["db"].telemetry_rows()[-1]["contract_id"] == "C-0001"
+
+
+@pytest.mark.asyncio
+async def test_investigation_in_a_worktree_sees_a_shared_ref_change_as_tamper(monkeypatch, inv_env, target_repo, tmp_path):
+    wt = tmp_path / "wt"; GitRepo(target_repo).worktree_add(wt, "wt", "main")
+
+    async def owner_branches(prompt, options):
+        GitRepo(target_repo).run("branch", "owner-work")        # the owner, in their own checkout, mid-session
+        yield _result({"candidates": [], "unknowns": [], "notes": "n"})
+
+    monkeypatch.setattr("ateam.runner.run.query", owner_branches)
+    r = await run_investigation(paths=inv_env["paths"], config=inv_env["config"], target_git=GitRepo(wt), name="C-0001",
+                                spec=DISCOVERY_SPEC, prompt="go", brief_text="B", tier=inv_env["tier"], db=inv_env["db"])
+    assert any("refs changed" in t for t in r.tampered) and r.res.report is None
