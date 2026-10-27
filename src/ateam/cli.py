@@ -1958,7 +1958,8 @@ def worker_pause_investigate(plan_id: str, contract_id: str, worktree: Path, tie
         prev = ctx.db.latest_checkpoint(contract_id, role="build")
         brief_text = assemble_pause_brief(
             contract, [recs[ref.id] for ref in contract.records if ref.id in recs], paused, ctx.db.attempts_for(contract_id),
-            Checkpoint.from_dict(prev) if prev else None, load_guidance(ctx.paths.guidance, contract_id))
+            Checkpoint.from_dict(prev) if prev else None, load_guidance(ctx.paths.guidance, contract_id),
+            runs_dir=home_dir(target) / "runs")
         result = asyncio.run(inv.run_investigation(
             paths=ctx.paths, config=ctx.config, target_git=wt_git, name=contract_id, scratch_name=f"{contract_id}-investigate",
             spec=PAUSE_INVESTIGATE_SPEC, brief_text=brief_text, tier=tiers[tier][Role.investigate], db=ctx.db, tier_name=tier,

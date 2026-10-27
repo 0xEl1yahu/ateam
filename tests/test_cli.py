@@ -2524,3 +2524,24 @@ def test_pause_investigate_refuses_without_an_open_pause(monkeypatch, cli_target
     out = tmp_path / "pi.json"
     r = run("worker", "pause-investigate", "P-0001", "C-0001", "--cwd", str(wt), "--result-file", str(out), "--target", str(cli_target))
     assert r.exit_code == 4 and _read(out)["outcome"] == "refused" and calls == []
+
+
+def test_pause_investigate_brief_carries_the_log_tail(monkeypatch, cli_target, tmp_path):
+    from ateam.contracts.store import load_contracts
+    from ateam.paths import TargetPaths, home_dir
+    _frozen_target(cli_target)
+    db = _db(cli_target)
+    h = load_contracts(TargetPaths.from_root(cli_target).contracts)["C-0001"].content_hash()
+    log = home_dir(cli_target) / "runs" / "P-0001" / "C-0001.log"
+    log.parent.mkdir(parents=True)
+    log.write_text("".join(f"step line {i}\n" for i in range(1, 81)))
+    db.record_pause("P-0001", "verify_failed", "checks failed",
+                    [{"contract_id": "C-0001", "reason": "verify_failed", "detail": "d", "contract_hash": h,
+                      "evidence": {"log": str(log)}}])
+    wt = tmp_path / "wt-l"; GitRepo(cli_target).worktree_add(wt, "wt-l", "main")
+    calls = _canned_investigation(monkeypatch, _PAUSE_REPORT)
+    out = tmp_path / "pi.json"
+    r = run("worker", "pause-investigate", "P-0001", "C-0001", "--cwd", str(wt), "--result-file", str(out), "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    brief = calls[0]["brief_text"]
+    assert "step line 80" in brief and "step line 21\n" in brief and "step line 20\n" not in brief

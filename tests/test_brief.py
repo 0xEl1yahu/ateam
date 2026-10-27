@@ -313,3 +313,64 @@ def test_pause_brief_sections_in_order(sample_contract, records_three):
     assert "build" in text[idx[3]:idx[4]] and "failed" in text[idx[3]:idx[4]] and "0.12" in text[idx[3]:idx[4]]
     assert "try y" in text[idx[4]:idx[5]]
     assert "use x" in text[idx[5]:] and "old advice" not in text
+
+
+def _pause_log_brief(contract, records, evidence, runs_dir):
+    from ateam.brief import assemble_pause_brief
+    paused = {"contract_id": contract.id, "reason": "verify_failed", "detail": "checks failed", "evidence": evidence}
+    return assemble_pause_brief(contract, [records["R-0001"]], paused, [], None, [], runs_dir=runs_dir)
+
+
+def test_pause_brief_includes_the_paused_step_log_tail(sample_contract, records_three, tmp_path):
+    runs = tmp_path / "runs"
+    (runs / "P-0001").mkdir(parents=True)
+    log = runs / "P-0001" / "C-0001.log"
+    log.write_text("".join(f"line {i}\n" for i in range(1, 101)))
+    text = _pause_log_brief(sample_contract, records_three, {"log": str(log), "code": 1}, runs)
+    why = text[text.index("## Why the plan paused"):text.index("## Attempt history")]
+    assert str(log) in why and "Paused step's output" in why
+    assert "line 41\n" in why and "line 100" in why and "line 40\n" not in why
+    assert why.index("line 41\n") < why.index("line 100")
+
+
+def test_pause_brief_log_unreadable_or_outside_runs(sample_contract, records_three, tmp_path):
+    import os
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    outside = tmp_path / "outside.log"
+    outside.write_text("SECRET-OUTSIDE\n")
+    link = runs / "link.log"
+    os.symlink(outside, link)
+    missing = runs / "missing.log"
+    cases = [(str(missing), runs), (str(outside), runs), (str(link), runs), ("/etc/hosts", runs), (str(outside), None)]
+    for path, root in cases:
+        text = _pause_log_brief(sample_contract, records_three, {"log": path}, root)
+        why = text[text.index("## Why the plan paused"):text.index("## Attempt history")]
+        assert "could not read the paused step's log" in why and path in why
+        assert "SECRET-OUTSIDE" not in text
+
+
+def test_pause_brief_without_a_log(sample_contract, records_three, tmp_path):
+    from ateam.brief import assemble_pause_brief
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    base = assemble_pause_brief(sample_contract, [records_three["R-0001"]],
+                                {"contract_id": sample_contract.id, "reason": "budget_exhausted", "detail": "d", "evidence": None},
+                                [], None, [])
+    assert "could not read" not in base and "Paused step's output" not in base
+    for ev in (None, {"error": "boom"}, {"paths": ["a"]}):
+        for root in (None, runs):
+            text = _pause_log_brief(sample_contract, records_three, ev, root)
+            assert "could not read" not in text and "Paused step's output" not in text
+            assert "## Attempt history" in text
+
+
+def test_pause_brief_log_tail_is_capped(sample_contract, records_three, tmp_path):
+    from ateam.brief import DOC_CAP
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    log = runs / "wide.log"
+    log.write_text("\n".join("x" * 1000 for _ in range(60)) + "\n")
+    text = _pause_log_brief(sample_contract, records_three, {"log": str(log)}, runs)
+    why = text[text.index("## Why the plan paused"):text.index("## Attempt history")]
+    assert why.count("x") <= DOC_CAP

@@ -124,15 +124,37 @@ def render_brief(b: Brief) -> str:
 
 
 DOC_CAP = 12_000
+PAUSE_LOG_LINES = 60
+
+
+def _pause_log(paused: dict, runs_dir: Path | None) -> str | None:
+    """The tail of the paused step's log, read only when it resolves under runs_dir; None when the evidence has no log."""
+    evidence = paused.get("evidence")
+    if not isinstance(evidence, dict) or not evidence.get("log"):
+        return None
+    path = str(evidence["log"])
+    try:
+        if runs_dir is None:
+            raise OSError("no runs directory")
+        f = Path(path).resolve()
+        if not f.is_relative_to(runs_dir.resolve()):
+            raise OSError("outside runs")
+        text = f.read_text(errors="replace")
+    except OSError:
+        return f"Note: could not read the paused step's log at {path}; its output is not shown."
+    tail = "\n".join(text.splitlines()[-PAUSE_LOG_LINES:])
+    if len(tail) > DOC_CAP:
+        tail = tail[-DOC_CAP:]
+    return f"Paused step's output (last {PAUSE_LOG_LINES} lines of {path}):\n{tail}"
 
 
 def assemble_pause_brief(
     contract: Contract, records: list[Record], paused: dict, attempts: list[dict], build_checkpoint: Checkpoint | None,
-    instructions: Sequence[GuidanceEntry],
+    instructions: Sequence[GuidanceEntry], runs_dir: Path | None = None,
 ) -> str:
     """The brief for a pause investigation: what binds the contract, what it asks, why the plan paused (with the
-    paused step's evidence), every attempt so far, the last BUILD worker's unverified notes, and the owner's live
-    instructions already given."""
+    paused step's evidence and log tail), every attempt so far, the last BUILD worker's unverified notes, and the
+    owner's live instructions already given."""
     import json
 
     binding = "\n\n".join(render_record(r) for r in records) or "No binding records apply to this contract."
@@ -140,6 +162,9 @@ def assemble_pause_brief(
     if len(evidence) > DOC_CAP:
         evidence = evidence[:DOC_CAP] + f"\n[... truncated at {DOC_CAP} characters]"
     why = f"Reason: {paused.get('reason')}\nDetail: {_one_line(str(paused.get('detail') or ''))}\nEvidence:\n{evidence}"
+    log = _pause_log(paused, runs_dir)
+    if log is not None:
+        why += "\n" + log
     history = "\n".join(
         f"- attempt {a.get('attempt_id')}: {a.get('role')} at {a.get('tier')}, {a.get('outcome') or 'unfinished'}"
         + (f" ({a['failure_class']})" if a.get("failure_class") else "")
