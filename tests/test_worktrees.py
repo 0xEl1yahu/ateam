@@ -1,5 +1,7 @@
 """Contract worktrees under ATeam's home, cut from the integration-branch tip with the base recorded first."""
 
+import subprocess
+
 import pytest
 
 from ateam.gitops import GitRepo
@@ -72,3 +74,70 @@ def test_wrong_branch_or_foreign_history_refused(target_repo, tmp_path):
     stray = home_dir(target_repo) / "worktrees" / "C-0004"; stray.mkdir(parents=True)
     with pytest.raises(WorktreeError, match="not a worktree"):
         contract_worktree(paths, db, owner, "P-0001", "C-0004")
+
+
+# ---- lanes (2026-10-27-lanes-design.md, decision 2)
+
+def _verified_head(db, w, cid, name):
+    g = GitRepo(w.path)
+    (w.path / name).write_text(f"{name}\n"); g.run("add", "-A"); g.run("commit", "-q", "-m", name)
+    db.set_checkpoint(cid, None, {"head": g.head()})
+    return g.head()
+
+
+def test_a_follower_shares_the_lane_worktree_with_the_head_as_base(target_repo):
+    from ateam.worktrees import contract_worktree, worktree_path
+    paths, db, owner = _setup(target_repo)
+    head = _verified_head(db, contract_worktree(paths, db, owner, "P-0001", "C-1"), "C-1", "one.txt")
+    w = contract_worktree(paths, db, owner, "P-0001", "C-2", after="C-1")
+    assert w.path == home_dir(target_repo) / "worktrees" / "C-1" and w.branch == "ateam/C-1" and w.base == head
+    assert db.get_meta("lane:C-2") == "C-1" and db.get_meta("lane:C-1") == "C-1" and db.get_meta("base:C-2") == head
+    assert worktree_path(paths, db, "C-2") == w.path and not (home_dir(target_repo) / "worktrees" / "C-2").exists()
+
+
+def test_a_follower_reuses_its_recorded_lane_and_base(target_repo):
+    from ateam.worktrees import contract_worktree
+    paths, db, owner = _setup(target_repo)
+    w1 = contract_worktree(paths, db, owner, "P-0001", "C-1")
+    head = _verified_head(db, w1, "C-1", "one.txt")
+    contract_worktree(paths, db, owner, "P-0001", "C-2", after="C-1")
+    _verified_head(db, w1, "C-1", "newer.txt")
+    assert contract_worktree(paths, db, owner, "P-0001", "C-2", after="C-1").base == head
+
+
+def test_a_third_contract_follows_the_lane_head_not_its_predecessor(target_repo):
+    from ateam.worktrees import contract_worktree
+    paths, db, owner = _setup(target_repo)
+    w1 = contract_worktree(paths, db, owner, "P-0001", "C-1")
+    _verified_head(db, w1, "C-1", "one.txt")
+    w2 = contract_worktree(paths, db, owner, "P-0001", "C-2", after="C-1")
+    head2 = _verified_head(db, w2, "C-2", "two.txt")
+    w3 = contract_worktree(paths, db, owner, "P-0001", "C-3", after="C-2")
+    assert w3.path == w1.path and w3.base == head2 and db.get_meta("lane:C-3") == "C-1"
+
+
+def test_a_contract_cut_before_lanes_keeps_its_own_worktree(target_repo):
+    from ateam.worktrees import contract_worktree
+    paths, db, owner = _setup(target_repo)
+    _verified_head(db, contract_worktree(paths, db, owner, "P-0001", "C-1"), "C-1", "one.txt")
+    old = contract_worktree(paths, db, owner, "P-0001", "C-2")
+    db.delete_meta("lane:C-2")   # as cut before lanes existed: base recorded, no lane
+    w = contract_worktree(paths, db, owner, "P-0001", "C-2", after="C-1")
+    assert w.path == old.path == home_dir(target_repo) / "worktrees" / "C-2" and w.base == old.base
+    assert db.get_meta("lane:C-2") == "C-2"
+
+
+def test_a_merge_in_progress_onto_the_recorded_base_is_accepted(target_repo, tmp_path):
+    from ateam.worktrees import WorktreeError, contract_worktree
+    paths, db, owner = _setup(target_repo)
+    w = contract_worktree(paths, db, owner, "P-0001", "C-1")
+    g = GitRepo(w.path)
+    (w.path / "f.txt").write_text("mine\n"); g.run("add", "-A"); g.run("commit", "-q", "-m", "mine")
+    tip = _advance_integration(owner, tmp_path, "f.txt", "other")
+    subprocess.run(["git", "merge", "--no-ff", "--no-commit", tip], cwd=w.path, capture_output=True)
+    assert g.merge_in_progress()
+    db.set_meta("base:C-1", tip)
+    assert contract_worktree(paths, db, owner, "P-0001", "C-1").base == tip
+    db.set_meta("base:C-1", _advance_integration(owner, tmp_path, "g.txt", "unrelated"))
+    with pytest.raises(WorktreeError):
+        contract_worktree(paths, db, owner, "P-0001", "C-1")

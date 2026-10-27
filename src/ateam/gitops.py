@@ -113,6 +113,11 @@ class GitRepo:
         r = subprocess.run(["git", "rev-parse", "--verify", "--quiet", "MERGE_HEAD"], cwd=self.root, capture_output=True)
         return r.returncode == 0
 
+    def merge_head(self) -> str | None:
+        """The commit being merged while a merge is in progress, else None."""
+        r = subprocess.run(["git", "rev-parse", "--verify", "--quiet", "MERGE_HEAD"], cwd=self.root, capture_output=True, text=True)
+        return r.stdout.strip() if r.returncode == 0 else None
+
     def merge_no_ff(self, rev: str, message: str) -> str:
         """Merge `rev` with a merge commit and return the new HEAD. Any failure that leaves a merge in progress is
         aborted first; a conflict raises MergeConflict naming the conflicting paths."""
