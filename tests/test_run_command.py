@@ -48,3 +48,221 @@ def test_first_interrupt_sets_stop_and_a_second_exits_130():
     with pytest.raises(SystemExit) as e:
         handler(2, None)
     assert e.value.code == 130
+
+
+# ---- ateam resume (pause and resume, task 7)
+
+import os  # noqa: E402
+
+from ateam.gitops import GitRepo  # noqa: E402
+from ateam.paths import home_dir  # noqa: E402
+from ateam.state.db import StateDB  # noqa: E402
+from test_scheduler import FakeInvestigator  # noqa: E402
+
+_SCOPE = {("C-0001", "build"): {"code": 3, "outcome": "scope_breach", "commit": False}}
+
+
+def _sdb(p):
+    db = StateDB(home_dir(p.root) / "state.db"); db.init_schema()
+    return db
+
+
+def _paused(p, monkeypatch, investigate=None):
+    """P-0001 paused by C-0001 (scope_exceeded after 2 BUILD attempts), with an investigation's findings recorded."""
+    _set_config(p.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    _fake(monkeypatch, FakeWorkers(_SCOPE), investigate)
+    r = run("run", "P-0001", "--target", str(p.root))
+    assert r.exit_code == 1 and "paused (scope_exceeded" in r.output, r.output
+    _fake(monkeypatch, FakeWorkers())
+    return _sdb(p)
+
+
+def _intent_head(p):
+    return GitRepo(p.paths.intent).head()
+
+
+def _resume(p, *args):
+    return run("resume", "P-0001", *args, "--target", str(p.root))
+
+
+def _seed(p, contracts, reason="budget_exhausted", conflict=False):
+    return _sdb(p).record_pause("P-0001", reason, "seeded", contracts, conflict=conflict)
+
+
+def _entry(cid, h, findings=None):
+    return {"contract_id": cid, "reason": "budget_exhausted", "detail": "d", "contract_hash": h, "evidence": None}
+
+
+def _not_paused(p, mp):
+    _set_config(p.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    return (), "only a paused plan resumes"
+
+
+def _lock_held(p, mp):
+    _paused(p, mp)
+    with _sdb(p).conn as c:
+        c.execute("INSERT INTO run_lock (singleton, plan_id, acquired_at, pid) VALUES (1, 'P-0001', 'then', ?)", (os.getpid(),))
+    return (), "is running"
+
+
+def _planning_live(p, mp):
+    db = _paused(p, mp)
+    db.transition("feature", "P-0099", "requested", by="t"); db.transition("feature", "P-0099", "investigating", by="t")
+    db.set_meta("planning:P-0099", str(os.getpid()))
+    return (), "is being planned"
+
+
+def _dirty_intent(p, mp):
+    _paused(p, mp)
+    (p.paths.intent / "stray.txt").write_text("x\n")
+    return (), "uncommitted changes"
+
+
+def _conflict(p, mp):
+    db = _paused(p, mp)
+    _seed(p, [_entry("C-0001", db.contract_hash("C-0001"))], reason="environment_failure", conflict=True)
+    return (), "merge conflict"
+
+
+def _hand_edit(p, mp):
+    from ateam.contracts.store import load_contracts, save_contract
+    from ateam.intent import commit_intent
+    _paused(p, mp)
+    c = load_contracts(p.paths.contracts)["C-0003"]
+    save_contract(p.paths.contracts, c.model_copy(update={"title": "edited by hand"}))
+    commit_intent(p.paths, "hand edit", ["contracts"])
+    return (), "C-0003 differs from its frozen hash"
+
+
+def _adopt_without_suggestion(p, mp):
+    _paused(p, mp, FakeInvestigator(outcome="failed"))
+    return ("--adopt",), "no suggestion for C-0001"
+
+
+def _adopt_after_owner_stop(p, mp):
+    _paused(p, mp)
+    _seed(p, [], reason="owner_stopped")
+    return ("--adopt",), "nothing to adopt"
+
+
+def _adopt_before_refreeze(p, mp):
+    db = _paused(p, mp)
+    pid = _seed(p, [_entry("C-0001", "an-older-hash")])
+    db.set_pause_findings(pid, "C-0001", 42, {"summary": "s", "suggested_instruction": "use x"}, None)
+    return ("--adopt",), "written before its re-freeze"
+
+
+def _adopt_and_note(p, mp):
+    _paused(p, mp)
+    return ("--adopt", "--note", "x"), "not both"
+
+
+def _note_two_paused(p, mp):
+    db = _paused(p, mp)
+    _seed(p, [_entry("C-0001", db.contract_hash("C-0001")), _entry("C-0003", db.contract_hash("C-0003"))])
+    return ("--note", "x"), "--contract"
+
+
+def _note_all_integrated(p, mp):
+    db = _paused(p, mp)
+    with db.conn as c:
+        c.execute("UPDATE contracts SET status='integrated'")
+    _seed(p, [])
+    return ("--note", "x", "--contract", "C-0001"), "is integrated; an instruction has no BUILD"
+
+
+@pytest.mark.parametrize("setup", [_not_paused, _lock_held, _planning_live, _dirty_intent, _conflict, _hand_edit,
+                                   _adopt_without_suggestion, _adopt_after_owner_stop, _adopt_before_refreeze,
+                                   _adopt_and_note, _note_two_paused, _note_all_integrated])
+def test_resume_refusals(setup, plan3, monkeypatch):
+    args, why = setup(plan3, monkeypatch)
+    status, head = _sdb(plan3).feature_status("P-0001"), _intent_head(plan3)
+    r = _resume(plan3, *args)
+    assert r.exit_code == 4 and why in r.output, r.output
+    assert _sdb(plan3).feature_status("P-0001") == status and _intent_head(plan3) == head
+
+
+def test_resume_with_a_note_commits_guidance_and_runs_to_merge_proposed(plan3, monkeypatch):
+    _paused(plan3, monkeypatch)
+    r = _resume(plan3, "--note", "use x")
+    assert r.exit_code == 0 and "P-0001 -> merge_proposed" in r.output, r.output
+    g = GitRepo(plan3.paths.intent)
+    sha = g.run("log", "--format=%H", "--grep", "P-0001 -> executing", "-1").strip()
+    changed = g.run("show", "--name-only", "--format=", sha).split()
+    assert any(f.startswith("plans/") for f in changed) and "guidance/C-0001.yaml" in changed
+    assert "owner: use x" in run("brief", "C-0001", "--role", "build", "--target", str(plan3.root)).output
+
+
+def test_resume_adopt_records_the_investigation_source(plan3, monkeypatch):
+    from ateam.guidance import load_guidance
+    db = _paused(plan3, monkeypatch)
+    pause = db.open_pause("P-0001")
+    db.set_pause_findings(pause["pause_id"], "C-0001", 42, {"summary": "s", "suggested_instruction": "use the helper"}, None)
+    r = _resume(plan3, "--adopt", "--no-run")
+    assert r.exit_code == 0, r.output
+    [e] = load_guidance(plan3.paths.guidance, "C-0001")
+    assert e.source == "A-42" and e.text == "use the helper" and e.contract_hash == db.contract_hash("C-0001")
+
+
+def test_resume_no_run_only_changes_state(plan3, monkeypatch):
+    db = _paused(plan3, monkeypatch)
+    fake = FakeWorkers(); _fake(monkeypatch, fake)
+    r = _resume(plan3, "--no-run")
+    assert r.exit_code == 0 and "P-0001 -> executing" in r.output and fake.calls == []
+    assert db.feature_status("P-0001") == "executing" and db.open_pause("P-0001") is None and db.window_start("C-0001") > 0
+
+
+def test_resume_after_a_failed_intent_commit_resumes_again(plan3, monkeypatch):
+    import subprocess
+
+    from ateam.guidance import load_guidance
+    from ateam.intent import IntentError
+    db = _paused(plan3, monkeypatch)
+    real = __import__("ateam.plans.ops", fromlist=["commit_intent_files"]).commit_intent_files
+    calls = {"n": 0}
+
+    def flaky(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise IntentError("gpg failed to sign the data")
+        return real(*a, **kw)
+
+    monkeypatch.setattr("ateam.plans.ops.commit_intent_files", flaky)
+    r = _resume(plan3, "--note", "use x", "--no-run")
+    assert r.exit_code == 1 and "gpg failed" in r.output and "git -C" in r.output, r.output
+    assert db.feature_status("P-0001") == "paused"
+    for line in r.output.splitlines():
+        if line.strip().startswith("git -C"):
+            subprocess.run(line.strip(), shell=True, check=True)
+    r2 = _resume(plan3, "--note", "use x", "--no-run")
+    assert r2.exit_code == 0, r2.output
+    assert [e.text for e in load_guidance(plan3.paths.guidance, "C-0001")] == ["use x"]
+
+
+def test_resume_of_a_plan_paused_without_a_record(plan3, monkeypatch):
+    from ateam.plans.ops import set_plan_status
+    from ateam.plans.store import load_plans
+    db = _sdb(plan3)
+    set_plan_status(plan3.paths, db, load_plans(plan3.paths.plans)["P-0001"], ["executing", "paused"], by="t", why="budget_exhausted: old")
+    r = _resume(plan3, "--no-run")
+    assert r.exit_code == 0 and "no contract's attempts were refreshed" in r.output, r.output
+    assert db.feature_status("P-0001") == "executing" and all(db.window_start(c) == 0 for c in ("C-0001", "C-0002", "C-0003"))
+
+
+def test_refrozen_contract_gets_a_window_and_no_stale_guidance(plan3, monkeypatch):
+    from datetime import UTC, datetime
+
+    from ateam.contracts.store import load_contracts, save_contract
+    from ateam.guidance import GuidanceEntry, append_guidance
+    from ateam.intent import commit_intent
+    db = _paused(plan3, monkeypatch)
+    c = load_contracts(plan3.paths.contracts)["C-0001"]
+    append_guidance(plan3.paths.guidance, "C-0001", GuidanceEntry(at=datetime(2026, 10, 27, tzinfo=UTC), source="owner",
+                                                                   contract_hash=c.content_hash(), text="for the old contract"))
+    save_contract(plan3.paths.contracts, c.model_copy(update={"title": "Add a, clarified"}))
+    commit_intent(plan3.paths, "owner clarifies C-0001", ["contracts", "guidance"])
+    assert run("contracts", "freeze", "C-0001", "--force", "--target", str(plan3.root)).exit_code == 0
+    r = _resume(plan3, "--no-run")
+    assert r.exit_code == 0, r.output
+    assert db.window_start("C-0001") > 0
+    assert "Owner's instructions" not in run("brief", "C-0001", "--role", "build", "--target", str(plan3.root)).output

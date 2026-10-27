@@ -307,27 +307,39 @@ def _preflight(ctx, plan_id: str, say, dry_run: bool):
     cids = plan_contract_ids(db, plan)
     if not cids:
         raise RunRefused(f"{plan_id} has no contracts")
-    for cid in cids:
-        c = cs.get(cid)
-        if c is None:
-            raise RunRefused(f"{cid} has no contract file")
-        frozen = db.contract_hash(cid)
-        if frozen is None:
-            raise RunRefused(f"{cid} is not frozen")
-        if c.content_hash() != frozen:
-            raise RunRefused(f"{cid} differs from its frozen hash (hand edit after freeze)")
-        drifted = drift(c, records)
-        if drifted:
-            raise RunRefused(f"{cid} has record drift ({', '.join(drifted)}); re-freeze or replan first")
-        if db.contract_status(cid) is None:
-            raise RunRefused(f"{cid} has no row in the state store")
-        if not c.checks:
-            raise RunRefused(f"{cid} has no deterministic checks of its own; verify would refuse it")
+    problems = binding_problems(ctx, cids, cs, records)
+    if problems:
+        raise RunRefused(problems[0])
     if stored == "integrating":
         unfinished = [f"{cid} ({db.contract_status(cid)})" for cid in cids if db.contract_status(cid) not in ("verified", "integrated")]
         if unfinished:
             raise RunRefused(f"{plan_id} is integrating but {', '.join(unfinished)} is unfinished; investigate")
     return plan, cs, cids
+
+
+def binding_problems(ctx, cids: list[str], cs: dict | None = None, records: dict | None = None) -> list[str]:
+    """Why each of these contracts cannot run as frozen; empty when every one binds. `ateam run` refuses on the first,
+    `ateam resume` names them all."""
+    cs = load_contracts(ctx.paths.contracts) if cs is None else cs
+    records = load_records(ctx.paths.records) if records is None else records
+    db, out = ctx.db, []
+    for cid in cids:
+        c = cs.get(cid)
+        if c is None:
+            out.append(f"{cid} has no contract file"); continue
+        frozen = db.contract_hash(cid)
+        if frozen is None:
+            out.append(f"{cid} is not frozen"); continue
+        if c.content_hash() != frozen:
+            out.append(f"{cid} differs from its frozen hash (hand edit after freeze)"); continue
+        drifted = drift(c, records)
+        if drifted:
+            out.append(f"{cid} has record drift ({', '.join(drifted)}); re-freeze or replan first"); continue
+        if db.contract_status(cid) is None:
+            out.append(f"{cid} has no row in the state store"); continue
+        if not c.checks:
+            out.append(f"{cid} has no deterministic checks of its own; verify would refuse it")
+    return out
 
 
 def _dry_run(ctx, plan_id: str, cs, cids: list[str], say) -> RunSummary:

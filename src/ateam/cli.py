@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import NoReturn
 
 import click
 
@@ -1014,6 +1015,12 @@ def run_cmd(plan_id: str, dry_run: bool, target: Path) -> None:
     """Execute an approved plan until the merge gate or a pause. Never merges into the target branch.
 
     Exit 0 merge_proposed (or a dry run), 1 paused, stalled or out of run budget, 4 refused or a re-run is needed, 130 interrupted."""
+    _run_foreground(target, plan_id, dry_run)
+
+
+def _run_foreground(target: Path, plan_id: str, dry_run: bool) -> NoReturn:
+    """Run the scheduler in a worker thread with the Ctrl-C handler in the main thread; exits with run's code.
+    Shared by `ateam run` and `ateam resume`."""
     import signal
     import threading
 
@@ -1056,6 +1063,111 @@ def run_cmd(plan_id: str, dry_run: bool, target: Path) -> None:
         click.echo(f"{plan_id} -> merge_proposed. Review {summary.proposal}, then: ateam merge {plan_id}   "
                    f"(or: ateam reject {plan_id} \"reason\")")
     sys.exit({"merge_proposed": 0, "dry_run": 0, "paused": 1, "stalled": 1, "budget": 1, "rerun": 4, "interrupted": 130}[summary.outcome])
+
+
+@main.command("resume")
+@click.argument("plan_id")
+@click.option("--adopt", is_flag=True, help="Use each paused contract's investigation suggestion as your instruction.")
+@click.option("--note", default=None, help="Your instruction for the next BUILD (guidance within the frozen contract).")
+@click.option("--note-file", type=click.Path(dir_okay=False, exists=True, path_type=Path), default=None,
+              help="Read the instruction from a file.")
+@click.option("--contract", "contract_ids", multiple=True, help="Which contract an instruction is for (repeatable).")
+@click.option("--no-run", is_flag=True, help="Only resume the plan's state; do not continue the run.")
+@TARGET_OPTION
+def resume(plan_id: str, adopt: bool, note: str | None, note_file: Path | None, contract_ids: tuple[str, ...], no_run: bool,
+           target: Path) -> None:
+    """Resume a paused plan: optional guidance for the next BUILD, fresh attempts for the paused contracts, then run.
+
+    Exit 4 refused, 1 when the intent commit fails; otherwise as `ateam run` (0 with --no-run)."""
+    from datetime import UTC, datetime
+
+    from ateam import scheduler
+    from ateam.contracts.store import load_contracts
+    from ateam.gitops import GitError
+    from ateam.guidance import GuidanceEntry, append_guidance
+    from ateam.plans.ops import plan_contract_ids, set_plan_status
+    from ateam.plans.store import load_plans
+
+    ctx = _context(target)
+    plan = load_plans(ctx.paths.plans).get(plan_id)
+    if plan is None:
+        _fail(f"unknown plan {plan_id}", code=4)
+    stored = ctx.db.feature_status(plan_id)
+    if "paused" not in (stored, str(plan.status)):
+        _fail(f"{plan_id} is {stored or plan.status}; only a paused plan resumes", code=4)
+    require_no_live_run(ctx)
+    require_no_live_planning(ctx)
+    try:
+        require_clean(ctx.paths)
+    except IntentError as e:
+        _fail(str(e), code=4)
+    pause = ctx.db.open_pause(plan_id)
+    if pause is not None and pause["conflict"]:
+        _fail(f"{plan_id} paused on a merge conflict ({pause['detail']}); resume is refused until the rebase BUILD exists", code=4)
+    cids = plan_contract_ids(ctx.db, plan)
+    problems = scheduler.binding_problems(ctx, cids)
+    if problems:
+        _fail(f"{plan_id} cannot resume until every contract binds:\n  " + "\n  ".join(problems), code=4)
+
+    if adopt and (note is not None or note_file is not None):
+        _fail("use --adopt or --note/--note-file, not both", code=4)
+    text = note_file.read_text().strip() if note_file is not None else note
+    paused_recs = {c["contract_id"]: c for c in (pause or {}).get("contracts", [])}
+    unfinished = [cid for cid in cids if ctx.db.contract_status(cid) != "integrated"]
+    for cid in contract_ids:
+        if cid not in cids:
+            _fail(f"{cid} is not a contract of {plan_id}", code=4)
+    targets = list(contract_ids) or (list(paused_recs) if adopt else (list(paused_recs) if len(paused_recs) == 1 else []))
+    instructions: dict[str, tuple[str, str]] = {}   # cid -> (source, text)
+    if adopt or text is not None:
+        if not unfinished:
+            _fail(f"every contract of {plan_id} is integrated; an instruction has no BUILD to reach (resume re-runs integration)", code=4)
+        if adopt:
+            if not targets:
+                _fail(f"nothing to adopt: {plan_id}'s pause names no contract with a suggestion", code=4)
+            for cid in targets:
+                rec = paused_recs.get(cid)
+                suggestion = ((rec or {}).get("findings") or {}).get("suggested_instruction")
+                if not suggestion:
+                    _fail(f"no suggestion for {cid} to adopt; write your own with --note", code=4)
+                if rec["contract_hash"] != ctx.db.contract_hash(cid):
+                    _fail(f"the suggestion for {cid} was written before its re-freeze; write your own with --note", code=4)
+                instructions[cid] = (f"A-{rec['attempt_id']}" if rec.get("attempt_id") is not None else "A-?", suggestion)
+        else:
+            if not targets:
+                _fail(f"say which contract the instruction is for: --contract C-xxxx (paused: {', '.join(paused_recs) or 'none'})", code=4)
+            for cid in targets:
+                instructions[cid] = ("owner", text)
+
+    window_cids = sorted(paused_recs)
+    if window_cids:
+        ctx.db.resume_pause(None, window_cids)   # first, and idempotent: a repeated resume opens a newer window
+    else:
+        click.echo("no contract's attempts were refreshed (the pause names no contract)")
+    cs = load_contracts(ctx.paths.contracts)
+    now = datetime.now(UTC)
+    written = [append_guidance(ctx.paths.guidance, cid, GuidanceEntry(at=now, source=src, contract_hash=cs[cid].content_hash(), text=t))
+               for cid, (src, t) in instructions.items()]
+    try:
+        set_plan_status(ctx.paths, ctx.db, plan, ["executing"], by="owner", why="resumed", extra_files=written)
+    except (IntentError, GitError) as e:
+        git = GitRepo(ctx.paths.intent)
+        click.echo(f"error: could not commit the resume in the intent repo: {e}")
+        click.echo(f"{plan_id} is still paused. Restore the intent repo, then resume again:")
+        for path in [*(ctx.paths.plans.glob(f"{plan_id}-*.yaml")), *written]:
+            rel = intent_relpath(ctx.paths, path)
+            tracked = bool(git.run("ls-files", "--", rel).strip())
+            verb = "checkout" if tracked else "clean -f"
+            click.echo(f'  git -C "{ctx.paths.intent}" {verb} -- {rel}')
+        sys.exit(1)
+    if pause is not None:
+        ctx.db.resume_pause(pause["pause_id"], [])
+    for cid, (src, t) in instructions.items():
+        click.echo(f"{cid}: instruction recorded ({'owner' if src == 'owner' else 'adopted from ' + src}): {t}")
+    click.echo(f"{plan_id} -> executing (resumed)")
+    if no_run:
+        sys.exit(0)
+    _run_foreground(target, plan_id, False)
 
 
 @main.command("merge")
