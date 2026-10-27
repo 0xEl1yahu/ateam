@@ -106,7 +106,7 @@ BUILD_MUST_DENY = [
     "git reset HEAD~3 --hard",
     "git stash -u && git stash drop",
     "find . -name '*.py' -delete",
-    "find . -name '*.pyc' -exec rm {} \;",
+    r"find . -name '*.pyc' -exec rm {} \;",
     "git clean -fdx",
     "git branch -D main",
     # second review: siblings

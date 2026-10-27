@@ -287,7 +287,7 @@ def test_stop_from_another_process_pauses_a_running_scheduler(plan3):
     stop = threading.Event()
 
     def blocks_until_stopped(fake, cid, role, worktree, n):
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 120
         while not stop.is_set() and time.monotonic() < deadline:
             time.sleep(0.05)
         return {"code": 130, "outcome": "interrupted", "commit": False}
@@ -297,11 +297,12 @@ def test_stop_from_another_process_pauses_a_running_scheduler(plan3):
                                                               launch=FakeWorkers({("C-0001", "build", 0): blocks_until_stopped}),
                                                               investigate=FakeInvestigator())))
     t.start()
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + 120      # generous: under a loaded full suite the BUILD can take well over 10 s to start
     while not _sdb(plan3).open_attempts(["C-0001"]) and time.monotonic() < deadline:
         time.sleep(0.05)
+    assert _sdb(plan3).open_attempts(["C-0001"]), "the BUILD never started; the stop would not test an interrupt"
     r = run("stop", "P-0001", "--target", str(plan3.root))
-    t.join(15)
+    t.join(120)
     db = _sdb(plan3)
     assert r.exit_code == 0 and "stop requested" in r.output, r.output
     assert box["s"].outcome == "paused" and db.transitions("feature", "P-0001")[-1]["reason"] == "owner_stopped: stopped by the owner"
