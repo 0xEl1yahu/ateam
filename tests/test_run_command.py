@@ -119,9 +119,9 @@ def _dirty_intent(p, mp):
 
 
 def _conflict(p, mp):
-    db = _paused(p, mp)
-    _seed(p, [_entry("C-0001", db.contract_hash("C-0001"))], reason="environment_failure", conflict=True)
-    return (), "merge conflict"
+    _paused(p, mp)   # a moved target branch conflicts: the pause names no contract, so nothing can be rebuilt
+    _seed(p, [], reason="environment_failure", conflict=True)
+    return (), "resume cannot rebuild it"
 
 
 def _hand_edit(p, mp):
@@ -366,10 +366,20 @@ def test_status_shows_why_there_are_no_findings(plan3):
     assert "no findings: tamper: refs changed" in out and "ateam resume P-0001 --adopt" not in out
 
 
-def test_status_for_a_conflict_pause_refuses_resume(plan3):
+def test_status_of_a_conflict_pause_names_the_rebase(plan3):
     _status_paused(plan3, conflict=True)
     out = run("status", "P-0001", "--target", str(plan3.root)).output
-    assert "resume is refused until the rebase BUILD exists" in out and "ateam resume P-0001" not in out
+    assert "resume runs the rebase BUILD for C-0001" in out and "ateam resume P-0001" in out
+
+
+def test_status_of_a_target_conflict_pause_refuses_resume(plan3):
+    from ateam.plans.ops import set_plan_status
+    from ateam.plans.store import load_plans
+    db = _executing(plan3)
+    set_plan_status(plan3.paths, db, load_plans(plan3.paths.plans)["P-0001"], ["paused"], by="t", why="environment_failure: main conflicts")
+    db.record_pause("P-0001", "environment_failure", "main conflicts in src/a/a.py", [], conflict=True)
+    out = run("status", "P-0001", "--target", str(plan3.root)).output
+    assert "resume cannot rebuild it" in out and "ateam resume P-0001" not in out
 
 
 def test_resume_after_a_hook_refused_commit_resumes_again(plan3, monkeypatch):
@@ -392,3 +402,57 @@ def test_resume_after_a_hook_refused_commit_resumes_again(plan3, monkeypatch):
     r2 = _resume(plan3, "--note", "use x", "--no-run")
     assert r2.exit_code == 0, r2.output
     assert [e.text for e in load_guidance(plan3.paths.guidance, "C-0001")] == ["use x"]
+
+
+# ---- resume after a merge conflict (2026-10-27-lanes-design.md, rulings 8, 9 and 13)
+
+def _conflict_paused(p, monkeypatch, script):
+    from test_scheduler import _conflict_during  # noqa: F401  (callers build the script with it)
+    _set_config(p.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    fake = FakeWorkers(script)
+    _fake(monkeypatch, fake)
+    r = run("run", "P-0001", "--target", str(p.root))
+    assert r.exit_code == 1 and "P-0001 -> paused (environment_failure: C-0001" in r.output, r.output
+    assert _sdb(p).open_pause("P-0001")["conflict"] is True
+    return fake
+
+
+def test_resume_of_a_conflict_pause_runs_the_rebase_build(plan3, monkeypatch):
+    from test_scheduler import _conflict_during, _rebase_builds
+    _conflict_paused(plan3, monkeypatch, {("C-0001", "build", 0): _conflict_during(plan3),
+                                          ("C-0001", "build", 1): _conflict_during(plan3, text="A = 'someone else again'\n")})
+    fake = FakeWorkers()
+    _fake(monkeypatch, fake)
+    r = _resume(plan3)
+    assert r.exit_code == 0 and "merge_proposed" in r.output, r.output
+    assert len(_rebase_builds(fake, "C-0001")) == 1
+
+
+def test_a_conflict_with_no_attempt_left_resumes_into_the_rebase(plan3, monkeypatch):
+    from ateam.contracts.store import load_contracts
+    from test_scheduler import _conflict_during, _rebase_builds
+    allowed = load_contracts(plan3.paths.contracts)["C-0001"].budget.attempts
+    script = {("C-0001", "build", n): {"code": 3, "outcome": "scope_breach", "commit": False} for n in range(allowed - 1)}
+    script[("C-0001", "build", allowed - 1)] = _conflict_during(plan3)
+    _conflict_paused(plan3, monkeypatch, script)
+    fake = FakeWorkers()
+    _fake(monkeypatch, fake)
+    r = _resume(plan3)
+    assert r.exit_code == 0 and "merge_proposed" in r.output, r.output
+    assert len(_rebase_builds(fake, "C-0001")) == 1
+
+
+def test_resume_after_the_tip_moved_keeps_the_open_merge(plan3, monkeypatch):
+    import json
+
+    from test_scheduler import _conflict_during, _land_on_integration, _rebase_builds
+    first = _conflict_paused(plan3, monkeypatch, {("C-0001", "build", 0): _conflict_during(plan3), ("C-0001", "build", 1): {"commit": False}})
+    tip = first.tips[0]
+    assert json.loads(_sdb(plan3).get_meta("rebase:C-0001"))["tip"] == tip
+    _land_on_integration(plan3, "docs/unrelated.md", "another lane\n")   # the tip moves on without touching C-0001's paths
+    fake = FakeWorkers()
+    _fake(monkeypatch, fake)
+    r = _resume(plan3)
+    assert r.exit_code == 0 and "merge_proposed" in r.output, r.output
+    assert json.loads(_sdb(plan3).get_meta("rebase:C-0001"))["tip"] == tip   # the open merge was kept, not restarted
+    assert len(_rebase_builds(fake, "C-0001")) == 1

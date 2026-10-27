@@ -91,7 +91,7 @@ def prepare_rebase(paths: TargetPaths, db: StateDB, owner: GitRepo, plan_id: str
                    tip: str) -> tuple[ContractWorktree, list[str]]:
     """Merge the integration tip into the contract's own worktree, without committing, for the rebase BUILD (owner,
     2026-10-27): workers may not run git merge, so the scheduler starts it and the BUILD concludes it. Idempotent:
-    an open merge onto the recorded tip is kept, a concluded one is left alone. The base moves to the tip only once
+    an open merge onto the recorded tip is kept, and a tip HEAD already holds is not merged again. The base moves to the tip only once
     the merge is under way, so a merge that fails leaves the contract as it was."""
     wt = GitRepo(worktree_path(paths, db, cid))
     raw = db.get_meta(f"rebase:{cid}")
@@ -101,7 +101,7 @@ def prepare_rebase(paths: TargetPaths, db: StateDB, owner: GitRepo, plan_id: str
         if db.get_meta(f"base:{cid}") != recorded:
             db.set_meta(f"base:{cid}", recorded)
         return contract_worktree(paths, db, owner, plan_id, cid), unmerged()
-    if recorded is not None and not wt.merge_in_progress() and wt.is_ancestor(recorded, "HEAD"):
+    if not wt.merge_in_progress() and wt.is_ancestor(tip, "HEAD"):   # the tip is already in: nothing to merge
         return contract_worktree(paths, db, owner, plan_id, cid), []
     after = max((a["attempt_id"] for a in db.attempts_for(cid)), default=0)
     db.set_meta(f"rebase:{cid}", json.dumps({"window": db.window_start(cid), "tip": tip, "after": after}))

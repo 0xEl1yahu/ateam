@@ -1147,8 +1147,8 @@ def resume(plan_id: str, adopt: bool, note: str | None, note_file: Path | None, 
     except IntentError as e:
         _fail(str(e), code=4)
     pause = ctx.db.open_pause(plan_id)
-    if pause is not None and pause["conflict"]:
-        _fail(f"{plan_id} paused on a merge conflict ({pause['detail']}); resume is refused until the rebase BUILD exists", code=4)
+    if pause is not None and pause["conflict"] and not pause["contracts"]:   # a contract's conflict resumes into its rebase BUILD
+        _fail(f"{plan_id} paused on a merge conflict of the target branch ({pause['detail']}); resume cannot rebuild it", code=4)
     cids = plan_contract_ids(ctx.db, plan)
     problems = scheduler.binding_problems(ctx, cids)
     if problems:
@@ -1746,9 +1746,11 @@ def _status_plan(ctx: Context, plan) -> None:
             click.echo(f"  needs your decision: {f['needs_owner_decision']}")
         if f.get("suggested_instruction"):
             click.echo(f"  suggested instruction: {f['suggested_instruction']}")
-    if pause["conflict"]:
-        click.echo("\nresume is refused until the rebase BUILD exists")
+    if pause["conflict"] and not pause["contracts"]:
+        click.echo("\nthis is a merge conflict of the target branch; resume cannot rebuild it (reject the plan and plan again)")
         return
+    if pause["conflict"]:
+        click.echo(f"\nresume runs the rebase BUILD for {', '.join(c['contract_id'] for c in pause['contracts'])}")
     suggested = any((c["findings"] or {}).get("suggested_instruction") for c in pause["contracts"])
     click.echo("\nTo continue:")
     if suggested:

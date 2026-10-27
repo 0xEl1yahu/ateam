@@ -810,11 +810,15 @@ class _Run:
         """A contract left building by a rebase: the conflicting paths when its merge is still open (the rebase BUILD
         runs again), None when the merge was concluded, or a pause. Runs inside an exclusive step."""
         db = ctx.db
+        wt = GitRepo(worktree_path(ctx.paths, db, cid))
+        tip = json.loads(db.get_meta(f"rebase:{cid}") or "{}").get("tip")
+        if tip and not wt.merge_in_progress() and wt.is_ancestor(tip, "HEAD"):
+            return None   # its merge was concluded; TEST, verify or an interruption stopped it after
         try:
             _, conflicts = prepare_rebase(ctx.paths, db, ctx.git, self.plan_id, cid, ctx.git.rev_parse(integration_branch(self.plan_id)))
         except (GitError, WorktreeError) as e:
             return _Outcome(cid, "pause", "environment_failure", f"{cid} rebase could not continue: {e}", conflict=True)
-        return conflicts if GitRepo(worktree_path(ctx.paths, db, cid)).merge_in_progress() else None
+        return conflicts if wt.merge_in_progress() else None
 
     def _merge_concluded(self, db, cid: str, w) -> bool:
         """The rebase BUILD concluded the merge the scheduler started: none in progress, and HEAD holds the recorded tip."""

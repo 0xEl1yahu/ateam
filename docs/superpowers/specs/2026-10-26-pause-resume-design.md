@@ -40,7 +40,7 @@ This design gives a pause a way out that keeps the owner in charge. When a run g
 4. When ATeam pauses on its own, the INVESTIGATE session starts automatically.
 5. The investigator presents its suggestion to the owner. ATeam does not adopt it or resume by itself.
 6. **A pause changes no contract status.** The plan goes to `paused` as today; which contracts paused is recorded in the store's pause record, and resume writes a store row that opens each paused contract's new attempt window. No new contract transitions and no intent commits for pausing or resuming a contract.
-7. **Resume refuses a merge-conflict pause** (a contract's merge onto `ateam/<plan>`, or integration's merge of a moved target), naming the pause, until the rebase BUILD exists.
+7. **Resume refuses a merge-conflict pause** (a contract's merge onto `ateam/<plan>`, or integration's merge of a moved target), naming the pause, until the rebase BUILD exists. *Superseded 2026-10-27 by `2026-10-27-lanes-design.md`: a contract's conflict pause resumes into the rebase BUILD; only a moved-target conflict, which names no contract, is still refused.*
 8. **Resume does not gate on the pause reason.** It applies the existing rule that every unfinished contract must bind (frozen, unchanged since the freeze, runnable, no record drift). The owner running `resume` is the judgment that the cause is dealt with.
 9. **Instructions are tied to the contract they were written for.** Each records the contract's frozen hash at the time; after a re-freeze changes the hash, the instruction stays in the file for history but is no longer delivered.
 10. **Pause investigations run in the paused contract's worktree**, read-only, with the full snapshot (HEAD, every ref, the stash list, dirty paths and their content, and the intent repo), not narrowed. A change discards the findings as `tamper` and the pause stands. This amends the rule that read-only investigations run in the owner's checkout (CLAUDE.md rule 6 and the spec's carve-out), for pause investigations only.
@@ -93,14 +93,14 @@ ateam resume P-0007 --note "use the helper in src/util/x.py"
 ateam resume P-0007                            # resume with no instruction
 ```
 
-A merge-conflict pause prints instead that resume is refused until the rebase BUILD exists, and which contract and paths conflict.
+A merge-conflict pause prints instead that resume is refused until the rebase BUILD exists, and which contract and paths conflict. *(Superseded 2026-10-27 by `2026-10-27-lanes-design.md`.)*
 
 ### Resuming
 
 `ateam resume P-xxxx [--adopt | --note TEXT | --note-file PATH] [--contract C-xxxx]... [--no-run]`:
 
 1. Refuses unless the plan is `paused` and no run holds the lock.
-2. Refuses a merge-conflict pause.
+2. Refuses a merge-conflict pause. *(Superseded 2026-10-27 by `2026-10-27-lanes-design.md`.)*
 3. Refuses unless every unfinished contract of the plan binds (`require_binding`), naming each contract that does not and why.
 4. Refuses `--adopt` when a paused contract has no suggestion, `--adopt` together with `--note`, and an instruction whose contract is ambiguous (see calls above).
 5. With an instruction, appends it to `intent/guidance/<contract-id>.yaml` with the date, source (owner, or the investigation's attempt id) and the contract's current frozen hash, and commits (`ateam: guidance for C-xxxx`). Refuses when the intent repo is dirty, like every intent commit.
@@ -134,7 +134,7 @@ A verify refusal caused by record drift classifies as `records_drifted`. A verif
 ## Spec and CLAUDE.md changes on approval
 
 - Pause reasons enum: add `owner_stopped`.
-- Replace the deviation "a paused plan is refused by `ateam run`, naming its reason, instead of being resumed" with this design; the other scheduler deviations stand, and add "resume refuses a merge-conflict pause until the rebase BUILD exists".
+- Replace the deviation "a paused plan is refused by `ateam run`, naming its reason, instead of being resumed" with this design; the other scheduler deviations stand, and add "resume refuses a merge-conflict pause until the rebase BUILD exists". *(Superseded 2026-10-27 by `2026-10-27-lanes-design.md`.)*
 - Amend the in-place investigation carve-out (spec "Decisions made by the owner", CLAUDE.md rule 6): pause investigations run read-only in the paused contract's worktree with the full snapshot.
 - Record decisions 1-13 under "Decisions made by the owner" and the calls under "Calls made by the assistant".
 

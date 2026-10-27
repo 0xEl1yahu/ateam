@@ -195,3 +195,20 @@ def test_rebased_this_window_needs_a_build_after_the_key(target_repo, tmp_path):
     assert rebased_this_window(db, "C-1")
     db.resume_pause(None, ["C-1"])
     assert not rebased_this_window(db, "C-1")          # a resume opens a new window
+
+
+def test_prepare_rebase_after_a_concluded_rebase_merges_a_newer_tip(target_repo, tmp_path):
+    """Resume after a second conflict: the earlier rebase's merge was concluded, and the newer tip must be merged."""
+    import json
+    from ateam.worktrees import contract_worktree, prepare_rebase
+    paths, db, owner = _setup(target_repo)
+    w = contract_worktree(paths, db, owner, "P-0001", "C-1")
+    first = _conflicting_tip(owner, tmp_path, w)
+    prepare_rebase(paths, db, owner, "P-0001", "C-1", first)
+    (w.path / "f.txt").write_text("both\n"); GitRepo(w.path).run("commit", "-q", "-am", "resolved")
+    side = tmp_path / "newer"; owner.worktree_add_existing(side, "ateam/P-0001")
+    (side / "f.txt").write_text("newer\n"); g = GitRepo(side); g.run("commit", "-q", "-am", "newer"); newer = g.head()
+    owner.run("worktree", "remove", str(side))   # f.txt again: conflicts with the resolution
+    _, conflicts = prepare_rebase(paths, db, owner, "P-0001", "C-1", newer)
+    assert conflicts == ["f.txt"] and GitRepo(w.path).merge_head() == newer
+    assert json.loads(db.get_meta("rebase:C-1"))["tip"] == newer == db.get_meta("base:C-1")
