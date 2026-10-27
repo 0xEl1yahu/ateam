@@ -106,7 +106,7 @@ BUILD_MUST_DENY = [
     "git reset HEAD~3 --hard",
     "git stash -u && git stash drop",
     "find . -name '*.py' -delete",
-    "find . -name '*.pyc' -exec rm {} \;",
+    r"find . -name '*.pyc' -exec rm {} \;",
     "git clean -fdx",
     "git branch -D main",
     # second review: siblings
@@ -1666,6 +1666,30 @@ OWN_WT_DENIED_WILDCARDS = [
 ]
 OWN_WT_ALLOWED_WILDCARDS = ["ls src/*", "cat src/*.py", "ls {wt}/src/*.py", "ls src/*/..", "ls */..", "ls $PWD/src/*",
                             "ls ${{PWD}}/src/*.py"]
+# Operator ${...} forms: the policy cannot evaluate them, so path variables and path-shaped tokens count as home.
+# Doubled braces are str.format escapes for a literal ${...}.
+OWN_WT_DENIED_PARAM_EXPANSIONS = [
+    "cat ${{PWD%/*}}/C-0002/src/x.py",
+    "cat ${{PWD%/*/*}}/intent/config.yaml",
+    "cat ${{PWD%/*/*}}/state.db",
+    "ls ${{PWD%/*}}",
+    "cat ${{OLDPWD%/*}}/C-0002/src/x.py",
+    "cat ${{PWD/C-0001/C-0002}}/src/x.py",
+    "cat ${{PWD#/}}/x",
+    "cat ${{PWD:-x}}/../C-0002/x",
+    "cat ${{X%/*}}/C-0002/src/x.py",
+]
+# `echo` is not on INVESTIGATE's allow-list, so its rows are asserted for build and test; `ls` stands in for investigate.
+OWN_WT_ALLOWED_PARAM_EXPANSIONS = [
+    ("echo ${{f%.py}}", ("build", "test")),
+    ('echo "${{f%.py}}.txt"', ("build", "test")),
+    ("echo ${{x:-d}}", ("build", "test")),
+    ("echo ${{#x}}", ("build", "test")),
+    ("echo ${{#arr[@]}}", ("build", "test")),
+    ("ls ${{x#*/}}", ("build", "test", "investigate")),
+    ("ls ${{f%.py}}", ("build", "test", "investigate")),
+    ("for f in src/*.py; do echo ${{f%.py}}; done", ("build", "test")),
+]
 OWN_WT_DENIED_TOOLS = [
     ("Read", {"file_path": "{wt}/lnk/config.yaml"}),
     ("Read", {"file_path": "lnk/config.yaml"}),
@@ -1711,6 +1735,20 @@ def test_own_worktree_wildcards_that_stay_inside_allowed(own_worktree, cmd):
 def test_own_worktree_wildcard_then_dotdot_judged_by_the_walk_up(own_worktree, cmd):
     pol, home, base, wt = own_worktree
     assert pol.command_allowed(_fmt(cmd, base, wt)) == (False, WILDCARD_HOME_REASON), pol.role
+
+
+@pytest.mark.parametrize("cmd", OWN_WT_DENIED_PARAM_EXPANSIONS)
+def test_own_worktree_param_expansions_reach_home(own_worktree, cmd):
+    pol, home, base, wt = own_worktree
+    assert pol.command_allowed(_fmt(cmd, base, wt)) == (False, WILDCARD_HOME_REASON), pol.role
+
+
+@pytest.mark.parametrize("cmd,roles", OWN_WT_ALLOWED_PARAM_EXPANSIONS)
+def test_own_worktree_ordinary_param_expansions_allowed(own_worktree, cmd, roles):
+    pol, home, base, wt = own_worktree
+    if pol.role.value not in roles:
+        pytest.skip("not asserted for this role")
+    assert pol.command_allowed(_fmt(cmd, base, wt)) == (True, ""), pol.role
 
 
 @pytest.mark.parametrize("cmd", OWN_WT_DENIED_CMDS)

@@ -55,35 +55,36 @@ class FakeWorkers:
             n = sum(1 for c in self.calls if c[0] == cid and c[1] == role)
             self.calls.append((cid, role, tier, prompt, worktree, base))
         paths = TargetPaths.from_root(target)
-        db = StateDB(home_dir(target) / "state.db"); db.init_schema()
-        intent = GitRepo(paths.intent)
-        before, t0 = intent.head(), time.monotonic()
-        attempt = db.start_attempt(cid, role, tier or "light", "fake", {})
-        behaviour = self.script.get((cid, role, n), self.script.get((cid, role), {}))
-        override = behaviour(self, cid, role, worktree, n) if callable(behaviour) else dict(behaviour)
-        result = {"code": 0, "outcome": "completed", "subtype": "success", "error": None, "cost_usd": 0.1,
-                  "session_id": "s", "test_outcome": None, "test_class": None, "report": {}}
-        commit = override.pop("commit", True)
-        if role == "build" and commit and prompt and "merge conflict" in prompt:
-            g = GitRepo(worktree)   # the rebase BUILD: resolve every conflicted file, then conclude the merge
-            for rel in [p for p in g.run("diff", "--name-only", "--diff-filter=U").splitlines() if p]:
-                (worktree / rel).write_text(f"# {rel} resolved by {cid}\n")
-            g.run("add", "-A"); g.run("commit", "-q", "--no-edit")
-        elif role == "build" and commit:
-            name = NAMES[cid]
-            (worktree / "src" / name).mkdir(parents=True, exist_ok=True)
-            (worktree / "src" / name / f"{name}.py").write_text(f"def {name}():\n    return '{name}'  # {n}\n")
-            (worktree / "tests" / f"test_{name}.py").write_text(f"def test_{name}():\n    assert True\n")
-            g = GitRepo(worktree); g.run("add", "-A"); g.run("commit", "-q", "-m", f"{name} attempt {n}")
-        result.update(override)
-        if role == "test" and result["code"] == 0:
-            result["test_outcome"] = "completed"
-        time.sleep(self.delay)
-        if result["outcome"] != "interrupted":
-            db.finish_attempt(attempt, result["outcome"], None, 1, 1, result["cost_usd"], 1, 0.1, "s")
-        self.intervals.append((cid, role, t0, time.monotonic(), before, intent.head()))
-        result_file.write_text(json.dumps(result))
-        return result
+        with StateDB(home_dir(target) / "state.db") as db:   # in the scheduler's thread, so closed here
+            db.init_schema()
+            intent = GitRepo(paths.intent)
+            before, t0 = intent.head(), time.monotonic()
+            attempt = db.start_attempt(cid, role, tier or "light", "fake", {})
+            behaviour = self.script.get((cid, role, n), self.script.get((cid, role), {}))
+            override = behaviour(self, cid, role, worktree, n) if callable(behaviour) else dict(behaviour)
+            result = {"code": 0, "outcome": "completed", "subtype": "success", "error": None, "cost_usd": 0.1,
+                      "session_id": "s", "test_outcome": None, "test_class": None, "report": {}}
+            commit = override.pop("commit", True)
+            if role == "build" and commit and prompt and "merge conflict" in prompt:
+                g = GitRepo(worktree)   # the rebase BUILD: resolve every conflicted file, then conclude the merge
+                for rel in [p for p in g.run("diff", "--name-only", "--diff-filter=U").splitlines() if p]:
+                    (worktree / rel).write_text(f"# {rel} resolved by {cid}\n")
+                g.run("add", "-A"); g.run("commit", "-q", "--no-edit")
+            elif role == "build" and commit:
+                name = NAMES[cid]
+                (worktree / "src" / name).mkdir(parents=True, exist_ok=True)
+                (worktree / "src" / name / f"{name}.py").write_text(f"def {name}():\n    return '{name}'  # {n}\n")
+                (worktree / "tests" / f"test_{name}.py").write_text(f"def test_{name}():\n    assert True\n")
+                g = GitRepo(worktree); g.run("add", "-A"); g.run("commit", "-q", "-m", f"{name} attempt {n}")
+            result.update(override)
+            if role == "test" and result["code"] == 0:
+                result["test_outcome"] = "completed"
+            time.sleep(self.delay)
+            if result["outcome"] != "interrupted":
+                db.finish_attempt(attempt, result["outcome"], None, 1, 1, result["cost_usd"], 1, 0.1, "s")
+            self.intervals.append((cid, role, t0, time.monotonic(), before, intent.head()))
+            result_file.write_text(json.dumps(result))
+            return result
 
     def tiers(self, cid, role="build"):
         return [c[2] for c in self.calls if c[0] == cid and c[1] == role]
@@ -98,12 +99,13 @@ class FakeInvestigator:
                                  "needs_owner_decision": None, "suggested_instruction": "use x"}
 
     def __call__(self, target, plan_id, cid, worktree, result_file):
-        db = StateDB(home_dir(target) / "state.db"); db.init_schema()
-        self.calls.append((cid, db.feature_status(plan_id), worktree))
-        if self.write:
-            pause = db.open_pause(plan_id)
-            findings = self.report if self.outcome == "completed" else None
-            db.set_pause_findings(pause["pause_id"], cid, None, findings, None if findings else f"{self.outcome}: x")
+        with StateDB(home_dir(target) / "state.db") as db:
+            db.init_schema()
+            self.calls.append((cid, db.feature_status(plan_id), worktree))
+            if self.write:
+                pause = db.open_pause(plan_id)
+                findings = self.report if self.outcome == "completed" else None
+                db.set_pause_findings(pause["pause_id"], cid, None, findings, None if findings else f"{self.outcome}: x")
         r = {"code": 0 if self.outcome == "completed" else 1, "outcome": self.outcome, "attempt_id": None,
              "cost_usd": 0.2, "error": None}
         result_file.write_text(json.dumps(r))
@@ -477,7 +479,8 @@ def test_a_window_refreshes_attempts_and_escalation(plan3):
 
 def test_owner_stop_pauses_owner_stopped(plan3):
     def owner_stop(fake, cid, role, worktree, n):
-        _db(plan3).request_stop("P-0001")
+        with _db(plan3) as db:   # in a scheduler thread, so closed here
+            db.request_stop("P-0001")
         time.sleep(0.8)                                                    # the loop polls within 0.5 s
         return {"code": 130, "outcome": "interrupted", "commit": False}
 
@@ -495,7 +498,8 @@ def test_owner_stop_during_an_exclusive_step_finishes_it_without_tamper(plan3):
 
     def child(argv, result_file):
         if "verify" in argv:
-            _db(plan3).request_stop("P-0001")
+            with _db(plan3) as db:   # in a scheduler thread, so closed here
+                db.request_stop("P-0001")
             time.sleep(0.8)                                                # the loop sees the request while verify runs
         return run_child(argv, result_file)
 
@@ -563,7 +567,9 @@ def test_owner_stop_is_not_investigated(plan3):
     inv = FakeInvestigator()
 
     def owner_stop(fake, cid, role, worktree, n):
-        _db(plan3).request_stop("P-0001"); time.sleep(0.8)
+        with _db(plan3) as db:
+            db.request_stop("P-0001")
+        time.sleep(0.8)
         return {"code": 130, "outcome": "interrupted", "commit": False}
 
     s, out = _run(plan3, FakeWorkers({("C-0001", "build", 0): owner_stop}), investigate=inv)
@@ -618,7 +624,8 @@ def test_no_session_starts_after_an_owner_stop_is_seen(plan3):
     stop = threading.Event()
 
     def stop_then_finish(fake, cid, role, worktree, n):
-        _db(plan3).request_stop("P-0001")
+        with _db(plan3) as db:   # in a scheduler thread, so closed here
+            db.request_stop("P-0001")
         deadline = time.monotonic() + 5
         while not stop.is_set() and time.monotonic() < deadline:   # the poll has seen the request
             time.sleep(0.01)
@@ -721,7 +728,8 @@ def test_a_lane_runs_in_one_worktree_and_the_follower_is_based_on_the_verified_h
     seen = {}
 
     def note_predecessor(fake, cid, role, worktree, n):
-        seen["C-0001"] = _db(plan_lanes).contract_status("C-0001")
+        with StateDB(home_dir(plan_lanes.root) / "state.db") as db:   # the scheduler's thread: closed here
+            seen["C-0001"] = db.contract_status("C-0001")
         return {}
 
     fake = FakeWorkers({("C-0002", "build", 0): note_predecessor})
@@ -772,8 +780,8 @@ def test_setup_reruns_on_each_new_base(plan_lanes, tmp_path):
 
     def with_setup(extra):
         def build(fake, cid, role, worktree, n):
-            base = _db(plan_lanes).get_meta(f"base:{cid}")
-            ensure_setup(worktree, load_config(plan_lanes.paths), _db(plan_lanes), base)
+            with StateDB(home_dir(plan_lanes.root) / "state.db") as db:   # the scheduler's thread: closed here
+                ensure_setup(worktree, load_config(plan_lanes.paths), db, db.get_meta(f"base:{cid}"))
             return dict(extra)
         return build
 
@@ -1013,3 +1021,23 @@ def test_the_p0018_shape_prints_two_lanes(target_repo, monkeypatch):
     text = "\n".join(out)
     assert s.outcome == "dry_run"
     assert "2 lane(s), up to 2 at once" in text and "lane 1: C-0001 -> C-0002" in text and "lane 2: C-0003" in text
+
+
+def test_run_closes_the_contexts_it_opens(plan3):
+    from ateam.scheduler import run_plan
+    from dbleaks import is_open
+
+    made: list[tuple[Context, int]] = []
+
+    def factory() -> Context:
+        c = Context(plan3.root)
+        made.append((c, threading.get_ident()))
+        return c
+
+    out: list[str] = []
+    s = run_plan(factory, "P-0001", out.append, threading.Event(), launch=FakeWorkers(), investigate=FakeInvestigator())
+    assert s.outcome == "merge_proposed"
+    assert len({t for _, t in made}) > 1   # run_plan's own context and the pipeline threads' contexts
+    me = threading.get_ident()
+    assert [c for c, t in made if is_open(c.db, t == me)] == []
+    assert _db(plan3).run_lock_info() is None

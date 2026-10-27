@@ -31,6 +31,12 @@ class Context:
         self.config: TargetConfig = load_config(self.paths)
         self.db = StateDB(home_dir(target) / "state.db")
         self.db.init_schema()
+        command = click.get_current_context(silent=True)   # thread-local: a scheduler thread's Context has none
+        if command is not None:
+            command.call_on_close(self.close)   # closed when the command ends, including on sys.exit
+
+    def close(self) -> None:
+        self.db.close()
 
 
 def _previous_home(target: Path) -> tuple[dict, Path] | None:
@@ -53,7 +59,7 @@ def _context(target: Path, require_ateam: bool = True) -> Context:
         else:
             click.echo(f"No intent repo for {target}. Run: ateam intent init")
         sys.exit(2)
-    return Context(target)
+    return Context(target)   # closed by click when the command ends (Context.__init__)
 
 
 _LAST_FAIL: list[str] = []   # the message of the last _fail, for --result-file
@@ -310,9 +316,9 @@ def _require_no_live_run_at(target: Path) -> None:
 
     state = home_dir(target) / "state.db"
     if state.exists():
-        db = StateDB(state)
-        db.init_schema()
-        require_no_live_run(SimpleNamespace(db=db))
+        with StateDB(state) as db:
+            db.init_schema()
+            require_no_live_run(SimpleNamespace(db=db))
 
 
 def _reject_stale_planning(ctx: Context) -> None:
@@ -989,11 +995,11 @@ def _release_own_run_lock(target: Path, plan_id: str) -> None:
     """Release the run lock only when this process holds it for this plan (a second Ctrl-C; owner, 2026-10-26)."""
     import os
 
-    db = StateDB(home_dir(target) / "state.db")
-    db.init_schema()
-    info = db.run_lock_info()
-    if info and info["plan_id"] == plan_id and info["pid"] == os.getpid():
-        db.release_run_lock(plan_id)
+    with StateDB(home_dir(target) / "state.db") as db:
+        db.init_schema()
+        info = db.run_lock_info()
+        if info and info["plan_id"] == plan_id and info["pid"] == os.getpid():
+            db.release_run_lock(plan_id)
 
 
 def _interrupt_handler(stop, say):
@@ -1156,12 +1162,18 @@ def resume(plan_id: str, adopt: bool, note: str | None, note_file: Path | None, 
 
     if adopt and (note is not None or note_file is not None):
         _fail("use --adopt or --note/--note-file, not both", code=4)
+    if note is not None and not note.strip():
+        _fail("the note is blank; write an instruction or leave out --note", code=4)
+    if note_file is not None and not note_file.read_text().strip():
+        _fail(f"the note file is blank ({note_file}); write an instruction or leave out --note-file", code=4)
     text = note_file.read_text().strip() if note_file is not None else note
     paused_recs = {c["contract_id"]: c for c in (pause or {}).get("contracts", [])}
     unfinished = [cid for cid in cids if ctx.db.contract_status(cid) != "integrated"]
     for cid in contract_ids:
         if cid not in cids:
             _fail(f"{cid} is not a contract of {plan_id}", code=4)
+        if ctx.db.contract_status(cid) == "integrated":
+            _fail(f"{cid} is integrated; an instruction has no BUILD to reach", code=4)
     targets = list(contract_ids) or (list(paused_recs) if adopt else (list(paused_recs) if len(paused_recs) == 1 else []))
     instructions: dict[str, tuple[str, str]] = {}   # cid -> (source, text)
     if adopt or text is not None:
@@ -1187,6 +1199,8 @@ def resume(plan_id: str, adopt: bool, note: str | None, note_file: Path | None, 
     window_cids = sorted(paused_recs)
     if window_cids:
         ctx.db.resume_pause(None, window_cids)   # first, and idempotent: a repeated resume opens a newer window
+    elif pause is None:
+        click.echo("no pause record; no contract's attempts were refreshed")
     else:
         click.echo("no contract's attempts were refreshed (the pause names no contract)")
     cs = load_contracts(ctx.paths.contracts)
@@ -1751,11 +1765,18 @@ def _status_plan(ctx: Context, plan) -> None:
         return
     if pause["conflict"]:
         click.echo(f"\nresume runs the rebase BUILD for {', '.join(c['contract_id'] for c in pause['contracts'])}")
-    suggested = any((c["findings"] or {}).get("suggested_instruction") for c in pause["contracts"])
+    contracts = pause["contracts"]
+    adoptable = bool(contracts) and all(
+        (c["findings"] or {}).get("suggested_instruction") and c["contract_hash"] == ctx.db.contract_hash(c["contract_id"])
+        for c in contracts)
     click.echo("\nTo continue:")
-    if suggested:
+    if adoptable:
         click.echo(f"  ateam resume {pid} --adopt                    # use the suggestion as your instruction")
-    click.echo(f'  ateam resume {pid} --note "use the helper in src/util/x.py"')
+    if len(contracts) > 1:
+        for c in contracts:
+            click.echo(f'  ateam resume {pid} --note "use the helper in src/util/x.py" --contract {c["contract_id"]}')
+    else:
+        click.echo(f'  ateam resume {pid} --note "use the helper in src/util/x.py"')
     click.echo(f"  ateam resume {pid}                            # resume with no instruction")
 
 
@@ -1977,7 +1998,8 @@ def worker_pause_investigate(plan_id: str, contract_id: str, worktree: Path, tie
         prev = ctx.db.latest_checkpoint(contract_id, role="build")
         brief_text = assemble_pause_brief(
             contract, [recs[ref.id] for ref in contract.records if ref.id in recs], paused, ctx.db.attempts_for(contract_id),
-            Checkpoint.from_dict(prev) if prev else None, load_guidance(ctx.paths.guidance, contract_id))
+            Checkpoint.from_dict(prev) if prev else None, load_guidance(ctx.paths.guidance, contract_id),
+            runs_dir=home_dir(target) / "runs")
         result = asyncio.run(inv.run_investigation(
             paths=ctx.paths, config=ctx.config, target_git=wt_git, name=contract_id, scratch_name=f"{contract_id}-investigate",
             spec=PAUSE_INVESTIGATE_SPEC, brief_text=brief_text, tier=tiers[tier][Role.investigate], db=ctx.db, tier_name=tier,

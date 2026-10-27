@@ -181,3 +181,22 @@ def _no_real_pause_investigation(monkeypatch):
         raise AssertionError("a unit test tried to start a real pause investigation; pass investigate= or patch default_investigate")
 
     monkeypatch.setattr("ateam.scheduler.default_investigate", refuse, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_state_db(monkeypatch):
+    """Whoever opens a StateDB closes it, in the thread that opened it (R-0022). At teardown this closes what the test
+    itself left open in this thread, and fails the test for an instance ATeam left open or one still open from another
+    thread; the latter is never closed here, because sqlite forbids closing it from this thread."""
+    import threading
+
+    from dbleaks import Tracker, install
+
+    tracker = Tracker()
+    install(monkeypatch, tracker)
+    yield tracker
+    me = threading.get_ident()
+    leaks = tracker.leaks(me)
+    tracker.close_test_owned(me)
+    if leaks:
+        pytest.fail("unclosed StateDB:\n" + "\n".join(leaks), pytrace=False)

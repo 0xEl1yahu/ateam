@@ -67,12 +67,12 @@ def test_finish_verification_walks_from_the_status_seen_before_the_checks(tmp_pa
 
 def test_fingerprint_sees_writes_from_another_connection(tmp_path):
     import sqlite3
+    from contextlib import closing
     db = fresh(tmp_path)
     db.upsert_contract("C-0001", "P-0001", "ready", "h")
     first = db.fingerprint("C-0001")
     assert db.fingerprint("C-0001") == first
-    other = sqlite3.connect(tmp_path / "s.db")
-    with other:
+    with closing(sqlite3.connect(tmp_path / "s.db")) as other, other:
         other.execute("UPDATE contracts SET status='verified'")
     assert db.fingerprint("C-0001") != first
 
@@ -361,3 +361,138 @@ def test_verified_may_go_back_to_building_for_a_rebase(tmp_path):
         db.transition("contract", "C-0001", "failed", by="run")
     db.transition("contract", "C-0001", "building", by="run", reason="rebase onto abc")
     assert db.contract_status("C-0001") == "building"
+
+
+def test_close_and_context_manager(tmp_path):
+    import sqlite3
+
+    db = fresh(tmp_path)
+    db.close()
+    db.close()   # a second close is a no-op
+    with pytest.raises(sqlite3.ProgrammingError):
+        db.schema_version()
+    with StateDB(tmp_path / "s.db") as inner:
+        assert isinstance(inner, StateDB)
+        assert inner.schema_version() == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        inner.schema_version()
+    with pytest.raises(RuntimeError, match="boom"):
+        with StateDB(tmp_path / "s.db") as failing:
+            raise RuntimeError("boom")
+    with pytest.raises(sqlite3.ProgrammingError):
+        failing.schema_version()
+
+
+def _ateam_dbs(tracker, since: int) -> list:
+    return [e for e in tracker.entries[since:] if e.owner == "ateam"]
+
+
+def test_cli_short_lived_dbs_and_command_contexts_are_closed(target_repo, _no_leaked_state_db):
+    import os
+    import sys
+    import threading
+
+    import click
+    from click.testing import CliRunner
+
+    from ateam import cli
+    from ateam.paths import home_dir
+    from dbleaks import is_open
+
+    tracker = _no_leaked_state_db
+    state = home_dir(target_repo) / "state.db"
+    with StateDB(state) as db:
+        db.init_schema()
+
+    def opened_and_closed(call) -> None:
+        since = len(tracker.entries)
+        call()
+        made = _ateam_dbs(tracker, since)
+        assert made, "the guard opened no StateDB"
+        assert not any(is_open(e.db, True) for e in made), [e.site for e in made]
+
+    opened_and_closed(lambda: cli._require_no_live_run_at(target_repo))   # passes: no lock
+    with StateDB(state) as db:
+        assert db.acquire_run_lock("P-0001")   # held by this live process
+    since = len(tracker.entries)
+    with pytest.raises(SystemExit) as refused:
+        cli._require_no_live_run_at(target_repo)
+    assert refused.value.code == 4
+    assert _ateam_dbs(tracker, since) and not any(is_open(e.db, True) for e in _ateam_dbs(tracker, since))
+
+    opened_and_closed(lambda: cli._release_own_run_lock(target_repo, "P-0002"))   # not ours: left alone
+    with StateDB(state) as db:
+        assert db.run_lock_info()["pid"] == os.getpid()
+    opened_and_closed(lambda: cli._release_own_run_lock(target_repo, "P-0001"))
+    with StateDB(state) as db:
+        assert db.run_lock_info() is None
+
+    ctx = cli.Context(target_repo)
+    ctx.close()
+    ctx.close()
+    assert not is_open(ctx.db, True)
+
+    made: list = []
+
+    @click.command()
+    @click.option("--code", type=int, default=None)
+    def probe(code):
+        made.append(cli._context(target_repo))
+        assert is_open(made[-1].db, True)
+        if code is not None:
+            sys.exit(code)
+
+    runner = CliRunner()
+    assert runner.invoke(probe, []).exit_code == 0
+    assert runner.invoke(probe, ["--code", "3"]).exit_code == 3
+    assert len(made) == 2 and not any(is_open(c.db, True) for c in made)
+    assert threading.current_thread() is threading.main_thread()
+
+
+def test_leak_check_reports_unclosed_and_cross_thread_dbs(tmp_path, target_repo, _no_leaked_state_db):
+    import threading
+
+    from ateam.cli import Context
+    from dbleaks import Tracker, is_open
+
+    by_test = StateDB(tmp_path / "t.db")
+    in_test_ctx = Context(target_repo)
+    owners = {id(e.db): e.owner for e in _no_leaked_state_db.entries}
+    assert owners[id(by_test)] == "test" and owners[id(in_test_ctx.db)] == "test"
+    in_test_ctx.close()
+    by_test.close()
+
+    tracker, me = Tracker(), threading.get_ident()
+    leaked = StateDB(tmp_path / "a.db")
+    tracker.track(leaked, "ateam", me, "src/ateam/somewhere.py:12 in opener")
+    mine = StateDB(tmp_path / "m.db")
+    tracker.track(mine, "test", me, "tests/test_x.py:3 in test_mine")
+    made, done, box = threading.Event(), threading.Event(), {}
+
+    def other() -> None:
+        db = StateDB(tmp_path / "b.db")
+        box["db"] = db
+        tracker.track(db, "test", threading.get_ident(), "tests/test_y.py:7 in other")
+        made.set()
+        done.wait(10)
+        db.close()   # only its own thread may
+
+    t = threading.Thread(target=other)
+    t.start()
+    try:
+        assert made.wait(10)
+        leaks = tracker.leaks(me)
+        assert len(leaks) == 2
+        assert any("src/ateam/somewhere.py:12 in opener" in m for m in leaks)
+        assert any("tests/test_y.py:7 in other" in m and "another thread" in m for m in leaks)
+        tracker.close_test_owned(me)
+        assert not is_open(mine, True)
+        assert is_open(leaked, True)
+        leaked.conn.execute("SELECT 1")   # still usable: the check never closed it
+        assert is_open(box["db"], False)
+        assert tracker.leaks(me) == leaks
+    finally:
+        done.set()
+        t.join(10)
+        leaked.close()
+    assert tracker.leaks(me) == []
