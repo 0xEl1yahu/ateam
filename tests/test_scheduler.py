@@ -686,3 +686,26 @@ def test_builds_that_record_no_attempt_still_count_toward_the_limit(plan3):
     s, out = _run(plan3, launch)
     allowed = load_contracts(plan3.paths.contracts)["C-0001"].budget.attempts
     assert s.outcome == "paused" and len(launch.calls) == allowed, launch.calls
+
+
+# ---- lanes (2026-10-27-lanes-design.md, decision 1)
+
+def _c(paths, incidental=(), depends_on=()):
+    return SimpleNamespace(paths=list(paths), incidental=list(incidental), depends_on=list(depends_on))
+
+
+@pytest.mark.parametrize("contracts, files, expected", [
+    pytest.param({"A": _c(["src/m/*.py"]), "B": _c(["src/m/x.py"])}, ["src/m/x.py"], [["A", "B"]], id="overlapping globs"),
+    pytest.param({"A": _c(["src/x/**"]), "B": _c(["src/x/new.py"])}, [], [["A", "B"]], id="glob vs literal new file"),
+    pytest.param({"A": _c(["src/y/**"]), "B": _c(["src/y/**"])}, [], [["A", "B"]], id="identical globs, no files"),
+    pytest.param({"A": _c(["a/**"]), "B": _c(["b/**"], depends_on=["A"])}, ["a/1", "b/1"], [["A", "B"]], id="dependency only"),
+    pytest.param({"A": _c(["a/**"], incidental=["shared.cfg"]), "B": _c(["shared.cfg"])}, ["shared.cfg"], [["A", "B"]],
+                 id="incidental counts"),
+    pytest.param({"A": _c(["a/**"]), "B": _c(["b/**"])}, ["a/1", "b/1"], [["A"], ["B"]], id="disjoint"),
+    pytest.param({"C": _c(["c/**"], depends_on=["B"]), "B": _c(["b/**"], incidental=["a/1"]), "A": _c(["a/**"]), "D": _c(["d/**"])},
+                 ["a/1", "b/1", "c/1", "d/1"], [["A", "B", "C"], ["D"]], id="transitive, ordered by deps then id"),
+    pytest.param({"A": _c(["a/**"], depends_on=["Z"])}, ["a/1"], [["A"]], id="dependency outside the plan ignored"),
+])
+def test_lanes(contracts, files, expected):
+    from ateam.scheduler import lanes
+    assert lanes(contracts, sorted(contracts), files) == expected

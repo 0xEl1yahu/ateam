@@ -141,3 +141,13 @@ def test_worktree_add_existing_and_show_file(target_repo, tmp_path):
     assert g.show_file("HEAD", "src/app.py").startswith("def greet")
     with pytest.raises(GitError):
         g.show_file("HEAD", "missing.txt")
+
+
+def test_files_at_lists_tracked_files_at_a_rev(target_repo):
+    g = GitRepo(target_repo)
+    before = set(g.files_at("HEAD"))
+    rev = _commit(g, "a.txt", "a\n", "a")
+    _commit(g, "b/c.txt", "c\n", "c")
+    assert set(g.files_at(rev)) - before == {"a.txt"}
+    assert set(g.files_at("HEAD")) - before == {"a.txt", "b/c.txt"}
+    assert g.files_at("HEAD") == sorted(g.files_at("HEAD"))

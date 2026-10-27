@@ -29,6 +29,7 @@ from typing import Literal
 from ateam.contracts.select import drift
 from ateam.contracts.store import load_contracts
 from ateam.gitops import GitRepo, MergeConflict
+from ateam.globs import matches
 from ateam.integrate import (IntegrateRefused, integration_branch, integration_worktree, merge_contract, prepare_integration,
                              reconcile_contracts, reconcile_feature)
 from ateam.intent import IntentError, require_clean
@@ -340,6 +341,36 @@ def binding_problems(ctx, cids: list[str], cs: dict | None = None, records: dict
         if not c.checks:
             out.append(f"{cid} has no deterministic checks of its own; verify would refuse it")
     return out
+
+
+def lanes(contracts: dict, cids: list[str], files: list[str]) -> list[list[str]]:
+    """The plan's contracts grouped into lanes (design 2026-10-27, decision 1): two contracts share a lane when a file
+    matches a glob of each, when a glob of one names the other's glob taken as a path (a file not created yet), or
+    when one depends on the other; a lane is the connected group. Each lane is in dependency order, ties by id, and
+    lanes are ordered by their first contract."""
+    globs = {cid: [*contracts[cid].paths, *contracts[cid].incidental] for cid in cids}
+    hits = {cid: {f for f in files if any(matches(g, f) for g in globs[cid])} for cid in cids}
+    parent = {cid: cid for cid in cids}
+
+    def root(cid: str) -> str:
+        while parent[cid] != cid:
+            parent[cid] = parent[parent[cid]]
+            cid = parent[cid]
+        return cid
+
+    def overlap(a: str, b: str) -> bool:
+        if b in contracts[a].depends_on or a in contracts[b].depends_on or hits[a] & hits[b]:
+            return True
+        return any(ga == gb or matches(ga, gb) or matches(gb, ga) for ga in globs[a] for gb in globs[b])
+
+    for i, a in enumerate(cids):
+        for b in cids[i + 1:]:
+            if root(a) != root(b) and overlap(a, b):
+                parent[root(a)] = root(b)
+    groups: dict[str, list[str]] = {}
+    for cid in cids:
+        groups.setdefault(root(cid), []).append(cid)
+    return sorted((dependency_order({c: contracts[c] for c in g}) for g in groups.values()), key=lambda lane: lane[0])
 
 
 def _dry_run(ctx, plan_id: str, cs, cids: list[str], say) -> RunSummary:

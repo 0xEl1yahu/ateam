@@ -105,6 +105,10 @@ class GitRepo:
             return r.returncode == 0
         raise GitError(f"git merge-base --is-ancestor {ancestor} {descendant} failed in {self.root}: {r.stderr.strip()}")
 
+    def files_at(self, rev: str) -> list[str]:
+        """Tracked file paths at `rev`, sorted (NUL-separated, so no path comes back quoted)."""
+        return sorted(p for p in self.run("ls-tree", "-r", "-z", "--name-only", rev).split("\0") if p)
+
     def merge_in_progress(self) -> bool:
         r = subprocess.run(["git", "rev-parse", "--verify", "--quiet", "MERGE_HEAD"], cwd=self.root, capture_output=True)
         return r.returncode == 0
