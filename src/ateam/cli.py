@@ -1065,6 +1065,50 @@ def _run_foreground(target: Path, plan_id: str, dry_run: bool) -> NoReturn:
     sys.exit({"merge_proposed": 0, "dry_run": 0, "paused": 1, "stalled": 1, "budget": 1, "rerun": 4, "interrupted": 130}[summary.outcome])
 
 
+@main.command("stop")
+@click.argument("plan_id")
+@TARGET_OPTION
+def stop_cmd(plan_id: str, target: Path) -> None:
+    """Pause an executing plan. A live run is asked through the state store and pauses after interrupting its own
+    sessions; with no run, the plan is paused at once (reason owner_stopped). Exit 0 requested or paused, 4 refused."""
+    from ateam.exclusion import run_holder
+    from ateam.plans.ops import set_plan_status
+    from ateam.plans.store import load_plans
+
+    ctx = _context(target)
+    plan = load_plans(ctx.paths.plans).get(plan_id)
+    if plan is None:
+        _fail(f"unknown plan {plan_id}", code=4)
+    status = ctx.db.feature_status(plan_id) or str(plan.status)
+    if status != "executing":
+        _fail(f"{plan_id} is {status}; only an executing plan can be stopped", code=4)
+    held = run_holder(ctx.db)
+    if held is not None and held["plan_id"] != plan_id:
+        require_no_live_run(ctx)   # names the other plan's run (or its stale lock)
+    if held is not None and not held["alive"]:
+        _fail(f"the run lock names {plan_id} (pid {held['pid']}), a process that is gone; remove the lock by hand first", code=4)
+    if held is not None:
+        if ctx.db.stop_requested(plan_id):
+            _fail(f"a stop is already in progress for {plan_id}", code=4)
+        ctx.db.request_stop(plan_id)   # the run polls the store and interrupts only its own sessions
+        click.echo(f"stop requested; {plan_id} pauses after its running sessions are interrupted")
+        sys.exit(0)
+    require_no_live_planning(ctx)
+    try:
+        require_clean(ctx.paths)
+    except IntentError as e:
+        _fail(str(e), code=4)
+    if not ctx.db.acquire_run_lock(plan_id):   # a run started a moment ago: ask it instead
+        _fail(f"{plan_id} just started running; run ateam stop {plan_id} again", code=4)
+    try:
+        why = "owner_stopped: stopped by the owner"
+        set_plan_status(ctx.paths, ctx.db, plan, ["paused"], by="owner", why=why)
+        ctx.db.record_pause(plan_id, "owner_stopped", "stopped by the owner", [])
+    finally:
+        ctx.db.release_run_lock(plan_id)
+    click.echo(f"{plan_id} -> paused (owner_stopped)")
+
+
 @main.command("resume")
 @click.argument("plan_id")
 @click.option("--adopt", is_flag=True, help="Use each paused contract's investigation suggestion as your instruction.")
@@ -1619,13 +1663,20 @@ def schema(kind: str) -> None:
 
 
 @main.command()
+@click.argument("plan_id", required=False)
 @TARGET_OPTION
-def status(target: Path) -> None:
-    """Feature and contract state from the operational store."""
+def status(plan_id: str | None, target: Path) -> None:
+    """Feature and contract state from the operational store; with a plan id, that plan in detail, including why it
+    paused, what the investigation found and how to resume it."""
     from ateam.plans.store import load_plans
 
     ctx = _context(target)
     plans_ = load_plans(ctx.paths.plans)
+    if plan_id is not None:
+        if plan_id not in plans_:
+            _fail(f"unknown plan {plan_id}", code=4)
+        _status_plan(ctx, plans_[plan_id])
+        return
     click.echo("Plans:" if plans_ else "Plans: none")
     for pid, p in sorted(plans_.items()):
         live = ctx.db.feature_status(pid) or p.status
@@ -1639,6 +1690,55 @@ def status(target: Path) -> None:
     holder = ctx.db.run_lock_holder()
     if holder:
         click.echo(f"Run lock held by {holder}")
+    for pid in sorted(plans_):
+        if (ctx.db.feature_status(pid) or str(plans_[pid].status)) == "paused":
+            pause = ctx.db.open_pause(pid)
+            reason = pause["reason"] if pause else "no reason recorded"
+            click.echo(f"  {pid} paused ({reason}): ateam status {pid}")
+
+
+def _status_plan(ctx: Context, plan) -> None:
+    from ateam.plans.ops import plan_contract_ids
+
+    pid = plan.id
+    live = ctx.db.feature_status(pid) or str(plan.status)
+    click.echo(f"{pid}  {live}  {plan.title}")
+    for cid in plan_contract_ids(ctx.db, plan):
+        last = ctx.db.latest_attempt(cid)
+        click.echo(f"  {cid}  {ctx.db.contract_status(cid)}" + (f"  last attempt: {last['role']} {last['outcome'] or 'running'}" if last else ""))
+    if live != "paused":
+        return
+    pause = ctx.db.open_pause(pid)
+    if pause is None:
+        last = (ctx.db.transitions("feature", pid) or [{}])[-1].get("reason") or "no reason recorded"
+        click.echo(f"\npaused ({last}); no pause record.\nResume: ateam resume {pid}")
+        return
+    click.echo(f"\npaused ({pause['reason']}): {pause['detail']}")
+    for c in pause["contracts"]:
+        click.echo(f"\n{c['contract_id']} ({c['reason']}): {c['detail']}")
+        click.echo(f"  worktree: {home_dir(ctx.paths.root) / 'worktrees' / c['contract_id']}")
+        f = c["findings"]
+        if not f:
+            click.echo(f"  no findings: {c['note'] or 'no investigation ran'}")
+            continue
+        click.echo(f"  findings: {f.get('summary')}")
+        if f.get("failure_class"):
+            click.echo(f"  failure class: {f['failure_class']}")
+        for e in f.get("evidence") or []:
+            click.echo(f"  - {e.get('ref')}: {e.get('shows')}")
+        if f.get("needs_owner_decision"):
+            click.echo(f"  needs your decision: {f['needs_owner_decision']}")
+        if f.get("suggested_instruction"):
+            click.echo(f"  suggested instruction: {f['suggested_instruction']}")
+    if pause["conflict"]:
+        click.echo("\nresume is refused until the rebase BUILD exists")
+        return
+    suggested = any((c["findings"] or {}).get("suggested_instruction") for c in pause["contracts"])
+    click.echo("\nTo continue:")
+    if suggested:
+        click.echo(f"  ateam resume {pid} --adopt                    # use the suggestion as your instruction")
+    click.echo(f'  ateam resume {pid} --note "use the helper in src/util/x.py"')
+    click.echo(f"  ateam resume {pid}                            # resume with no instruction")
 
 
 @main.command()

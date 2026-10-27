@@ -266,3 +266,105 @@ def test_refrozen_contract_gets_a_window_and_no_stale_guidance(plan3, monkeypatc
     assert r.exit_code == 0, r.output
     assert db.window_start("C-0001") > 0
     assert "Owner's instructions" not in run("brief", "C-0001", "--role", "build", "--target", str(plan3.root)).output
+
+
+# ---- ateam stop and the paused-plan status view (pause and resume, task 8)
+
+def _executing(p):
+    from ateam.plans.ops import set_plan_status
+    from ateam.plans.store import load_plans
+    db = _sdb(p)
+    set_plan_status(p.paths, db, load_plans(p.paths.plans)["P-0001"], ["executing"], by="t")
+    return db
+
+
+def test_stop_from_another_process_pauses_a_running_scheduler(plan3):
+    import time
+
+    from ateam.cli import Context
+    from ateam.scheduler import run_plan
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    stop = threading.Event()
+
+    def blocks_until_stopped(fake, cid, role, worktree, n):
+        deadline = time.monotonic() + 10
+        while not stop.is_set() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return {"code": 130, "outcome": "interrupted", "commit": False}
+
+    box: dict = {}
+    t = threading.Thread(target=lambda: box.update(s=run_plan(lambda: Context(plan3.root), "P-0001", lambda m: None, stop,
+                                                              launch=FakeWorkers({("C-0001", "build", 0): blocks_until_stopped}),
+                                                              investigate=FakeInvestigator())))
+    t.start()
+    deadline = time.monotonic() + 10
+    while not _sdb(plan3).open_attempts(["C-0001"]) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    r = run("stop", "P-0001", "--target", str(plan3.root))
+    t.join(15)
+    db = _sdb(plan3)
+    assert r.exit_code == 0 and "stop requested" in r.output, r.output
+    assert box["s"].outcome == "paused" and db.transitions("feature", "P-0001")[-1]["reason"] == "owner_stopped: stopped by the owner"
+    assert db.attempts_for("C-0001", role="build")[0]["outcome"] == "interrupted" and db.run_lock_info() is None
+
+
+def test_stop_without_a_run_pauses_directly(plan3):
+    db = _executing(plan3)
+    head = _intent_head(plan3)
+    r = run("stop", "P-0001", "--target", str(plan3.root))
+    assert r.exit_code == 0 and "P-0001 -> paused (owner_stopped)" in r.output, r.output
+    assert db.feature_status("P-0001") == "paused" and db.open_pause("P-0001")["contracts"] == []
+    assert GitRepo(plan3.paths.intent).run("rev-list", "--count", f"{head}..HEAD").strip() == "1" and db.run_lock_info() is None
+
+
+@pytest.mark.parametrize("case", ["not_executing", "other_plan", "stale_lock", "in_progress"])
+def test_stop_refusals(case, plan3):
+    db = _sdb(plan3) if case == "not_executing" else _executing(plan3)
+    lock = {"other_plan": ("P-0042", os.getpid()), "stale_lock": ("P-0001", 2 ** 22 + 12345),
+            "in_progress": ("P-0001", os.getpid())}.get(case)
+    if lock:
+        with db.conn as c:
+            c.execute("INSERT INTO run_lock (singleton, plan_id, acquired_at, pid) VALUES (1, ?, 'then', ?)", lock)
+    if case == "in_progress":
+        db.request_stop("P-0001")
+    r = run("stop", "P-0001", "--target", str(plan3.root))
+    why = {"not_executing": "only an executing plan", "other_plan": "P-0042 is running", "stale_lock": "remove the lock by hand",
+           "in_progress": "a stop is already in progress"}[case]
+    assert r.exit_code == 4 and why in r.output, r.output
+
+
+def _status_paused(p, findings=None, note=None, conflict=False):
+    from ateam.plans.ops import set_plan_status
+    from ateam.plans.store import load_plans
+    db = _executing(p)
+    set_plan_status(p.paths, db, load_plans(p.paths.plans)["P-0001"], ["paused"], by="t", why="budget_exhausted: C-0001 used all")
+    pid = db.record_pause("P-0001", "budget_exhausted", "C-0001 used all 2 BUILD attempts",
+                          [_entry("C-0001", db.contract_hash("C-0001"))], conflict=conflict)
+    db.set_pause_findings(pid, "C-0001", 7, findings, note)
+    return db
+
+
+def test_status_shows_findings_and_resume_commands(plan3):
+    _status_paused(plan3, findings={"summary": "the helper already exists", "failure_class": "implementation",
+                                    "evidence": [{"ref": "src/a/x.py:3", "shows": "helper()"}], "needs_owner_decision": None,
+                                    "suggested_instruction": "use helper() from src/a/x.py"})
+    r = run("status", "P-0001", "--target", str(plan3.root))
+    out = r.output
+    assert r.exit_code == 0 and "paused (budget_exhausted)" in out and "C-0001 used all 2 BUILD attempts" in out
+    for text in ("the helper already exists", "implementation", "src/a/x.py:3", "use helper() from src/a/x.py",
+                 "worktrees/C-0001", "ateam resume P-0001 --adopt", 'ateam resume P-0001 --note "',
+                 "# resume with no instruction"):
+        assert text in out, text
+    assert "  P-0001 paused (budget_exhausted): ateam status P-0001" in run("status", "--target", str(plan3.root)).output
+
+
+def test_status_shows_why_there_are_no_findings(plan3):
+    _status_paused(plan3, note="tamper: refs changed (a branch or tag was created, moved or deleted)")
+    out = run("status", "P-0001", "--target", str(plan3.root)).output
+    assert "no findings: tamper: refs changed" in out and "ateam resume P-0001 --adopt" not in out
+
+
+def test_status_for_a_conflict_pause_refuses_resume(plan3):
+    _status_paused(plan3, conflict=True)
+    out = run("status", "P-0001", "--target", str(plan3.root)).output
+    assert "resume is refused until the rebase BUILD exists" in out and "ateam resume P-0001" not in out
