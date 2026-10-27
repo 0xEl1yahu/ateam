@@ -94,3 +94,9 @@ def test_refusals_pause_with_their_cause(stage, code, outcome, status, refusal, 
 
 def test_owner_stopped_is_a_pause_reason():
     assert "owner_stopped" in PAUSE_REASONS
+
+
+def test_a_code_4_refusal_that_is_not_binding_related_is_environment():
+    """A worktree-guard refusal (`_fail(code=4)`, outcome refused, refusal other) is the run's environment (#17)."""
+    o = StepOutcome("build", 4, "refused", refusal="other")
+    assert decide(classify(o), 0, 2, "light", False, None).reason == "environment_failure"

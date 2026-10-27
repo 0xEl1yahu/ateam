@@ -633,3 +633,22 @@ def test_unit_tests_cannot_start_a_real_investigation(tmp_path):
     from ateam import scheduler
     with pytest.raises(AssertionError, match="real pause investigation"):
         scheduler.default_investigate(tmp_path, "P-0001", "C-0001", tmp_path, tmp_path / "r.json")
+
+
+def test_no_session_starts_after_an_owner_stop_is_seen(plan3):
+    """The poll halts the run as it sets stop: a pipeline moving from BUILD to TEST right after the stop is seen never
+    launches TEST (final review, 2026-10-27)."""
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    stop = threading.Event()
+
+    def stop_then_finish(fake, cid, role, worktree, n):
+        _db(plan3).request_stop("P-0001")
+        deadline = time.monotonic() + 5
+        while not stop.is_set() and time.monotonic() < deadline:   # the poll has seen the request
+            time.sleep(0.01)
+        return {}                                                   # BUILD completed: the pipeline moves on at once
+
+    fake = FakeWorkers({("C-0001", "build", 0): stop_then_finish})
+    s, out = _run(plan3, fake, stop=stop)
+    assert s.outcome == "paused" and _last_reason(plan3).startswith("owner_stopped")
+    assert [c[1] for c in fake.calls] == ["build"], fake.calls

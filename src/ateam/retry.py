@@ -59,7 +59,7 @@ def classify(o: StepOutcome) -> str:
         return "tamper"
     if o.refusal == "records_drifted":
         return "drifted"
-    if o.outcome == "not_binding" or o.code == 4:
+    if o.outcome == "not_binding":
         return "not_binding"
     if o.outcome == "setup_failed":
         return "environment"

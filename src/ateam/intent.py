@@ -123,7 +123,11 @@ def commit_intent_files(paths: TargetPaths, message: str, files: list[Path | str
     git.run("add", "--", *rel)
     if not git.run("diff", "--cached", "--name-only", "--", *rel).strip():
         raise IntentError(f"nothing to commit for {', '.join(rel)} in {paths.intent}")
-    git.run("commit", "-q", "-m", message, "--only", "--", *rel)
+    try:
+        git.run("commit", "-q", "-m", message, "--only", "--", *rel)
+    except GitError:
+        git.run("reset", "-q", "--", *rel)   # a hook, signing or identity failure: leave nothing staged
+        raise
     return git.head()
 
 

@@ -368,3 +368,25 @@ def test_status_for_a_conflict_pause_refuses_resume(plan3):
     _status_paused(plan3, conflict=True)
     out = run("status", "P-0001", "--target", str(plan3.root)).output
     assert "resume is refused until the rebase BUILD exists" in out and "ateam resume P-0001" not in out
+
+
+def test_resume_after_a_hook_refused_commit_resumes_again(plan3, monkeypatch):
+    """Review Focus 1 in its realistic form: the commit fails after staging; the printed restore commands work."""
+    import subprocess
+
+    from ateam.guidance import load_guidance
+    db = _paused(plan3, monkeypatch)
+    gate = plan3.paths.intent.parent / "refuse-commits"
+    gate.write_text("on\n")
+    hook = plan3.paths.intent / ".git" / "hooks" / "pre-commit"
+    hook.write_text(f"#!/bin/sh\nif [ -e '{gate}' ]; then echo refused by hook >&2; exit 1; fi\n"); hook.chmod(0o755)
+    r = _resume(plan3, "--note", "use x", "--no-run")
+    assert r.exit_code == 1 and "refused by hook" in r.output, r.output
+    for line in r.output.splitlines():
+        if line.strip().startswith("git -C"):
+            subprocess.run(line.strip(), shell=True, check=True)
+    assert GitRepo(plan3.paths.intent).is_clean() and db.feature_status("P-0001") == "paused"
+    gate.unlink()
+    r2 = _resume(plan3, "--note", "use x", "--no-run")
+    assert r2.exit_code == 0, r2.output
+    assert [e.text for e in load_guidance(plan3.paths.guidance, "C-0001")] == ["use x"]

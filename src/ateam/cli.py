@@ -1200,7 +1200,7 @@ def resume(plan_id: str, adopt: bool, note: str | None, note_file: Path | None, 
         click.echo(f"{plan_id} is still paused. Restore the intent repo, then resume again:")
         for path in [*(ctx.paths.plans.glob(f"{plan_id}-*.yaml")), *written]:
             rel = intent_relpath(ctx.paths, path)
-            tracked = bool(git.run("ls-files", "--", rel).strip())
+            tracked = bool(git.run("ls-tree", "--name-only", "HEAD", "--", rel).strip())
             verb = "checkout" if tracked else "clean -f"
             click.echo(f'  git -C "{ctx.paths.intent}" {verb} -- {rel}')
         sys.exit(1)

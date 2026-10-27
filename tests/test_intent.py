@@ -88,3 +88,16 @@ def test_commit_intent_files_stages_only_the_named_files(paths):
     assert "?? records/R-0099-planted.yaml" in git.run("status", "--porcelain", "--untracked-files=all").splitlines()
     with pytest.raises(IntentError, match="nothing to commit"):
         commit_intent_files(paths, "ateam: again", [mine])
+
+
+def test_a_failed_commit_leaves_nothing_staged(paths):
+    """A pre-commit hook (or signing, or identity) failure happens after `git add`: nothing may stay staged, or a
+    restore with `git checkout --` restores the staged content and the repo stays dirty (final review, 2026-10-27)."""
+    git = init_intent(paths)
+    hook = paths.intent / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\necho refused by hook >&2\nexit 1\n"); hook.chmod(0o755)
+    (paths.intent / "plans").mkdir(exist_ok=True)
+    (paths.intent / "plans" / "new.yaml").write_text("x: 1\n")
+    with pytest.raises(Exception, match="refused by hook"):
+        commit_intent_files(paths, "ateam: x", [paths.intent / "plans" / "new.yaml"])
+    assert git.run("diff", "--cached", "--name-only").strip() == ""
