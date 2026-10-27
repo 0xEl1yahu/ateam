@@ -652,3 +652,37 @@ def test_no_session_starts_after_an_owner_stop_is_seen(plan3):
     s, out = _run(plan3, fake, stop=stop)
     assert s.outcome == "paused" and _last_reason(plan3).startswith("owner_stopped")
     assert [c[1] for c in fake.calls] == ["build"], fake.calls
+
+
+# ---- a BUILD that records no attempt can never loop (live test, 2026-10-27)
+
+class _NoAttemptLaunch:
+    """A session that fails before `ateam worker run` records an attempt; raises after 10 calls so a loop shows up."""
+
+    def __init__(self, result):
+        self.result, self.calls = result, []
+
+    def __call__(self, target, cid, role, worktree, base, tier, prompt, result_file):
+        self.calls.append((cid, role))
+        if len(self.calls) > 10:
+            raise RuntimeError(f"looping: {len(self.calls)} launches")
+        r = {"code": 1, "subtype": None, "error": None, "cost_usd": 0.0, "session_id": None, "test_outcome": None,
+             "test_class": None, "report": None, **self.result}
+        result_file.write_text(json.dumps(r))
+        return r
+
+
+def test_a_failing_setup_pauses_after_one_launch(plan3):
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    launch = _NoAttemptLaunch({"outcome": "setup_failed", "error": "setup failed: false (exit 1)\n"})
+    s, out = _run(plan3, launch)
+    assert s.outcome == "paused" and _last_reason(plan3).startswith("environment_failure: C-0001 build setup_failed")
+    assert launch.calls == [("C-0001", "build")]
+
+
+def test_builds_that_record_no_attempt_still_count_toward_the_limit(plan3):
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    launch = _NoAttemptLaunch({"outcome": "failed", "error": "crashed before the attempt was recorded"})
+    s, out = _run(plan3, launch)
+    allowed = load_contracts(plan3.paths.contracts)["C-0001"].budget.attempts
+    assert s.outcome == "paused" and len(launch.calls) == allowed, launch.calls

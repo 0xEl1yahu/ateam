@@ -8,7 +8,7 @@ from ateam.retry import PAUSE_REASONS, Decision, StepOutcome, classify, decide, 
 @pytest.mark.parametrize("o,cls", [
     (StepOutcome("build", 0, "completed"), "ok"),
     (StepOutcome("build", 3, "scope_breach"), "scope_breach"),
-    (StepOutcome("build", 1, "setup_failed"), "environment"),
+    (StepOutcome("build", 1, "setup_failed"), "setup"),
     (StepOutcome("build", 1, "failed", subtype="error_max_turns"), "implementation"),
     (StepOutcome("build", 1, "failed", subtype="error_max_budget_usd"), "implementation"),
     (StepOutcome("build", 1, "failed", subtype="error_during_execution"), "environment"),
@@ -100,3 +100,10 @@ def test_a_code_4_refusal_that_is_not_binding_related_is_environment():
     """A worktree-guard refusal (`_fail(code=4)`, outcome refused, refusal other) is the run's environment (#17)."""
     o = StepOutcome("build", 4, "refused", refusal="other")
     assert decide(classify(o), 0, 2, "light", False, None).reason == "environment_failure"
+
+
+@pytest.mark.parametrize("stage", ["build", "test"])
+def test_a_failing_setup_pauses_at_once(stage):
+    """A failing setup stops the run (owner, 2026-10-25): it pauses environment_failure, never a retry."""
+    o = StepOutcome(stage, 1, "setup_failed")
+    assert decide(classify(o), 0, 2, "light", False, None, stage=stage, stage_used=1) == Decision("pause", "light", "environment_failure")

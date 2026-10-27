@@ -573,8 +573,9 @@ class _Run:
         escalated = any(a["tier"] != frozen for a in builds)
         allowed = c.budget.attempts
         prompt: str | None = None
+        launched = 0   # BUILDs this pipeline launched that count: one that fails before recording an attempt still does
         while True:
-            used = len(self._counted_builds(db, cid))
+            used = max(len(self._counted_builds(db, cid)), launched)
             if self.halt.is_set():
                 return _Outcome(cid, "halted")
             if used >= allowed:
@@ -585,6 +586,7 @@ class _Run:
             if r.get("outcome") == "interrupted" or self.stop.is_set():
                 return _Outcome(cid, "interrupted")
             used += 1
+            launched = used
             o = StepOutcome("build", int(r.get("code", 1)), r.get("outcome") or "failed", subtype=r.get("subtype"),
                             refusal=r.get("refusal"))
             d = decide(classify(o), used, allowed, tier, escalated, o.subtype)

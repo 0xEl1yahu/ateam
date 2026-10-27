@@ -19,7 +19,7 @@ PAUSE_REASONS = {"decision_change_needed", "scope_exceeded", "budget_exhausted",
 ESCALATION_EVIDENCE = "error_max_turns"
 _IMPLEMENTATION_SUBTYPES = {"error_max_turns", "error_max_budget_usd"}   # the session ran out of turns or money
 _PAUSE_NOW = {"requirements": "decision_change_needed", "drifted": "records_drifted", "not_binding": "verification_unresolvable",
-              "refused": "environment_failure", "tamper": "verification_unresolvable"}
+              "refused": "environment_failure", "tamper": "verification_unresolvable", "setup": "environment_failure"}
 _EXHAUSTED = {"environment": "environment_failure", "scope_breach": "scope_exceeded", "implementation": "budget_exhausted"}
 
 
@@ -48,7 +48,7 @@ def next_tier(tier: str) -> str | None:
 
 
 def classify(o: StepOutcome) -> str:
-    """ok, implementation, environment, requirements, tamper, drifted, not_binding, refused or scope_breach."""
+    """ok, implementation, environment, setup, requirements, tamper, drifted, not_binding, refused or scope_breach."""
     if o.stage == "verify":
         if o.verify_status == "verified":
             return "ok"
@@ -62,7 +62,7 @@ def classify(o: StepOutcome) -> str:
     if o.outcome == "not_binding":
         return "not_binding"
     if o.outcome == "setup_failed":
-        return "environment"
+        return "setup"   # a failing setup stops the run (owner, 2026-10-25)
     if o.outcome == "refused":
         return "refused"
     if o.code == 3:
