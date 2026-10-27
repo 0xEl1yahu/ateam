@@ -364,6 +364,74 @@ def test_status_shows_why_there_are_no_findings(plan3):
     assert "no findings: tamper: refs changed" in out and "ateam resume P-0001 --adopt" not in out
 
 
+@pytest.mark.parametrize("case", ["current", "no_suggestion", "stale_hash", "owner_stopped"])
+def test_status_offers_adopt_only_when_every_suggestion_is_current(case, plan3):
+    from ateam.plans.ops import set_plan_status
+    from ateam.plans.store import load_plans
+    db = _executing(plan3)
+    set_plan_status(plan3.paths, db, load_plans(plan3.paths.plans)["P-0001"], ["paused"], by="t", why="budget_exhausted: x")
+    if case == "owner_stopped":
+        db.record_pause("P-0001", "owner_stopped", "stopped by the owner", [])
+    else:
+        h = "an-older-hash" if case == "stale_hash" else db.contract_hash("C-0001")
+        pid = db.record_pause("P-0001", "budget_exhausted", "d", [_entry("C-0001", h)])
+        findings = {"summary": "s"} if case == "no_suggestion" else {"summary": "s", "suggested_instruction": "use x"}
+        db.set_pause_findings(pid, "C-0001", 7, findings, None)
+    out = run("status", "P-0001", "--target", str(plan3.root)).output
+    assert ("ateam resume P-0001 --adopt" in out) == (case == "current"), out
+
+
+@pytest.mark.parametrize("paused", [["C-0001"], ["C-0001", "C-0003"]])
+def test_status_note_names_contract_when_several_are_paused(paused, plan3):
+    from ateam.plans.ops import set_plan_status
+    from ateam.plans.store import load_plans
+    db = _executing(plan3)
+    set_plan_status(plan3.paths, db, load_plans(plan3.paths.plans)["P-0001"], ["paused"], by="t", why="budget_exhausted: x")
+    db.record_pause("P-0001", "budget_exhausted", "d", [_entry(c, db.contract_hash(c)) for c in paused])
+    out = run("status", "P-0001", "--target", str(plan3.root)).output
+    notes = [line.strip() for line in out.splitlines() if line.strip().startswith('ateam resume P-0001 --note "')]
+    if len(paused) == 1:
+        assert len(notes) == 1 and "--contract" not in notes[0], out
+    else:
+        assert len(notes) == 2 and all(f"--contract {c}" in n for n, c in zip(notes, paused)), out
+
+
+@pytest.mark.parametrize("case", ["blank_note", "blank_note_file", "integrated_contract"])
+def test_resume_refuses_blank_notes_and_integrated_contracts(case, plan3, monkeypatch, tmp_path):
+    db = _paused(plan3, monkeypatch)
+    args: tuple[str, ...] = ("--note", "   ", "--no-run")
+    why = "the note is blank"
+    if case == "blank_note_file":
+        blank = tmp_path / "blank.txt"
+        blank.write_text("  \n")
+        args, why = ("--note-file", str(blank), "--no-run"), "the note file is blank"
+    elif case == "integrated_contract":
+        with db.conn as c:
+            c.execute("UPDATE contracts SET status='integrated' WHERE contract_id='C-0001'")
+        args, why = ("--note", "x", "--contract", "C-0001", "--no-run"), "C-0001 is integrated"
+    status, head = db.feature_status("P-0001"), _intent_head(plan3)
+    windows = [db.window_start(c) for c in ("C-0001", "C-0002", "C-0003")]
+    r = _resume(plan3, *args)
+    assert r.exit_code == 4 and why in r.output, r.output
+    assert _sdb(plan3).feature_status("P-0001") == status == "paused" and _intent_head(plan3) == head
+    assert [_sdb(plan3).window_start(c) for c in ("C-0001", "C-0002", "C-0003")] == windows
+    assert GitRepo(plan3.paths.intent).status_porcelain() == []
+
+
+def test_resume_message_distinguishes_no_record_from_an_empty_pause(plan3, monkeypatch):
+    from ateam.plans.ops import set_plan_status
+    from ateam.plans.store import load_plans
+    db = _sdb(plan3)
+    set_plan_status(plan3.paths, db, load_plans(plan3.paths.plans)["P-0001"], ["executing", "paused"], by="t", why="budget_exhausted: old")
+    r = _resume(plan3, "--no-run")
+    assert r.exit_code == 0 and "no pause record; no contract's attempts were refreshed" in r.output, r.output
+    assert "(the pause names no contract)" not in r.output
+    set_plan_status(plan3.paths, db, load_plans(plan3.paths.plans)["P-0001"], ["paused"], by="t", why="owner_stopped: stopped by the owner")
+    db.record_pause("P-0001", "owner_stopped", "stopped by the owner", [])
+    r = _resume(plan3, "--no-run")
+    assert r.exit_code == 0 and "no contract's attempts were refreshed (the pause names no contract)" in r.output, r.output
+
+
 def test_status_for_a_conflict_pause_refuses_resume(plan3):
     _status_paused(plan3, conflict=True)
     out = run("status", "P-0001", "--target", str(plan3.root)).output

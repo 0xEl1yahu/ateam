@@ -1155,12 +1155,18 @@ def resume(plan_id: str, adopt: bool, note: str | None, note_file: Path | None, 
 
     if adopt and (note is not None or note_file is not None):
         _fail("use --adopt or --note/--note-file, not both", code=4)
+    if note is not None and not note.strip():
+        _fail("the note is blank; write an instruction or leave out --note", code=4)
+    if note_file is not None and not note_file.read_text().strip():
+        _fail(f"the note file is blank ({note_file}); write an instruction or leave out --note-file", code=4)
     text = note_file.read_text().strip() if note_file is not None else note
     paused_recs = {c["contract_id"]: c for c in (pause or {}).get("contracts", [])}
     unfinished = [cid for cid in cids if ctx.db.contract_status(cid) != "integrated"]
     for cid in contract_ids:
         if cid not in cids:
             _fail(f"{cid} is not a contract of {plan_id}", code=4)
+        if ctx.db.contract_status(cid) == "integrated":
+            _fail(f"{cid} is integrated; an instruction has no BUILD to reach", code=4)
     targets = list(contract_ids) or (list(paused_recs) if adopt else (list(paused_recs) if len(paused_recs) == 1 else []))
     instructions: dict[str, tuple[str, str]] = {}   # cid -> (source, text)
     if adopt or text is not None:
@@ -1186,6 +1192,8 @@ def resume(plan_id: str, adopt: bool, note: str | None, note_file: Path | None, 
     window_cids = sorted(paused_recs)
     if window_cids:
         ctx.db.resume_pause(None, window_cids)   # first, and idempotent: a repeated resume opens a newer window
+    elif pause is None:
+        click.echo("no pause record; no contract's attempts were refreshed")
     else:
         click.echo("no contract's attempts were refreshed (the pause names no contract)")
     cs = load_contracts(ctx.paths.contracts)
@@ -1733,11 +1741,18 @@ def _status_plan(ctx: Context, plan) -> None:
     if pause["conflict"]:
         click.echo("\nresume is refused until the rebase BUILD exists")
         return
-    suggested = any((c["findings"] or {}).get("suggested_instruction") for c in pause["contracts"])
+    contracts = pause["contracts"]
+    adoptable = bool(contracts) and all(
+        (c["findings"] or {}).get("suggested_instruction") and c["contract_hash"] == ctx.db.contract_hash(c["contract_id"])
+        for c in contracts)
     click.echo("\nTo continue:")
-    if suggested:
+    if adoptable:
         click.echo(f"  ateam resume {pid} --adopt                    # use the suggestion as your instruction")
-    click.echo(f'  ateam resume {pid} --note "use the helper in src/util/x.py"')
+    if len(contracts) > 1:
+        for c in contracts:
+            click.echo(f'  ateam resume {pid} --note "use the helper in src/util/x.py" --contract {c["contract_id"]}')
+    else:
+        click.echo(f'  ateam resume {pid} --note "use the helper in src/util/x.py"')
     click.echo(f"  ateam resume {pid}                            # resume with no instruction")
 
 
