@@ -17,7 +17,7 @@ def test_init_schema_idempotent(tmp_path):
 
 def test_transition_tables_match_design():
     assert FEATURE_TRANSITIONS["plan_proposed"] == {"plan_approved", "plan_rejected", "superseded"}
-    assert CONTRACT_TRANSITIONS["verified"] == {"integrated"}
+    assert CONTRACT_TRANSITIONS["verified"] == {"integrated", "building"}   # building: the rebase BUILD only (owner, 2026-10-27)
     assert "integrated" not in CONTRACT_TRANSITIONS["ready"]
 
 
@@ -352,3 +352,12 @@ def test_existing_store_gains_the_pause_tables(tmp_path):
             db.conn.execute(f"DROP TABLE {t}")
     db.init_schema()
     assert db.open_pause("P-0001") is None and db.window_start("C-0001") == 0
+
+
+def test_verified_may_go_back_to_building_for_a_rebase(tmp_path):
+    db = fresh(tmp_path)
+    db.upsert_contract("C-0001", "P-0001", "verified", "h")
+    with pytest.raises(InvalidTransition):
+        db.transition("contract", "C-0001", "failed", by="run")
+    db.transition("contract", "C-0001", "building", by="run", reason="rebase onto abc")
+    assert db.contract_status("C-0001") == "building"

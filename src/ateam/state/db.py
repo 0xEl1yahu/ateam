@@ -35,7 +35,7 @@ CONTRACT_TRANSITIONS: dict[str | None, set[str]] = {
     "verifying": {"verified", "failed", "paused"},
     "failed": {"building", "paused"},
     "paused": {"building", "ready"},
-    "verified": {"integrated"},
+    "verified": {"integrated", "building"},   # building: only the rebase BUILD after a merge conflict (owner, 2026-10-27)
     "integrated": set(),
     "superseded": set(),     # terminal; its plan was superseded before the contract started
 }

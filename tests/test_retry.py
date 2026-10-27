@@ -2,7 +2,7 @@
 
 import pytest
 
-from ateam.retry import PAUSE_REASONS, Decision, StepOutcome, classify, decide, next_tier
+from ateam.retry import PAUSE_REASONS, Decision, StepOutcome, classify, decide, decide_conflict, next_tier
 
 
 @pytest.mark.parametrize("o,cls", [
@@ -107,3 +107,14 @@ def test_a_failing_setup_pauses_at_once(stage):
     """A failing setup stops the run (owner, 2026-10-25): it pauses environment_failure, never a retry."""
     o = StepOutcome(stage, 1, "setup_failed")
     assert decide(classify(o), 0, 2, "light", False, None, stage=stage, stage_used=1) == Decision("pause", "light", "environment_failure")
+
+
+@pytest.mark.parametrize("rebased, used, allowed, uneditable, action", [
+    (False, 1, 3, [], "rebase"),
+    (True, 1, 3, [], "pause"),                # one rebase BUILD per window
+    (False, 3, 3, [], "pause"),               # the limit holds (owner, 2026-10-27, ruling 9)
+    (False, 1, 3, ["uv.lock"], "pause"),      # a path the contract may not edit (ruling 12)
+])
+def test_decide_conflict(rebased, used, allowed, uneditable, action):
+    d = decide_conflict(rebased, used, allowed, uneditable)
+    assert d.action == action and d.reason == (None if action == "rebase" else "environment_failure")

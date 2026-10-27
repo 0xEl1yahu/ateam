@@ -151,3 +151,39 @@ def test_files_at_lists_tracked_files_at_a_rev(target_repo):
     assert set(g.files_at(rev)) - before == {"a.txt"}
     assert set(g.files_at("HEAD")) - before == {"a.txt", "b/c.txt"}
     assert g.files_at("HEAD") == sorted(g.files_at("HEAD"))
+
+
+def _diverge(target_repo):
+    """main and branch `other` both change f.txt from one base."""
+    g = GitRepo(target_repo)
+    _commit(g, "f.txt", "base\n", "base")
+    g.create_branch("other", g.head())
+    _commit(g, "f.txt", "mine\n", "mine")
+    g.run("checkout", "-q", "other"); theirs = _commit(g, "f.txt", "theirs\n", "theirs"); g.run("checkout", "-q", "main")
+    return g, theirs
+
+
+def test_merge_keep_conflicts_leaves_the_markers_and_the_merge(target_repo):
+    g, theirs = _diverge(target_repo)
+    assert g.merge_keep_conflicts(theirs) == ["f.txt"]
+    assert g.merge_in_progress() and g.merge_head() == theirs and "<<<<<<<" in (target_repo / "f.txt").read_text()
+
+
+def test_merge_keep_conflicts_without_a_conflict_still_leaves_the_merge_open(target_repo):
+    g = GitRepo(target_repo)
+    base = g.head()
+    g.create_branch("other", base)
+    _commit(g, "mine.txt", "m\n", "mine")
+    g.run("checkout", "-q", "other"); theirs = _commit(g, "theirs.txt", "t\n", "theirs"); g.run("checkout", "-q", "main")
+    assert g.merge_keep_conflicts(theirs) == [] and g.merge_in_progress() and g.merge_head() == theirs
+
+
+def test_merge_keep_conflicts_raises_on_a_failure_that_is_not_a_conflict(target_repo):
+    g = GitRepo(target_repo)
+    base = g.head()
+    g.create_branch("other", base)
+    g.run("checkout", "-q", "other"); theirs = _commit(g, "new.txt", "t\n", "theirs"); g.run("checkout", "-q", "main")
+    (target_repo / "new.txt").write_text("untracked, would be overwritten\n")
+    with pytest.raises(GitError):
+        g.merge_keep_conflicts(theirs)
+    assert not g.merge_in_progress() and g.head() == base

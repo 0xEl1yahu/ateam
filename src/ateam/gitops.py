@@ -118,6 +118,21 @@ class GitRepo:
         r = subprocess.run(["git", "rev-parse", "--verify", "--quiet", "MERGE_HEAD"], cwd=self.root, capture_output=True, text=True)
         return r.stdout.strip() if r.returncode == 0 else None
 
+    def merge_keep_conflicts(self, rev: str) -> list[str]:
+        """Start merging `rev` without committing and leave the merge in progress, conflict markers and all; return
+        the conflicting paths ([] when it merged cleanly). Rerere is off, so a clone's settings cannot change the
+        result. Any failure that is not a conflict aborts the merge and raises GitError."""
+        try:
+            self.run("-c", "rerere.enabled=false", "merge", "--no-ff", "--no-commit", rev)
+        except GitError:
+            paths = [p for p in self.run("diff", "--name-only", "--diff-filter=U").splitlines() if p] if self.merge_in_progress() else []
+            if paths:
+                return paths
+            if self.merge_in_progress():
+                self.run("merge", "--abort")
+            raise
+        return []
+
     def merge_no_ff(self, rev: str, message: str) -> str:
         """Merge `rev` with a merge commit and return the new HEAD. Any failure that leaves a merge in progress is
         aborted first; a conflict raises MergeConflict naming the conflicting paths."""

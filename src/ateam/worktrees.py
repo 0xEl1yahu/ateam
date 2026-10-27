@@ -12,6 +12,7 @@ created and win over any later call, so a re-run never moves a contract.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -72,3 +73,39 @@ def contract_worktree(paths: TargetPaths, db: StateDB, owner: GitRepo, plan_id: 
     if not wt.is_ancestor(base, "HEAD") and wt.merge_head() != base:   # merge_head: a rebase onto base is under way
         raise WorktreeError(f"the worktree {path} does not descend from {cid}'s recorded base {base[:12]}")
     return ContractWorktree(cid, path, base, branch)
+
+
+def rebased_this_window(db: StateDB, cid: str) -> bool:
+    """A rebase was prepared in the contract's current attempt window and a counted BUILD has run since: a crash
+    between preparing it and its BUILD does not use it up."""
+    raw = db.get_meta(f"rebase:{cid}")
+    if raw is None:
+        return False
+    rebase = json.loads(raw)
+    if rebase["window"] != db.window_start(cid):
+        return False
+    return any(a["attempt_id"] > rebase["after"] and a.get("outcome") != "interrupted" for a in db.attempts_for(cid, role="build"))
+
+
+def prepare_rebase(paths: TargetPaths, db: StateDB, owner: GitRepo, plan_id: str, cid: str,
+                   tip: str) -> tuple[ContractWorktree, list[str]]:
+    """Merge the integration tip into the contract's own worktree, without committing, for the rebase BUILD (owner,
+    2026-10-27): workers may not run git merge, so the scheduler starts it and the BUILD concludes it. Idempotent:
+    an open merge onto the recorded tip is kept, a concluded one is left alone. The base moves to the tip only once
+    the merge is under way, so a merge that fails leaves the contract as it was."""
+    wt = GitRepo(worktree_path(paths, db, cid))
+    raw = db.get_meta(f"rebase:{cid}")
+    recorded = json.loads(raw)["tip"] if raw else None
+    unmerged = lambda: [p for p in wt.run("diff", "--name-only", "--diff-filter=U").splitlines() if p]  # noqa: E731
+    if recorded is not None and wt.merge_head() == recorded:
+        if db.get_meta(f"base:{cid}") != recorded:
+            db.set_meta(f"base:{cid}", recorded)
+        return contract_worktree(paths, db, owner, plan_id, cid), unmerged()
+    if recorded is not None and not wt.merge_in_progress() and wt.is_ancestor(recorded, "HEAD"):
+        return contract_worktree(paths, db, owner, plan_id, cid), []
+    after = max((a["attempt_id"] for a in db.attempts_for(cid)), default=0)
+    db.set_meta(f"rebase:{cid}", json.dumps({"window": db.window_start(cid), "tip": tip, "after": after}))
+    conflicts = wt.merge_keep_conflicts(tip)
+    if wt.merge_head() == tip:
+        db.set_meta(f"base:{cid}", tip)
+    return contract_worktree(paths, db, owner, plan_id, cid), conflicts

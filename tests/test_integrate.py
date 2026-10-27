@@ -389,3 +389,56 @@ def test_failed_final_checks_record_a_pause_that_is_not_a_conflict(verified):
     res, out, ctx = _integrate(verified.root)
     p = ctx.db.open_pause("P-0001")
     assert p["conflict"] is False and p["reason"] == "verification_unresolvable" and p["detail"] == "lint failed" and p["contracts"] == []
+
+
+# ---- the rebase BUILD's state step (2026-10-27-lanes-design.md, ruling 6)
+
+def test_reopen_for_rebase_moves_file_then_store_and_repeats_safely(verified):
+    from ateam.integrate import reopen_for_rebase
+    ctx, out = Context(verified.root), []
+    tip = GitRepo(verified.root).head()
+    reopen_for_rebase(ctx, "P-0001", "C-0001", tip, out.append)
+    assert load_contracts(verified.paths.contracts)["C-0001"].status == "building"
+    assert ctx.db.contract_status("C-0001") == "building"
+    assert GitRepo(verified.paths.intent).is_clean() and "rebase C-0001" in GitRepo(verified.paths.intent).run("log", "-1", "--format=%s")
+    reopen_for_rebase(ctx, "P-0001", "C-0001", tip, out.append)
+    assert [t["to_status"] for t in ctx.db.transitions("contract", "C-0001")].count("building") == 2   # verify's walk + this one
+
+
+def _mid_rebase(verified, tmp_path, window_now=True, merging=True):
+    """C-0001: file `building`, store `verified`, a rebase key, and a lane worktree with (or without) the merge open."""
+    import json
+    from ateam.contracts.model import ContractStatus
+    from ateam.contracts.store import save_contract
+    from ateam.intent import commit_intent_files
+    from ateam.paths import home_dir
+    ctx = Context(verified.root)
+    owner = GitRepo(verified.root)
+    head = ctx.db.latest_checkpoint("C-0001")["head"]
+    lane = home_dir(verified.root) / "worktrees" / "L-1"
+    owner.worktree_add(lane, "lane-L-1", head)
+    owner.create_branch("other", head)
+    side = tmp_path / "side"; owner.worktree_add_existing(side, "other")
+    (side / "src" / "a" / "a.py").write_text("other\n"); g = GitRepo(side); g.run("commit", "-q", "-am", "other"); tip = g.head()
+    (lane / "src" / "a" / "a.py").write_text("mine\n"); GitRepo(lane).run("commit", "-q", "-am", "mine")
+    if merging:
+        GitRepo(lane).merge_keep_conflicts(tip)
+    ctx.db.set_meta("lane:C-0001", "L-1")
+    ctx.db.set_meta("rebase:C-0001", json.dumps({"window": ctx.db.window_start("C-0001") + (0 if window_now else -1), "tip": tip, "after": 0}))
+    c = load_contracts(verified.paths.contracts)["C-0001"]
+    saved = save_contract(verified.paths.contracts, c.model_copy(update={"status": ContractStatus.building}))
+    commit_intent_files(verified.paths, "ateam: rebase C-0001", [saved])
+    return ctx, owner
+
+
+@pytest.mark.parametrize("window_now, merging, reconciled", [(True, True, True), (False, True, False), (True, False, False)])
+def test_reconcile_completes_a_rebase_whose_store_step_was_lost(verified, tmp_path, window_now, merging, reconciled):
+    from ateam.integrate import IntegrateRefused, reconcile_contracts
+    ctx, owner = _mid_rebase(verified, tmp_path, window_now, merging)
+    cs, out = load_contracts(verified.paths.contracts), []
+    if reconciled:
+        reconcile_contracts(ctx.db, owner, cs, ["C-0001"], "ateam/P-0001", out.append)
+        assert ctx.db.contract_status("C-0001") == "building" and "reconciled" in out[0]
+    else:
+        with pytest.raises(IntegrateRefused):
+            reconcile_contracts(ctx.db, owner, cs, ["C-0001"], "ateam/P-0001", out.append)

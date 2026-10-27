@@ -246,9 +246,40 @@ def merge_contract(ctx, wt: GitRepo, plan_id: str, cid: str, echo) -> str:
     return merge
 
 
+def reopen_for_rebase(ctx, plan_id: str, cid: str, tip: str, echo) -> None:
+    """Move a verified contract back to building for its rebase BUILD (owner, 2026-10-27): the contract file in an
+    intent commit first, then the store, as merge_contract does. A repeat records only what is missing."""
+    paths, db = ctx.paths, ctx.db
+    contract = load_contracts(paths.contracts)[cid]
+    if contract.status != ContractStatus.building:
+        saved = save_contract(paths.contracts, contract.model_copy(update={"status": ContractStatus.building}))
+        commit_intent_files(paths, f"ateam: rebase {cid} onto {integration_branch(plan_id)} {tip[:12]}", [saved])
+    if db.contract_status(cid) != "building":
+        db.transition("contract", cid, "building", by="run", reason=f"rebase onto {tip}")
+        echo(f"{cid} -> building (rebase onto {integration_branch(plan_id)} {tip[:12]})")
+
+
+def _rebase_under_way(db, owner: GitRepo, cid: str) -> bool:
+    """The contract's worktree shows the rebase its key records, in the current attempt window."""
+    from ateam.worktrees import worktree_path
+
+    raw = db.get_meta(f"rebase:{cid}")
+    if raw is None:
+        return False
+    rebase = json.loads(raw)
+    if rebase["window"] != db.window_start(cid):
+        return False
+    try:
+        wt = GitRepo(worktree_path(TargetPaths.from_root(owner.root), db, cid))
+        return wt.merge_head() == rebase["tip"] or wt.is_ancestor(rebase["tip"], "HEAD")
+    except GitError:
+        return False
+
+
 def reconcile_contracts(db, owner: GitRepo, cs, cids, branch: str, echo) -> None:
     """A contract whose file says integrated while the store says verified lost its store step in a crash, provided
-    its verified head is on the integration branch. Any other disagreement is refused."""
+    its verified head is on the integration branch; one whose file says building while the store says verified lost
+    the store step of its rebase, provided the rebase is under way. Any other disagreement is refused."""
     for cid in cids:
         file_status, stored = str(cs[cid].status), db.contract_status(cid)
         if file_status == stored:
@@ -257,6 +288,9 @@ def reconcile_contracts(db, owner: GitRepo, cs, cids, branch: str, echo) -> None
         if file_status == "integrated" and stored == "verified" and owner.branch_exists(branch) and owner.is_ancestor(head, branch):
             db.transition("contract", cid, "integrated", by="integrate", reason="reconciled after an interruption")
             echo(f"reconciled: {cid} -> integrated (state store)")
+        elif file_status == "building" and stored == "verified" and _rebase_under_way(db, owner, cid):
+            db.transition("contract", cid, "building", by="run", reason="reconciled after an interruption (rebase)")
+            echo(f"reconciled: {cid} -> building (state store, rebase)")
         else:
             raise IntegrateRefused(f"{cid} is {file_status} in its file and {stored} in the state store; investigate before integrating")
 

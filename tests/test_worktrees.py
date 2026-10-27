@@ -141,3 +141,57 @@ def test_a_merge_in_progress_onto_the_recorded_base_is_accepted(target_repo, tmp
     db.set_meta("base:C-1", _advance_integration(owner, tmp_path, "g.txt", "unrelated"))
     with pytest.raises(WorktreeError):
         contract_worktree(paths, db, owner, "P-0001", "C-1")
+
+
+# ---- the rebase BUILD (2026-10-27-lanes-design.md, rulings 6-9)
+
+def _conflicting_tip(owner, tmp_path, w, name="tip"):
+    """C-1's worktree and ateam/P-0001 both add f.txt; returns the new integration tip."""
+    g = GitRepo(w.path)
+    (w.path / "f.txt").write_text("mine\n"); g.run("add", "-A"); g.run("commit", "-q", "-m", "mine")
+    return _advance_integration(owner, tmp_path, "f.txt", name)
+
+
+def test_prepare_rebase_records_then_merges_and_is_idempotent(target_repo, tmp_path):
+    import json
+    from ateam.worktrees import contract_worktree, prepare_rebase
+    paths, db, owner = _setup(target_repo)
+    w = contract_worktree(paths, db, owner, "P-0001", "C-1")
+    tip = _conflicting_tip(owner, tmp_path, w)
+    a = db.start_attempt("C-1", "build", "light", "m", {}); db.finish_attempt(a, "completed", None, 1, 1, 0.1, 1, 0.1, "s")
+    wt, conflicts = prepare_rebase(paths, db, owner, "P-0001", "C-1", tip)
+    assert conflicts == ["f.txt"] and wt.path == w.path and wt.base == tip == db.get_meta("base:C-1")
+    assert json.loads(db.get_meta("rebase:C-1")) == {"window": db.window_start("C-1"), "tip": tip, "after": a}
+    newer = _advance_integration(owner, tmp_path, "g.txt", "newer")
+    assert prepare_rebase(paths, db, owner, "P-0001", "C-1", newer)[1] == ["f.txt"]   # the open merge is kept
+    assert db.get_meta("base:C-1") == tip and GitRepo(w.path).merge_head() == tip
+    (w.path / "f.txt").write_text("both\n"); GitRepo(w.path).run("commit", "-q", "-am", "resolved")
+    assert prepare_rebase(paths, db, owner, "P-0001", "C-1", tip)[1] == [] and db.get_meta("base:C-1") == tip
+
+
+def test_prepare_rebase_leaves_the_base_when_the_merge_fails(target_repo, tmp_path):
+    from ateam.gitops import GitError
+    from ateam.worktrees import contract_worktree, prepare_rebase
+    paths, db, owner = _setup(target_repo)
+    w = contract_worktree(paths, db, owner, "P-0001", "C-1")
+    old = db.get_meta("base:C-1")
+    tip = _advance_integration(owner, tmp_path, "new.txt", "tip")
+    (w.path / "new.txt").write_text("untracked\n")
+    with pytest.raises(GitError):
+        prepare_rebase(paths, db, owner, "P-0001", "C-1", tip)
+    assert db.get_meta("base:C-1") == old and not GitRepo(w.path).merge_in_progress()
+
+
+def test_rebased_this_window_needs_a_build_after_the_key(target_repo, tmp_path):
+    from ateam.worktrees import contract_worktree, prepare_rebase, rebased_this_window
+    paths, db, owner = _setup(target_repo)
+    w = contract_worktree(paths, db, owner, "P-0001", "C-1")
+    assert not rebased_this_window(db, "C-1")
+    prepare_rebase(paths, db, owner, "P-0001", "C-1", _conflicting_tip(owner, tmp_path, w))
+    assert not rebased_this_window(db, "C-1")          # prepared, but its BUILD has not run (a crash here re-runs it)
+    a = db.start_attempt("C-1", "build", "light", "m", {}); db.finish_attempt(a, "interrupted", None, 1, 1, 0.1, 1, 0.1, "s")
+    assert not rebased_this_window(db, "C-1")          # an interrupted BUILD does not count
+    b = db.start_attempt("C-1", "build", "light", "m", {}); db.finish_attempt(b, "completed", None, 1, 1, 0.1, 1, 0.1, "s")
+    assert rebased_this_window(db, "C-1")
+    db.resume_pause(None, ["C-1"])
+    assert not rebased_this_window(db, "C-1")          # a resume opens a new window

@@ -3,7 +3,8 @@
 Pure functions: an outcome of one step (BUILD, TEST or verify, as their result files report it) becomes a class,
 and a class plus the attempt history becomes a decision. A retry is always a fresh BUILD attempt; the limit is the
 contract's frozen budget.attempts BUILD attempts, counted across runs. One escalation, one tier up, once per contract,
-only after a BUILD that ended with subtype error_max_turns; environment failures never change the tier.
+only after a BUILD that ended with subtype error_max_turns; environment failures never change the tier. A verified contract whose merge conflicts gets one rebase BUILD
+per attempt window, within budget.attempts, unless a conflicting path is one it may not edit (owner, 2026-10-27).
 """
 
 from __future__ import annotations
@@ -37,7 +38,8 @@ class StepOutcome:
 
 @dataclass(frozen=True)
 class Decision:
-    action: Literal["continue", "retry", "retry_stage", "pause"]   # retry: a fresh BUILD; retry_stage: the same stage again
+    action: Literal["continue", "retry", "retry_stage", "pause", "rebase"]   # retry: a fresh BUILD; retry_stage: the same
+    # stage again; rebase: one BUILD that resolves a merge conflict
     tier: str
     reason: str | None
 
@@ -90,3 +92,10 @@ def decide(cls: str, build_attempts_used: int, attempts_allowed: int, tier: str,
     if cls == "implementation" and last_subtype == ESCALATION_EVIDENCE and not escalated and up is not None:
         return Decision("retry", up, None)
     return Decision("retry", tier, None)
+
+
+def decide_conflict(rebased_this_window: bool, build_attempts_used: int, attempts_allowed: int, uneditable: list[str]) -> Decision:
+    """A verified contract's merge conflicted: one rebase BUILD, or a pause (marked a conflict by the caller)."""
+    if uneditable or rebased_this_window or build_attempts_used >= attempts_allowed:
+        return Decision("pause", "", "environment_failure")
+    return Decision("rebase", "", None)
