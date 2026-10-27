@@ -998,3 +998,18 @@ def test_an_integrating_rerun_continues_a_rebase(plan3):
     set_plan_status(ctx.paths, ctx.db, load_plans(ctx.paths.plans)["P-0001"], ["integrating"], by="integrate")
     s, out = _run(plan3, FakeWorkers())
     assert s.outcome == "merge_proposed", out
+
+
+def test_the_p0018_shape_prints_two_lanes(target_repo, monkeypatch):
+    """The live P-0018 shape on a scratch target: two contracts in src/ateam/cli.py, one in src/ateam/runner/policy.py."""
+    _commit_on_main(target_repo, "src/ateam/cli.py", "def main():\n    pass\n")
+    _commit_on_main(target_repo, "src/ateam/runner/policy.py", "POLICY = {}\n")
+    report = _report3()
+    for c, paths in zip(report["contracts"], (["src/ateam/cli.py", "tests/test_a.py"], ["src/ateam/cli.py", "tests/test_b.py"],
+                                              ["src/ateam/runner/policy.py", "tests/test_c.py"])):
+        c["paths"], c["depends_on"] = paths, []
+    p = _approve_lanes(target_repo, monkeypatch, report=report)
+    s, out = _run(p, FakeWorkers(), dry_run=True)
+    text = "\n".join(out)
+    assert s.outcome == "dry_run"
+    assert "2 lane(s), up to 2 at once" in text and "lane 1: C-0001 -> C-0002" in text and "lane 2: C-0003" in text
