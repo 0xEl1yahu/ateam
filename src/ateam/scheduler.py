@@ -10,7 +10,8 @@ at most config.run_budget_usd on sessions. `ateam run` never merges into the tar
 
 Contracts whose declared paths overlap, or that depend on each other, form a lane (design 2026-10-27): a lane runs
 its contracts one after another in one shared worktree, each starting from the previous contract's verified head once
-that contract is integrated, and lanes run in parallel up to config.max_workers.
+that contract is integrated, and lanes run in parallel up to config.max_workers. A verified contract whose merge
+conflicts gets one rebase BUILD in its own worktree, then TEST and verify again (owner, 2026-10-27).
 """
 
 from __future__ import annotations
@@ -32,19 +33,19 @@ from typing import Literal
 
 from ateam.contracts.select import drift
 from ateam.contracts.store import load_contracts
-from ateam.gitops import GitRepo, MergeConflict
+from ateam.gitops import GitError, GitRepo, MergeConflict
 from ateam.globs import matches
 from ateam.integrate import (IntegrateRefused, integration_branch, integration_worktree, merge_contract, prepare_integration,
-                             reconcile_contracts, reconcile_feature)
+                             reconcile_contracts, reconcile_feature, reopen_for_rebase)
 from ateam.intent import IntentError, require_clean
 from ateam.paths import home_dir
 from ateam.plans.ops import dependency_order, plan_contract_ids, set_plan_status
 from ateam.plans.store import load_plans
 from ateam.records.store import load_records
-from ateam.retry import StepOutcome, classify, decide, next_tier
+from ateam.retry import StepOutcome, classify, decide, decide_conflict, next_tier
 from ateam.roles import Role
 from ateam.tiers import at_least, load_tiers
-from ateam.worktrees import WorktreeError, contract_worktree, worktree_path
+from ateam.worktrees import WorktreeError, contract_worktree, prepare_rebase, rebased_this_window, worktree_path
 
 LIVE = ("plan_approved", "executing", "integrating")
 STOP_POLL_S = 0.5   # how often the main loop reads a stop request from the store
@@ -248,12 +249,12 @@ def run_child(argv: list[str], result_file: Path) -> dict:
 @dataclass
 class _Outcome:
     cid: str
-    kind: Literal["done", "pause", "budget", "interrupted", "halted", "error"]
+    kind: Literal["done", "pause", "budget", "interrupted", "halted", "error", "rebase"]   # rebase: _merge to _pipeline only
     reason: str | None = None
     detail: str | None = None
     exc: BaseException | None = None
     evidence: dict | None = None     # the result of the step that paused, kept on the pause record
-    conflict: bool = False           # a merge conflict: resume refuses it until the rebase BUILD exists
+    conflict: bool = False           # a merge conflict: resume leads to the rebase BUILD
 
 
 def run_plan(ctx_factory: Callable[[], object], plan_id: str, echo: Callable[[str], None], stop: threading.Event,
@@ -316,7 +317,8 @@ def _preflight(ctx, plan_id: str, say, dry_run: bool):
     if problems:
         raise RunRefused(problems[0])
     if stored == "integrating":
-        unfinished = [f"{cid} ({db.contract_status(cid)})" for cid in cids if db.contract_status(cid) not in ("verified", "integrated")]
+        unfinished = [f"{cid} ({db.contract_status(cid)})" for cid in cids if db.contract_status(cid) not in ("verified", "integrated")
+                      and not (db.contract_status(cid) == "building" and db.get_meta(f"rebase:{cid}"))]   # a rebase under way
         if unfinished:
             raise RunRefused(f"{plan_id} is integrating but {', '.join(unfinished)} is unfinished; investigate")
     return plan, cs, cids
@@ -574,7 +576,7 @@ class _Run:
         lane, is integrated, so nothing is cut before the work it builds on is merged; a verified contract (stopped
         before its merge) is merged at once."""
         status = db.contract_status(cid)
-        if status == "verified":
+        if status in ("verified", "building"):   # building: only a rebase BUILD an interruption stopped
             return True
         before = [d for d in cs[cid].depends_on if d in self.cids] + ([self.prev[cid]] if self.prev.get(cid) else [])
         return status in ("ready", "failed") and all(db.contract_status(d) == "integrated" for d in before)
@@ -604,8 +606,21 @@ class _Run:
     def _pipeline(self, cid: str) -> _Outcome:
         ctx = self.ctx_factory()
         db = ctx.db
+        rebase: list[str] | None = None   # the conflicting paths while this pipeline runs a rebase BUILD
+        prompt: str | None = None
         if db.contract_status(cid) == "verified":
-            return self._merge(ctx, cid)
+            o = self._merge(ctx, cid)
+            if o.kind != "rebase":
+                return o
+            rebase = o.evidence["paths"]
+        elif db.contract_status(cid) == "building":   # a rebase that an interruption, a pause or a crash stopped
+            with self.gate.exclusive():
+                o = self._continue_rebase(ctx, cid)
+            if isinstance(o, _Outcome):
+                return o
+            rebase = o
+            if rebase is None:   # the merge was concluded; what failed after it gets an ordinary BUILD
+                prompt = _retry_prompt(load_contracts(ctx.paths.contracts)[cid], "the attempt after its rebase was stopped or did not pass")
         c = load_contracts(ctx.paths.contracts)[cid]
         with self.gate.exclusive():
             try:
@@ -623,7 +638,8 @@ class _Run:
         tier = builds[-1]["tier"] if builds and builds[-1]["tier"] in self.tiers else frozen
         escalated = any(a["tier"] != frozen for a in builds)
         allowed = c.budget.attempts
-        prompt: str | None = None
+        if rebase is not None:
+            prompt = _rebase_prompt(c, rebase)
         launched = 0   # BUILDs this pipeline launched that count: one that fails before recording an attempt still does
         while True:
             used = max(len(self._counted_builds(db, cid)), launched)
@@ -638,9 +654,14 @@ class _Run:
                 return _Outcome(cid, "interrupted")
             used += 1
             launched = used
+            if rebase is not None and not self._merge_concluded(db, cid, w):
+                return _Outcome(cid, "pause", "environment_failure", f"{cid} rebase BUILD did not conclude the merge",
+                                evidence=r, conflict=True)
             o = StepOutcome("build", int(r.get("code", 1)), r.get("outcome") or "failed", subtype=r.get("subtype"),
                             refusal=r.get("refusal"))
             d = decide(classify(o), used, allowed, tier, escalated, o.subtype)
+            if rebase is not None and d.action != "continue":   # one attempt: no retry after a rebase BUILD
+                return _Outcome(cid, "pause", "environment_failure", f"{cid} rebase build {o.outcome}", evidence=r)
             if d.action == "pause":
                 return _Outcome(cid, "pause", d.reason, f"{cid} build {o.outcome}" + (f" ({r['error']})" if r.get("error") else ""),
                                 evidence=r)
@@ -664,6 +685,9 @@ class _Run:
                 o = StepOutcome("test", int(r.get("code", 1)), r.get("outcome") or "failed", subtype=r.get("subtype"),
                                 test_class=r.get("test_class"), refusal=r.get("refusal"))
                 d = decide(classify(o), used, allowed, tier, escalated, None, stage="test", stage_used=stage_used + 1)
+                if rebase is not None and d.action != "continue":
+                    return _Outcome(cid, "pause", "environment_failure",
+                                    f"{cid} test {r.get('test_outcome') or o.outcome} after its rebase BUILD", evidence=r)
                 if d.action == "retry_stage":
                     continue
                 if d.action == "pause":
@@ -686,6 +710,9 @@ class _Run:
                 o = StepOutcome("verify", int(v.get("code", 1)), v.get("status") or "failed", verify_status=v.get("status"),
                                 failure_class=v.get("failure_class"), refusal=v.get("refusal"))
                 d = decide(classify(o), used, allowed, tier, escalated, None, stage="verify", stage_used=stage_used + 1)
+                if rebase is not None and d.action != "continue":
+                    return _Outcome(cid, "pause", "environment_failure", f"{cid} verify {v.get('status')} after its rebase BUILD: "
+                                    + "; ".join(v.get("reasons") or []), evidence=v)
                 if d.action == "retry_stage":
                     continue
                 if d.action == "pause":
@@ -700,7 +727,12 @@ class _Run:
             if db.contract_status(cid) != "verified":   # the store, not the child's report, decides what is merged
                 return _Outcome(cid, "pause", "environment_failure",
                                 f"{cid} verify reported verified but the state store says {db.contract_status(cid)}", evidence=v)
-            return self._merge(ctx, cid)
+            o = self._merge(ctx, cid)
+            if o.kind != "rebase":
+                return o
+            rebase, prompt = o.evidence["paths"], _rebase_prompt(c, o.evidence["paths"])
+            with self.gate.exclusive():
+                w = contract_worktree(ctx.paths, db, ctx.git, self.plan_id, cid)   # its base is now the integration tip
 
     def _blocks(self, db, cid: str) -> str:
         """`; blocks C-x, C-y (same lane)` for the unfinished contracts after `cid` in its lane, which build on it."""
@@ -745,10 +777,49 @@ class _Run:
             try:
                 merge_contract(ctx, wt, self.plan_id, cid, self.say)
             except MergeConflict as e:
-                return _Outcome(cid, "pause", "environment_failure", f"{cid} conflicts in {', '.join(e.paths)}",
-                                evidence={"paths": list(e.paths)}, conflict=True)
+                return self._conflict(ctx, cid, list(e.paths))   # inside the exclusive step: the Gate is not reentrant
             self._refresh(ctx)
         return _Outcome(cid, "done")
+
+    def _conflict(self, ctx, cid: str, paths: list[str]) -> _Outcome:
+        """A verified contract's merge conflicted: start its one rebase BUILD (kind `rebase`) or pause as a conflict
+        (owner, 2026-10-27). Runs inside _merge's exclusive step."""
+        db = ctx.db
+        c = load_contracts(ctx.paths.contracts)[cid]
+        uneditable = [p for p in paths if not any(matches(g, p) for g in c.paths)]
+        rebased = rebased_this_window(db, cid)
+        d = decide_conflict(rebased, len(self._counted_builds(db, cid)), c.budget.attempts, uneditable)
+        if d.action == "pause":
+            why = (f"{', '.join(uneditable)} are outside the contract's paths" if uneditable
+                   else "again after its rebase BUILD" if rebased else "no BUILD attempt left")
+            return _Outcome(cid, "pause", d.reason, f"{cid} conflicts in {', '.join(paths)}; {why}", evidence={"paths": paths},
+                            conflict=True)
+        if self.halt.is_set():
+            return _Outcome(cid, "halted")
+        try:
+            _, conflicts = prepare_rebase(ctx.paths, db, ctx.git, self.plan_id, cid, ctx.git.rev_parse(integration_branch(self.plan_id)))
+            tip = json.loads(db.get_meta(f"rebase:{cid}"))["tip"]
+            reopen_for_rebase(ctx, self.plan_id, cid, tip, self.say)
+        except (GitError, WorktreeError, IntentError) as e:
+            return _Outcome(cid, "pause", "environment_failure", f"{cid} rebase could not start: {e}", evidence={"paths": paths},
+                            conflict=True)
+        self.say(f"{cid} conflicts in {', '.join(paths)}; one rebase BUILD onto {tip[:12]}")
+        return _Outcome(cid, "rebase", evidence={"paths": conflicts or paths})
+
+    def _continue_rebase(self, ctx, cid: str) -> list[str] | None | _Outcome:
+        """A contract left building by a rebase: the conflicting paths when its merge is still open (the rebase BUILD
+        runs again), None when the merge was concluded, or a pause. Runs inside an exclusive step."""
+        db = ctx.db
+        try:
+            _, conflicts = prepare_rebase(ctx.paths, db, ctx.git, self.plan_id, cid, ctx.git.rev_parse(integration_branch(self.plan_id)))
+        except (GitError, WorktreeError) as e:
+            return _Outcome(cid, "pause", "environment_failure", f"{cid} rebase could not continue: {e}", conflict=True)
+        return conflicts if GitRepo(worktree_path(ctx.paths, db, cid)).merge_in_progress() else None
+
+    def _merge_concluded(self, db, cid: str, w) -> bool:
+        """The rebase BUILD concluded the merge the scheduler started: none in progress, and HEAD holds the recorded tip."""
+        g = GitRepo(w.path)
+        return not g.merge_in_progress() and g.is_ancestor(json.loads(db.get_meta(f"rebase:{cid}"))["tip"], "HEAD")
 
     def _refresh(self, ctx) -> None:
         rf = self._result_path("refresh", "contracts")
@@ -768,6 +839,13 @@ def _unmet(report: dict | None) -> str:
     verdicts = (report or {}).get("verdicts") or []
     lines = [f"- {v.get('id')}: {v.get('evidence') or v.get('verdict')}" for v in verdicts if v.get("verdict") != "met"]
     return "\n".join(lines) or "- (no evidence reported)"
+
+
+def _rebase_prompt(contract, paths: list[str]) -> str:
+    return (f"Resolve a merge conflict for contract {contract.id}: {contract.title}. The scheduler merged the plan's integration "
+            f"branch into this worktree and left conflict markers in: {', '.join(paths) or '(none left; the merge is still open)'}. "
+            "Resolve them keeping the behaviour of both sides and this contract's intent, change nothing else, and conclude "
+            "the merge with git commit. Follow the brief in your system prompt and end with the structured report.")
 
 
 def _retry_prompt(contract, why: str) -> str:

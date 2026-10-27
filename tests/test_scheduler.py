@@ -63,7 +63,13 @@ class FakeWorkers:
         override = behaviour(self, cid, role, worktree, n) if callable(behaviour) else dict(behaviour)
         result = {"code": 0, "outcome": "completed", "subtype": "success", "error": None, "cost_usd": 0.1,
                   "session_id": "s", "test_outcome": None, "test_class": None, "report": {}}
-        if role == "build" and override.pop("commit", True):
+        commit = override.pop("commit", True)
+        if role == "build" and commit and prompt and "merge conflict" in prompt:
+            g = GitRepo(worktree)   # the rebase BUILD: resolve every conflicted file, then conclude the merge
+            for rel in [p for p in g.run("diff", "--name-only", "--diff-filter=U").splitlines() if p]:
+                (worktree / rel).write_text(f"# {rel} resolved by {cid}\n")
+            g.run("add", "-A"); g.run("commit", "-q", "--no-edit")
+        elif role == "build" and commit:
             name = NAMES[cid]
             (worktree / "src" / name).mkdir(parents=True, exist_ok=True)
             (worktree / "src" / name / f"{name}.py").write_text(f"def {name}():\n    return '{name}'  # {n}\n")
@@ -243,22 +249,6 @@ def test_an_in_flight_reservation_does_not_stop_the_run(plan3):
     _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=2, run_budget_usd=2.0)
     s, out = _run(plan3, FakeWorkers(delay=0.2))
     assert s.outcome == "merge_proposed", out      # two $1 caps in flight wait for each other instead of stopping
-
-
-def test_merge_conflict_pauses_environment_failure_contract_verified(plan3):
-    from ateam.integrate import integration_worktree
-
-    def conflicting_merge_lands_first(fake, cid, role, worktree, n):
-        wt = GitRepo(integration_worktree(plan3.paths, "P-0001"))
-        (wt.root / "src" / "a").mkdir(parents=True, exist_ok=True)
-        (wt.root / "src" / "a" / "a.py").write_text("A = 'someone else'\n")
-        wt.run("add", "-A"); wt.run("commit", "-q", "-m", "a conflicting merge")
-        return {}
-
-    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
-    s, out = _run(plan3, FakeWorkers({("C-0001", "build"): conflicting_merge_lands_first}))
-    assert s.outcome == "paused" and _last_reason(plan3) == "environment_failure: C-0001 conflicts in src/a/a.py; blocks C-0002 (same lane)"
-    assert _db(plan3).contract_status("C-0001") == "verified"
 
 
 def test_stop_interrupts_closes_attempts_and_rerun_continues(plan3):
@@ -466,22 +456,6 @@ def test_a_pause_is_recorded_with_its_contract_and_evidence(plan3):
     [c] = p["contracts"]
     assert c["contract_id"] == "C-0001" and c["evidence"]["test_class"] == "requirements"
     assert c["contract_hash"] == db.contract_hash("C-0001") and db.contract_status("C-0001") == "ready"
-
-
-def test_merge_conflict_pause_is_marked_conflict(plan3):
-    from ateam.integrate import integration_worktree
-
-    def conflicting_merge_lands_first(fake, cid, role, worktree, n):
-        wt = GitRepo(integration_worktree(plan3.paths, "P-0001"))
-        (wt.root / "src" / "a").mkdir(parents=True, exist_ok=True)
-        (wt.root / "src" / "a" / "a.py").write_text("A = 'someone else'\n")
-        wt.run("add", "-A"); wt.run("commit", "-q", "-m", "a conflicting merge")
-        return {}
-
-    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
-    s, out = _run(plan3, FakeWorkers({("C-0001", "build"): conflicting_merge_lands_first}))
-    p = _db(plan3).open_pause("P-0001")
-    assert s.outcome == "paused" and p["conflict"] is True and p["contracts"][0]["contract_id"] == "C-0001"
 
 
 def test_a_window_refreshes_attempts_and_escalation(plan3):
@@ -721,12 +695,12 @@ def _report_lanes():
     return r
 
 
-def _approve_lanes(target_repo, monkeypatch, check="true", max_workers=2):
+def _approve_lanes(target_repo, monkeypatch, check="true", max_workers=2, report=None):
     """C-0001 and C-0002 share src/shared/** (one lane); C-0003 is a lane of one. No dependencies. The check's command
     is frozen into the contracts at approval."""
     paths = TargetPaths.from_root(target_repo)
     _set_config(paths, checks=[NamedCheck(name="unit", cmd=check)], max_workers=max_workers)
-    _fake_planner(monkeypatch, _report_lanes())
+    _fake_planner(monkeypatch, report or _report_lanes())
     assert run("plan", "lanes", "--no-review", "--target", str(target_repo)).exit_code == 0
     r = run("approve", "P-0001", "--skip-records", "--target", str(target_repo))
     assert r.exit_code == 0
@@ -823,3 +797,204 @@ def test_investigation_runs_in_the_lane_worktree_and_status_names_it(plan_lanes)
     r = run("status", "P-0001", "--target", str(plan_lanes.root))
     assert f"worktree: {lane}" in r.output
     assert "lane 1: C-0001 -> C-0002" in r.output and "lane 2: C-0003" in r.output
+
+
+# ---- the rebase BUILD (2026-10-27-lanes-design.md, rulings 6-9 and 12)
+
+def _land_on_integration(p, rel, text):
+    """Another merge lands on ateam/P-0001 that touches `rel`, as a lane the overlap test missed would."""
+    from ateam.integrate import integration_worktree
+    wt = GitRepo(integration_worktree(p.paths, "P-0001"))
+    (wt.root / rel).parent.mkdir(parents=True, exist_ok=True)
+    (wt.root / rel).write_text(text)
+    wt.run("add", "-A"); wt.run("commit", "-q", "-m", f"another merge touches {rel}")
+    return wt.head()
+
+
+def _conflict_during(p, rel="src/a/a.py", text="A = 'someone else'\n", extra=None):
+    def lands(fake, cid, role, worktree, n):
+        fake.tips = getattr(fake, "tips", []) + [_land_on_integration(p, rel, text)]
+        return dict(extra or {})
+    return lands
+
+
+def _builds(fake, cid):
+    return [c for c in fake.calls if c[0] == cid and c[1] == "build"]
+
+
+def _rebase_builds(fake, cid):
+    return [c for c in _builds(fake, cid) if c[3] and "merge conflict" in c[3]]
+
+
+def _interrupting(stop):
+    def interrupted(fake, cid, role, worktree, n):
+        stop.set()
+        return {"code": 130, "outcome": "interrupted", "commit": False}
+    return interrupted
+
+
+def test_a_merge_conflict_gets_one_rebase_build_then_test_verify_and_merge(plan3):
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    fake = FakeWorkers({("C-0001", "build", 0): _conflict_during(plan3)})
+    s, out = _run(plan3, fake)
+    assert s.outcome == "merge_proposed", out
+    db = _db(plan3)
+    rebases = _rebase_builds(fake, "C-0001")
+    assert len(rebases) == 1 and "src/a/a.py" in rebases[0][3] and len(_builds(fake, "C-0001")) == 2
+    assert [c[1] for c in fake.calls if c[0] == "C-0001"] == ["build", "test", "build", "test"]
+    reopened = [t for t in db.transitions("contract", "C-0001") if t["from_status"] == "verified" and t["to_status"] == "building"]
+    assert len(reopened) == 1 and reopened[0]["reason"].startswith("rebase onto")
+    assert db.get_meta("base:C-0001") == fake.tips[0] and rebases[0][5] == fake.tips[0]
+    assert load_contracts(plan3.paths.contracts)["C-0001"].status == "integrated" and db.open_pause("P-0001") is None
+
+
+def test_a_second_conflict_pauses_as_a_conflict(plan3):
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    fake = FakeWorkers({("C-0001", "build", 0): _conflict_during(plan3),
+                        ("C-0001", "build", 1): _conflict_during(plan3, text="A = 'someone else again'\n")})
+    s, out = _run(plan3, fake)
+    pause = _db(plan3).open_pause("P-0001")
+    assert s.outcome == "paused" and pause["conflict"] is True, out
+    assert pause["contracts"][0]["detail"].startswith("C-0001 conflicts in src/a/a.py; again after its rebase BUILD")
+    assert _db(plan3).contract_status("C-0001") == "verified" and len(_rebase_builds(fake, "C-0001")) == 1
+
+
+def test_a_conflict_with_no_attempt_left_pauses(plan3):
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    allowed = load_contracts(plan3.paths.contracts)["C-0001"].budget.attempts
+    script = {("C-0001", "build", n): {"code": 3, "outcome": "scope_breach", "commit": False} for n in range(allowed - 1)}
+    script[("C-0001", "build", allowed - 1)] = _conflict_during(plan3)
+    fake = FakeWorkers(script)
+    s, out = _run(plan3, fake)
+    pause = _db(plan3).open_pause("P-0001")
+    assert s.outcome == "paused" and pause["conflict"] is True, out
+    assert pause["contracts"][0]["detail"].startswith("C-0001 conflicts in src/a/a.py; no BUILD attempt left")
+    assert _rebase_builds(fake, "C-0001") == []
+
+
+def test_a_conflict_in_an_incidental_path_pauses_without_a_rebase(target_repo, monkeypatch):
+    report = _report_lanes()
+    report["contracts"][0]["incidental"] = ["shared.lock"]
+    p = _approve_lanes(target_repo, monkeypatch, max_workers=1, report=report)
+
+    def lock_and_conflict(fake, cid, role, worktree, n):
+        (worktree / "shared.lock").write_text("mine\n")
+        return _conflict_during(p, rel="shared.lock", text="theirs\n")(fake, cid, role, worktree, n)
+
+    fake = FakeWorkers({("C-0001", "build", 0): lock_and_conflict})
+    s, out = _run(p, fake)
+    pause = _db(p).open_pause("P-0001")
+    assert s.outcome == "paused" and pause["conflict"] is True, out
+    assert "shared.lock are outside the contract's paths" in pause["contracts"][0]["detail"]
+    assert _rebase_builds(fake, "C-0001") == []
+
+
+def test_a_rebase_build_that_leaves_the_merge_open_pauses(plan3):
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    fake = FakeWorkers({("C-0001", "build", 0): _conflict_during(plan3), ("C-0001", "build", 1): {"commit": False}})
+    s, out = _run(plan3, fake)
+    pause = _db(plan3).open_pause("P-0001")
+    assert s.outcome == "paused" and pause["conflict"] is True, out
+    assert pause["contracts"][0]["detail"].startswith("C-0001 rebase BUILD did not conclude the merge")
+    assert [c[1] for c in fake.calls if c[0] == "C-0001"] == ["build", "test", "build"]
+
+
+def _failed_test_after_rebase(plan3):
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    fake = FakeWorkers({("C-0001", "build", 0): _conflict_during(plan3),
+                        ("C-0001", "test", 1): {"code": 5, "outcome": "failed", "test_class": "implementation"}})
+    return fake, _run(plan3, fake)
+
+
+def test_a_failed_test_after_the_rebase_pauses_without_retry(plan3):
+    fake, (s, out) = _failed_test_after_rebase(plan3)
+    pause = _db(plan3).open_pause("P-0001")
+    assert s.outcome == "paused" and pause["reason"] == "environment_failure", out
+    assert len(_rebase_builds(fake, "C-0001")) == 1 and len(_builds(fake, "C-0001")) == 2
+    assert _db(plan3).contract_status("C-0001") == "building"
+
+
+def test_a_failed_test_after_the_rebase_resumes_with_an_ordinary_build(plan3):
+    _failed_test_after_rebase(plan3)
+    r = run("resume", "P-0001", "--no-run", "--target", str(plan3.root))
+    assert r.exit_code == 0, r.output
+    fake = FakeWorkers()
+    s, out = _run(plan3, fake)
+    assert s.outcome == "merge_proposed", out
+    prompt = _builds(fake, "C-0001")[0][3]
+    assert "merge conflict" not in prompt and "did not pass" in prompt
+
+
+def test_a_rebase_interrupted_by_stop_continues_on_rerun(plan3):
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    stop = threading.Event()
+    s, out = _run(plan3, FakeWorkers({("C-0001", "build", 0): _conflict_during(plan3), ("C-0001", "build", 1): _interrupting(stop)}),
+                  stop=stop)
+    assert s.outcome == "interrupted" and _db(plan3).contract_status("C-0001") == "building", out
+    fake = FakeWorkers()
+    s, out = _run(plan3, fake)
+    assert s.outcome == "merge_proposed", out
+    assert "merge conflict" in _builds(fake, "C-0001")[0][3]
+
+
+def test_a_crash_after_preparing_the_rebase_still_runs_it(plan3, monkeypatch):
+    import ateam.scheduler as sch
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+
+    def killed(*a, **k):
+        raise SystemExit("killed between preparing the rebase and reopening the contract")
+
+    with monkeypatch.context() as m:
+        m.setattr(sch, "reopen_for_rebase", killed)
+        with pytest.raises(SystemExit):
+            _run(plan3, FakeWorkers({("C-0001", "build", 0): _conflict_during(plan3)}))
+    assert _db(plan3).contract_status("C-0001") == "verified"
+    assert GitRepo(home_dir(plan3.root) / "worktrees" / "C-0001").merge_in_progress()
+    fake = FakeWorkers()
+    s, out = _run(plan3, fake)
+    assert s.outcome == "merge_proposed", out
+    assert len(_rebase_builds(fake, "C-0001")) == 1
+
+
+def test_a_rebase_that_cannot_start_pauses(plan3, monkeypatch):
+    import ateam.scheduler as sch
+    from ateam.gitops import GitError
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+
+    def refuses(*a, **k):
+        raise GitError("untracked working tree files would be overwritten by merge")
+
+    with monkeypatch.context() as m:
+        m.setattr(sch, "prepare_rebase", refuses)
+        fake = FakeWorkers({("C-0001", "build", 0): _conflict_during(plan3)})
+        s, out = _run(plan3, fake)
+    pause = _db(plan3).open_pause("P-0001")
+    assert s.outcome == "paused" and pause["conflict"] is True, out
+    assert pause["contracts"][0]["detail"].startswith("C-0001 rebase could not start: untracked working tree files")
+    assert _db(plan3).contract_status("C-0001") == "verified" and _rebase_builds(fake, "C-0001") == []
+
+
+def test_a_rebased_lane_head_is_the_follower_base(plan_lanes):
+    fake = FakeWorkers({("C-0001", "build", 0): _conflict_during(plan_lanes)})
+    s, out = _run(plan_lanes, fake)
+    assert s.outcome == "merge_proposed", out
+    db = _db(plan_lanes)
+    lane = home_dir(plan_lanes.root) / "worktrees" / "C-0001"
+    b_build = _builds(fake, "C-0002")[0]
+    assert b_build[4] == lane and b_build[5] == db.latest_checkpoint("C-0001")["head"]
+    assert GitRepo(lane).is_ancestor(fake.tips[0], b_build[5])   # the rebased head contains the other merge
+
+
+def test_an_integrating_rerun_continues_a_rebase(plan3):
+    from ateam.plans.ops import set_plan_status
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    stop = threading.Event()
+    s, out = _run(plan3, FakeWorkers({("C-0002", "build", 0): _conflict_during(plan3, rel="src/b/b.py"),
+                                      ("C-0002", "build", 1): _interrupting(stop)}), stop=stop)
+    db = _db(plan3)   # C-0002 merges last: the others are integrated, as a hand-run integrate would need
+    assert s.outcome == "interrupted" and db.contract_status("C-0002") == "building", out
+    assert db.contract_status("C-0001") == db.contract_status("C-0003") == "integrated"
+    ctx = Context(plan3.root)
+    set_plan_status(ctx.paths, ctx.db, load_plans(ctx.paths.plans)["P-0001"], ["integrating"], by="integrate")
+    s, out = _run(plan3, FakeWorkers())
+    assert s.outcome == "merge_proposed", out
