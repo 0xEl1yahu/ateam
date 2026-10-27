@@ -14,12 +14,12 @@ from typing import Literal
 from ateam.tiers import ORDER
 
 PAUSE_REASONS = {"decision_change_needed", "scope_exceeded", "budget_exhausted", "verification_unresolvable",
-                 "sensitive_action", "environment_failure", "records_drifted"}
+                 "sensitive_action", "environment_failure", "records_drifted", "owner_stopped"}
 
 ESCALATION_EVIDENCE = "error_max_turns"
 _IMPLEMENTATION_SUBTYPES = {"error_max_turns", "error_max_budget_usd"}   # the session ran out of turns or money
-_PAUSE_NOW = {"requirements": "decision_change_needed", "refused": "decision_change_needed",
-              "tamper": "verification_unresolvable", "not_binding": "records_drifted"}
+_PAUSE_NOW = {"requirements": "decision_change_needed", "drifted": "records_drifted", "not_binding": "verification_unresolvable",
+              "refused": "environment_failure", "tamper": "verification_unresolvable"}
 _EXHAUSTED = {"environment": "environment_failure", "scope_breach": "scope_exceeded", "implementation": "budget_exhausted"}
 
 
@@ -32,6 +32,7 @@ class StepOutcome:
     test_class: str | None = None
     verify_status: str | None = None
     failure_class: str | None = None
+    refusal: str | None = None   # records_drifted, not_binding, intent_dirty or other, from the result file
 
 
 @dataclass(frozen=True)
@@ -47,15 +48,17 @@ def next_tier(tier: str) -> str | None:
 
 
 def classify(o: StepOutcome) -> str:
-    """ok, implementation, environment, requirements, tamper, not_binding, refused or scope_breach."""
+    """ok, implementation, environment, requirements, tamper, drifted, not_binding, refused or scope_breach."""
     if o.stage == "verify":
         if o.verify_status == "verified":
             return "ok"
         if o.verify_status == "refused":
-            return "refused"
+            return {"records_drifted": "drifted", "not_binding": "not_binding"}.get(o.refusal or "", "refused")
         return {"tamper": "tamper", "environment": "environment"}.get(o.failure_class or "", "implementation")
     if o.outcome == "tamper":
         return "tamper"
+    if o.refusal == "records_drifted":
+        return "drifted"
     if o.outcome == "not_binding" or o.code == 4:
         return "not_binding"
     if o.outcome == "setup_failed":

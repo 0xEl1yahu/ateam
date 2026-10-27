@@ -444,7 +444,8 @@ class _Run:
             if r.get("outcome") == "interrupted" or self.stop.is_set():
                 return _Outcome(cid, "interrupted")
             used += 1
-            o = StepOutcome("build", int(r.get("code", 1)), r.get("outcome") or "failed", subtype=r.get("subtype"))
+            o = StepOutcome("build", int(r.get("code", 1)), r.get("outcome") or "failed", subtype=r.get("subtype"),
+                            refusal=r.get("refusal"))
             d = decide(classify(o), used, allowed, tier, escalated, o.subtype)
             if d.action == "pause":
                 return _Outcome(cid, "pause", d.reason, f"{cid} build {o.outcome}" + (f" ({r['error']})" if r.get("error") else ""))
@@ -466,7 +467,7 @@ class _Run:
                 if r.get("outcome") == "interrupted" or self.stop.is_set():
                     return _Outcome(cid, "interrupted")
                 o = StepOutcome("test", int(r.get("code", 1)), r.get("outcome") or "failed", subtype=r.get("subtype"),
-                                test_class=r.get("test_class"))
+                                test_class=r.get("test_class"), refusal=r.get("refusal"))
                 d = decide(classify(o), used, allowed, tier, escalated, None, stage="test", stage_used=stage_used + 1)
                 if d.action == "retry_stage":
                     continue
@@ -488,7 +489,7 @@ class _Run:
                                     "--target", str(ctx.paths.root)], rf)
                 self.say(f"{cid} verify {v.get('status')}" + (f" ({v['failure_class']})" if v.get("failure_class") else ""))
                 o = StepOutcome("verify", int(v.get("code", 1)), v.get("status") or "failed", verify_status=v.get("status"),
-                                failure_class=v.get("failure_class"))
+                                failure_class=v.get("failure_class"), refusal=v.get("refusal"))
                 d = decide(classify(o), used, allowed, tier, escalated, None, stage="verify", stage_used=stage_used + 1)
                 if d.action == "retry_stage":
                     continue

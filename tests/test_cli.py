@@ -2318,10 +2318,11 @@ def test_verify_result_file_marks_refusals_and_verdicts(cli_target, tmp_path):
     r = run("verify", "C-0001", "--cwd", str(wt), "--result-file", str(out), "--target", str(cli_target))
     d = _read(out)
     assert r.exit_code == 1 and d["status"] == "refused" and d["failure_class"] is None and "uncommitted" in d["reasons"][0]
+    assert d["refusal"] == "other"
     GitRepo(wt).run("checkout", "--", "src/api/x.py")
     _do_work(wt)
     r = run("verify", "C-0001", "--cwd", str(wt), "--result-file", str(out), "--target", str(cli_target))
-    assert r.exit_code == 0 and _read(out) == {"code": 0, "status": "verified", "failure_class": None, "reasons": []}
+    assert r.exit_code == 0 and _read(out) == {"code": 0, "status": "verified", "failure_class": None, "reasons": [], "refusal": None}
 
 
 def test_refresh_result_file(monkeypatch, cli_target, tmp_path):
@@ -2420,3 +2421,22 @@ def test_stale_run_lock_refusal_names_the_dead_process(cli_target):
     r = run("reject", "P-0001", "no", "--target", str(cli_target))
     assert r.exit_code == 4, r.output
     assert f"the run lock names P-0007 (pid {pid}), a process that is gone; remove the lock by hand" in r.output
+
+
+def test_verify_result_file_names_the_refusal(cli_target, tmp_path):
+    import json
+
+    from ateam.contracts.store import save_contract
+
+    wt = _verify_setup(cli_target, tmp_path, [("unit", "true")])
+    paths = TargetPaths.from_root(cli_target)
+    rf = tmp_path / "v.json"
+    (paths.intent / "stray.txt").write_text("x\n")
+    r = run("verify", "C-0001", "--cwd", str(wt), "--target", str(cli_target), "--result-file", str(rf))
+    assert r.exit_code == 4 and json.loads(rf.read_text())["refusal"] == "intent_dirty"
+    (paths.intent / "stray.txt").unlink()
+    c = load_contracts(paths.contracts)["C-0001"]
+    save_contract(paths.contracts, c.model_copy(update={"title": "edited by hand"}))
+    commit_intent(paths, "hand edit", ["contracts"])
+    r = run("verify", "C-0001", "--cwd", str(wt), "--target", str(cli_target), "--result-file", str(rf))
+    assert r.exit_code == 4 and json.loads(rf.read_text())["refusal"] == "not_binding"

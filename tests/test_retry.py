@@ -39,9 +39,10 @@ def test_classify_table(o, cls):
     ("environment", 3, Decision("pause", "standard", "environment_failure")),
     ("scope_breach", 3, Decision("pause", "standard", "scope_exceeded")),
     ("requirements", 1, Decision("pause", "standard", "decision_change_needed")),
-    ("refused", 1, Decision("pause", "standard", "decision_change_needed")),
+    ("refused", 1, Decision("pause", "standard", "environment_failure")),
+    ("drifted", 1, Decision("pause", "standard", "records_drifted")),
     ("tamper", 1, Decision("pause", "standard", "verification_unresolvable")),
-    ("not_binding", 1, Decision("pause", "standard", "records_drifted")),
+    ("not_binding", 1, Decision("pause", "standard", "verification_unresolvable")),
 ])
 def test_decide_table(cls, used, expected):
     assert decide(cls, build_attempts_used=used, attempts_allowed=3, tier="standard", escalated=False, last_subtype=None) == expected
@@ -59,8 +60,8 @@ def test_escalation_once_and_never_above_careful():
 
 def test_pause_reasons_are_the_spec_enum():
     assert PAUSE_REASONS == {"decision_change_needed", "scope_exceeded", "budget_exhausted", "verification_unresolvable",
-                             "sensitive_action", "environment_failure", "records_drifted"}
-    for cls in ("implementation", "environment", "scope_breach", "requirements", "refused", "tamper", "not_binding"):
+                             "sensitive_action", "environment_failure", "records_drifted", "owner_stopped"}
+    for cls in ("implementation", "environment", "scope_breach", "requirements", "refused", "tamper", "not_binding", "drifted"):
         d = decide(cls, 3, 3, "standard", False, None)
         assert d.action == "pause" and d.reason in PAUSE_REASONS
 
@@ -75,3 +76,21 @@ def test_environment_at_test_or_verify_retries_that_stage():
 def test_a_tampered_session_classifies_as_tamper():
     assert classify(StepOutcome("build", 0, "tamper")) == "tamper"
     assert classify(StepOutcome("test", 0, "tamper")) == "tamper"
+
+
+@pytest.mark.parametrize("stage,code,outcome,status,refusal,reason", [
+    ("verify", 4, "refused", "refused", "records_drifted", "records_drifted"),
+    ("verify", 4, "refused", "refused", "not_binding", "verification_unresolvable"),
+    ("verify", 4, "refused", "refused", "intent_dirty", "environment_failure"),
+    ("verify", 1, "refused", "refused", "other", "environment_failure"),
+    ("build", 4, "not_binding", None, "records_drifted", "records_drifted"),
+    ("build", 4, "not_binding", None, "not_binding", "verification_unresolvable"),
+    ("build", 1, "refused", None, "other", "environment_failure"),
+])
+def test_refusals_pause_with_their_cause(stage, code, outcome, status, refusal, reason):
+    o = StepOutcome(stage, code, outcome, verify_status=status, refusal=refusal)
+    assert decide(classify(o), 0, 2, "light", False, None, stage=stage, stage_used=1).reason == reason
+
+
+def test_owner_stopped_is_a_pause_reason():
+    assert "owner_stopped" in PAUSE_REASONS

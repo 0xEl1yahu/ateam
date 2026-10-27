@@ -98,6 +98,8 @@ class _Result:
                     data["error"] = f"{type(exc).__name__}: {exc}"
                 if "cost_usd" in data:
                     data["cost_usd"] = None   # unknown: the scheduler counts the session's whole cap
+            if "refusal" in data and data["refusal"] is None and "refused" in (data.get("status"), data.get("outcome")):
+                data["refusal"] = "other"
             if _LAST_FAIL and "reasons" in data and not data["reasons"]:
                 data["reasons"] = list(_LAST_FAIL)
             if _LAST_FAIL and "error" in data and data["error"] is None:
@@ -1627,6 +1629,7 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
     import asyncio
     import json
 
+    from ateam.contracts.select import drift
     from ateam.contracts.store import load_contracts
     from ateam.records.store import load_records
     from ateam.roles import Role
@@ -1636,7 +1639,7 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
     from ateam.runner.binding import ContractNotBinding, require_binding
 
     with _Result(result_file, {"outcome": "refused", "subtype": None, "error": None, "cost_usd": 0.0, "session_id": None,
-                               "test_outcome": None, "test_class": None, "report": None}) as out:
+                               "test_outcome": None, "test_class": None, "report": None, "refusal": None}) as out:
         ctx = _context(target)
         cs = load_contracts(ctx.paths.contracts)
         if contract_id not in cs:
@@ -1647,6 +1650,7 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
             require_binding(contract, records, ctx.db)   # before setup: a contract that does not bind never provisions a worktree
         except ContractNotBinding as e:
             out["outcome"] = "not_binding"
+            out["refusal"] = "records_drifted" if drift(contract, records) else "not_binding"
             _fail(str(e), code=4)
         wt_git = _require_isolated_worktree(ctx, worktree)
         worktree = wt_git.root
@@ -1667,6 +1671,7 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
             ))
         except ContractNotBinding as e:
             out["outcome"] = "not_binding"
+            out["refusal"] = "records_drifted" if drift(contract, records) else "not_binding"
             _fail(str(e), code=4)
         except ValueError as e:
             _fail(str(e))
@@ -1714,6 +1719,7 @@ def verify(contract_id: str, worktree: Path, base_rev: str | None, result_file: 
     from ateam import verify as v
     from ateam.checkpoint import Checkpoint
     from ateam.contracts.model import ContractStatus
+    from ateam.contracts.select import drift
     from ateam.contracts.store import load_contracts, save_contract
     from ateam.gitops import GitError
     from ateam.intent import intent_git
@@ -1722,7 +1728,7 @@ def verify(contract_id: str, worktree: Path, base_rev: str | None, result_file: 
     from ateam.runner.run import default_base
     from ateam.treecheck import scope_check, tree_state
 
-    with _Result(result_file, {"status": "refused", "failure_class": None, "reasons": []}) as out:
+    with _Result(result_file, {"status": "refused", "failure_class": None, "reasons": [], "refusal": None}) as out:
         ctx = _context(target)
         cs = load_contracts(ctx.paths.contracts)
         if contract_id not in cs:
@@ -1788,10 +1794,15 @@ def verify(contract_id: str, worktree: Path, base_rev: str | None, result_file: 
 
         if contract.status == ContractStatus.paused:
             _fail(f"{contract_id} is paused; the owner resumes it before it is verified", code=4)
+        records = load_records(ctx.paths.records)
         try:
-            require_binding(contract, load_records(ctx.paths.records), ctx.db)
+            require_binding(contract, records, ctx.db)
             require_clean(ctx.paths)
         except (ContractNotBinding, IntentError) as e:
+            if isinstance(e, ContractNotBinding):
+                out["refusal"] = "records_drifted" if drift(contract, records) else "not_binding"
+            else:
+                out["refusal"] = "intent_dirty"
             _fail(str(e), code=4)
         if not contract.checks:
             _fail(f"minimal verify needs at least one deterministic check; {contract_id} has none")
