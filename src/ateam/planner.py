@@ -133,9 +133,88 @@ _SYMBOL = r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*"
 _GROUPED_SYMBOLS = re.compile(rf"{_SYMBOL}(?:(?:\s*,\s*|\s+/\s+){_SYMBOL})+")
 
 
-def _interface_notes(raw: list[dict], ids: list[str], interfaces: list[list[Interface]], repo_root: Path, files_read: list[str]) -> list[str]:
+def _same_signature(a: Interface, b: Interface) -> bool:
+    ha, hb = a.code_header(), b.code_header()
+    if ha is not None and hb is not None:
+        return ha == hb
+    return " ".join(a.signature.split()) == " ".join(b.signature.split())
+
+
+def _producers(contracts: list[Contract]) -> dict[str, list[tuple[Contract, Interface]]]:
+    out: dict[str, list[tuple[Contract, Interface]]] = {}
+    for c in contracts:
+        for itf in c.interfaces:
+            if itf.kind == "produces":
+                out.setdefault(itf.name, []).append((c, itf))
+    return out
+
+
+def shape_problems(contracts: list[Contract]) -> list[str]:
+    """Whole-plan rules for shared shapes: one producer per name, matching consumers, and a direct dependency on the producer."""
+    problems: list[str] = []
+    producers = _producers(contracts)
+    for name, prods in producers.items():
+        if len(prods) > 1:
+            problems.append(f"{' and '.join(c.id for c, _ in prods)} both produce `{name}`; one contract must own it")
+    for c in contracts:
+        for itf in c.interfaces:
+            if itf.kind != "consumes":
+                continue
+            others = [(p, pi) for p, pi in producers.get(itf.name, []) if p.id != c.id]
+            if not others:
+                continue
+            prod, pitf = others[0]
+            if not _same_signature(pitf, itf):
+                problems.append(f"{c.id} consumes `{itf.signature}` but {prod.id} produces `{pitf.signature}`")
+            if prod.id not in c.depends_on:
+                problems.append(f"{c.id} consumes `{itf.name}` from {prod.id} but does not list {prod.id} in depends_on")
+    return problems
+
+
+def _shapes(contracts: list[Contract]) -> list[dict]:
+    shapes = []
+    for name, prods in _producers(contracts).items():
+        prod, pitf = prods[0]
+        consumers = [c.id for c in contracts if c.id != prod.id and any(i.kind == "consumes" and i.name == name for i in c.interfaces)]
+        if consumers:
+            shapes.append({"name": name, "signature": pitf.signature, "producer": prod.id, "consumers": consumers})
+    return shapes
+
+
+def shapes_table(contracts: list[Contract]) -> list[str]:
+    shapes = _shapes(contracts)
+    problems = shape_problems(contracts)
+    if shapes:
+        lines = ["Shared shapes:"]
+        lines += [f"  {s['name']}: {s['signature']}  (produced by {s['producer']}; consumed by {', '.join(s['consumers'])})" for s in shapes]
+    else:
+        lines = ["Shared shapes: none (no contract consumes what another produces)"]
+    if problems:
+        lines.append("  Shape problems (these make `ateam approve` refuse the plan):")
+        lines += [f"    - {p}" for p in problems]
+    return lines
+
+
+_CODE_NAME = re.compile(rf"{_SYMBOL}(?:\(.*\))?")
+
+
+def signature_form_notes(contracts: list[Contract]) -> list[str]:
+    """Notes for code-like interfaces whose signature is not a def/class header line. Never blocking."""
     notes: list[str] = []
-    produced: dict[str, tuple[str, str]] = {}   # name -> (contract id, signature), from earlier contracts only
+    for c in contracts:
+        for itf in c.interfaces:
+            if itf.code_header() is not None:
+                continue
+            name = itf.name.strip()
+            if name.startswith("-") or not _CODE_NAME.fullmatch(name) or not ("(" in name or "(" in itf.signature):
+                continue
+            notes.append(f"{c.id} {itf.kind} `{itf.signature}`: write code signatures as a header line, e.g. `def name(args) -> Type:`")
+    return notes
+
+
+def _interface_notes(raw: list[dict], ids: list[str], interfaces: list[list[Interface]], repo_root: Path, files_read: list[str],
+                     plan_produced: frozenset[str] = frozenset()) -> list[str]:
+    notes: list[str] = []
     for i, ifs in enumerate(interfaces):
         text: str | None = None
         definitions: set[str] = set()
@@ -145,20 +224,14 @@ def _interface_notes(raw: list[dict], ids: list[str], interfaces: list[list[Inte
             if _GROUPED_SYMBOLS.fullmatch(itf.name.strip()):
                 notes.append(f"{ids[i]} consumes `{itf.name}`: declare one interface per entry with its exact signature")
                 continue
-            prior = produced.get(itf.name)
-            if prior is not None:
-                if " ".join(prior[1].split()) != " ".join(itf.signature.split()):
-                    notes.append(f"{ids[i]} consumes `{itf.signature}` but {prior[0]} produces `{prior[1]}`")
-                continue
+            if itf.name in plan_produced:
+                continue   # the plan's own producer: shape_problems checks it
             if text is None:
                 scope = [*raw[i].get("paths", []), *raw[i].get("incidental", [])]
                 text, definitions = _search_interfaces(repo_root, scope, files_read)
             if itf.name not in definitions and itf.name not in text:
                 notes.append(f"{ids[i]} consumes `{itf.name}`: could not verify it in earlier contracts or the searched files; "
                              "check the name and include its defining file in files_read")
-        for itf in ifs:
-            if itf.kind == "produces":
-                produced[itf.name] = (ids[i], itf.signature)
     return notes
 
 
@@ -322,7 +395,8 @@ def report_to_plan(
             acceptance=acceptance, interfaces=interfaces, checks=[known_checks[n] for n in c.get("checks", [])], allocation=alloc, budget=budget,
         ))
 
-    notes.extend(_interface_notes(raw, ids, all_interfaces, repo_root, list(report.get("files_read") or [])))
+    plan_produced = frozenset(itf.name for ifs in all_interfaces for itf in ifs if itf.kind == "produces")
+    notes.extend(_interface_notes(raw, ids, all_interfaces, repo_root, list(report.get("files_read") or []), plan_produced))
 
     proposed = candidates_to_records(
         list(report.get("proposed_records") or []), list(report.get("unknowns") or []), records, repo_root, records_dir,
@@ -352,6 +426,8 @@ def render_draft(result: PlanResult) -> str:
                              for r in result.proposed.proposed],
         "bound_records": {cid: list(rids) for cid, rids in result.bound_preview.items()},
         "corrections_and_warnings": list(result.problems),
+        "shared_shapes": _shapes(result.contracts),
+        "shape_conflicts": shape_problems(result.contracts),
         "contracts": [c.model_dump(mode="json") for c in result.contracts],
     }
     return yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
@@ -412,6 +488,9 @@ def render_plan_review(result: PlanResult, tiers) -> str:
         bound = result.bound_preview.get(c.id, [])
         lines.append("  bound records: " + (", ".join(bound) if bound else "none (no approved records apply)"))
         lines.append("")
+    lines.extend(shapes_table(result.contracts))
+    lines.extend(f"  Note: {n}" for n in signature_form_notes(result.contracts))
+    lines.append("")
     lines.append("Depends on plans: " + (", ".join(p.depends_on_plans) or "none"))
     shown = p.files_read[:20]
     lines.append(f"Files read ({len(p.files_read)}):" + (" " + ", ".join(shown) + (", ..." if len(p.files_read) > 20 else "") if shown else " none"))

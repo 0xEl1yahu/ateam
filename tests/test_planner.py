@@ -245,7 +245,9 @@ def test_interface_signature_mismatch_is_a_note(target_repo, target_paths, recor
     rep = report(_with(contract("First"), _ifc("produces", "foo", "foo(a)")),
                  _with(contract("Second", deps=[0]), _ifc("consumes", "foo", "foo(a, b)")))
     r = report_to_plan(rep, "x", "P-0001", target_paths.contracts, records_three, CFG, target_repo, target_paths.records)
-    assert "C-0002 consumes `foo(a, b)` but C-0001 produces `foo(a)`" in r.problems
+    from ateam.planner import shape_problems
+    assert shape_problems(r.contracts) == ["C-0002 consumes `foo(a, b)` but C-0001 produces `foo(a)`"]
+    assert not any("but C-0001 produces" in n for n in r.problems)   # reported once, as a shape problem
     assert [i.name for i in r.contracts[0].interfaces] == ["foo"] and r.contracts[1].interfaces[0].kind == "consumes"
 
 
@@ -394,3 +396,73 @@ def test_contract_refs_skip_other_plans_and_structural_fields(target_repo, targe
     assert r.contracts[1].acceptance[0].statement == "P-0002's contract 1 owns the schema; this plan's C-0001 adds the helper"
     assert r.plan.unknowns == ["see plan contract 1 in P-0002"]
     assert r.contracts[1].acceptance[0].check.ref == "tests/test_routes.py::RoutesTest::test_health"
+
+
+# ---- whole-plan shared shapes (C-0082)
+
+def _c(cid, deps, *ifaces):
+    from ateam.contracts.model import Allocation, Budget, Contract, Interface
+    return Contract(
+        id=cid, plan="P-0001", title=cid, status=ContractStatus.draft, depends_on=list(deps), paths=["src/**"], acceptance=[], checks=[],
+        interfaces=[Interface(kind=k, name=n, signature=sg) for k, n, sg in ifaces],
+        allocation=Allocation(complexity="low", risk="low", uncertainty="low", reasoning="r", tier={"build": "light"}), budget=Budget())
+
+
+@pytest.mark.parametrize("contracts,expected", [
+    ([_c("C-0001", [], ("produces", "f", "def f(a) -> T:")), _c("C-0002", ["C-0001"], ("consumes", "f", "def f(a) -> T:"))], []),
+    ([_c("C-0001", [], ("produces", "f", "def f( a ) -> T:")), _c("C-0002", ["C-0001"], ("consumes", "f", "def f(a) -> T:"))], []),
+    ([_c("C-0001", [], ("produces", "f", "f(a)")), _c("C-0002", ["C-0001"], ("consumes", "f", "f(a,  b)"))],
+     ["C-0002 consumes `f(a,  b)` but C-0001 produces `f(a)`"]),
+    ([_c("C-0001", [], ("produces", "f", "f(a)")), _c("C-0002", [], ("produces", "f", "f(a)"))], ["C-0001 and C-0002 both produce `f`"]),
+    ([_c("C-0001", [], ("produces", "f", "f(a)")), _c("C-0002", [], ("consumes", "f", "f(a)"))], ["does not list C-0001"]),
+    ([_c("C-0001", ["C-0002"], ("consumes", "f", "f(a)")), _c("C-0002", [], ("produces", "f", "f(a)"))], []),
+    ([_c("C-0001", [], ("consumes", "g", "g()"))], []),
+])
+def test_shape_rules(contracts, expected):
+    from ateam.planner import shape_problems
+    got = shape_problems(contracts)
+    assert len(got) == len(expected)
+    for g, e in zip(got, expected):
+        assert e in g
+
+
+def test_consumer_of_existing_code_unchanged(target_repo, target_paths, records_three):
+    # consumer listed before the plan's producer: not unverifiable
+    rep = report(_with(contract("Consumer", deps=[1]), _ifc("consumes", "foo", "def foo(a) -> int:")),
+                 _with(contract("Producer"), _ifc("produces", "foo", "def foo(a) -> int:")))
+    r = report_to_plan(rep, "x", "P-0001", target_paths.contracts, records_three, CFG, target_repo, target_paths.records)
+    assert r.problems == []
+    rep = report(_with(contract("Only"), _ifc("consumes", "nowhere", "def nowhere() -> int:")))
+    r = report_to_plan(rep, "x", "P-0001", target_paths.contracts, records_three, CFG, target_repo, target_paths.records)
+    assert len(r.problems) == 1 and "could not verify" in r.problems[0]
+
+
+def _shaped(target_repo, target_paths, records_three, consumer_sig="def foo(a) -> int:"):
+    rep = report(_with(contract("First"), _ifc("produces", "foo", "def foo(a) -> int:")),
+                 _with(contract("Second", deps=[0]), _ifc("consumes", "foo", consumer_sig)))
+    return report_to_plan(rep, "x", "P-0001", target_paths.contracts, records_three, CFG, target_repo, target_paths.records)
+
+
+def test_plan_review_shows_shared_shapes(target_repo, target_paths, records_three):
+    text = render_plan_review(_shaped(target_repo, target_paths, records_three), load_tiers())
+    assert "Shared shapes:" in text and "foo: def foo(a) -> int:  (produced by C-0001; consumed by C-0002)" in text
+    bad = render_plan_review(_shaped(target_repo, target_paths, records_three, "def foo(a, b) -> int:"), load_tiers())
+    assert "ateam approve" in bad and "C-0002 consumes `def foo(a, b) -> int:` but C-0001 produces" in bad
+    none = report_to_plan(report(contract("A")), "x", "P-0001", target_paths.contracts, records_three, CFG, target_repo, target_paths.records)
+    assert "Shared shapes: none" in render_plan_review(none, load_tiers())
+
+
+def test_render_draft_carries_shape_conflicts(target_repo, target_paths, records_three):
+    import yaml
+    from ateam.planner import render_draft
+    d = yaml.safe_load(render_draft(_shaped(target_repo, target_paths, records_three, "def foo(a, b) -> int:")))
+    assert d["shared_shapes"] == [{"name": "foo", "signature": "def foo(a) -> int:", "producer": "C-0001", "consumers": ["C-0002"]}]
+    assert len(d["shape_conflicts"]) == 1 and "C-0002" in d["shape_conflicts"][0]
+
+
+def test_signature_form_notes():
+    from ateam.planner import signature_form_notes
+    assert len(signature_form_notes([_c("C-0001", [], ("produces", "foo", "foo(a) -> int"))])) == 1
+    assert len(signature_form_notes([_c("C-0001", [], ("produces", "foo(a)", "returns int"))])) == 1
+    assert signature_form_notes([_c("C-0001", [], ("produces", "foo", "def foo(a) -> int:"), ("consumes", "--target", "a path"),
+                                    ("produces", "plan.yaml", "YAML file"), ("produces", "ateam integrate", "CLI command"))]) == []
