@@ -38,7 +38,8 @@ WORKER_COMMON = (
     "(the frozen contract, authoritative), Verified prior work (facts the coordinator checked) and, sometimes, a "
     "previous worker's notes, which are unverified. You cannot change the contract or its acceptance criteria; if "
     "they are wrong, say so in your report instead of working around them. Never edit anything under .ateam/ or "
-    ".claude/. Never push, merge, rebase or run destructive commands. Use absolute paths with `cd`; a relative "
+    ".claude/. Never push, merge, rebase or run destructive commands. Stop a background run you started by its PID "
+    "(`kill <pid>`), never by name (`pkill`, `killall`): other workers share this machine. Use absolute paths with `cd`; a relative "
     "`cd` is denied. "
     f"{AUTHORITY} {HANDOFF} End by producing the structured report you were asked for."
 )
