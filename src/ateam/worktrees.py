@@ -5,9 +5,9 @@ integration" step 2). The tip is recorded as the contract's base before anything
 after a crash between the two, cuts from the same commit and never from a newer tip. Worktrees are never removed.
 
 A lane's contracts share one worktree, <home>/worktrees/<first contract id>, on branch ateam/<first contract id>
-(design 2026-10-27, decision 2): a later contract's base is its predecessor's verified head, so its own diff is what
-scope, tamper and TEST judge. Each contract's lane head (`lane:<cid>`) and base are recorded before anything is
-created and win over any later call, so a re-run never moves a contract.
+(design 2026-10-27, decision 2): a later contract's base is the integration tip at its first call (owner decision 7,
+2026-10-28), and the lane branch is fast-forwarded to it, so its own diff is what scope, tamper and TEST judge.
+Each contract's lane head (`lane:<cid>`) and base are recorded before anything is created and win over any later call, so a re-run never moves a contract.
 """
 
 from __future__ import annotations
@@ -41,21 +41,23 @@ def worktree_path(paths: TargetPaths, db: StateDB, cid: str) -> Path:
 def contract_worktree(paths: TargetPaths, db: StateDB, owner: GitRepo, plan_id: str, cid: str,
                       after: str | None = None) -> ContractWorktree:
     """The contract's worktree, made if missing. `after` is the contract before it in its lane (already integrated):
-    the first call records its lane head and its verified head as this contract's base."""
+    the first call records its lane head and the integration tip as this contract's base, then the lane branch is
+    fast-forwarded to it (only when no merge is under way and HEAD is a strict ancestor of the base)."""
     key = f"base:{cid}"
     base, head = db.get_meta(key), db.get_meta(f"lane:{cid}")
     if head is None:
         head = (db.get_meta(f"lane:{after}") or after) if after is not None and base is None else cid
         db.set_meta(f"lane:{cid}", head)   # a contract cut before lanes (a base, no lane) stays its own lane head
     if base is None:
-        base = db.latest_checkpoint(after)["head"] if after is not None else owner.rev_parse(f"ateam/{plan_id}")
+        base = owner.rev_parse(f"ateam/{plan_id}")
         db.set_meta(key, base)
     branch = f"ateam/{head}"
     path = home_dir(paths.root) / "worktrees" / head
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         if owner.branch_exists(branch):
-            if not owner.is_ancestor(base, owner.rev_parse(branch)):
+            tip = owner.rev_parse(branch)
+            if not owner.is_ancestor(base, tip) and not (after is not None and owner.is_ancestor(tip, base)):
                 raise WorktreeError(f"{branch} does not descend from {cid}'s recorded base {base[:12]}")
             owner.worktree_add_existing(path, branch)
         else:
@@ -70,6 +72,15 @@ def contract_worktree(paths: TargetPaths, db: StateDB, owner: GitRepo, plan_id: 
         raise WorktreeError(f"{path} exists but is not a worktree; move it aside")
     if current != branch:
         raise WorktreeError(f"the worktree {path} is on {current or 'a detached HEAD'}, not {branch}")
+    if (after is not None and not wt.merge_in_progress() and not wt.is_ancestor(base, "HEAD")
+            and wt.is_ancestor("HEAD", base)):
+        left = [p for _, p in wt.status_porcelain()]
+        if left:
+            raise WorktreeError(f"the lane worktree has files left by an earlier contract ({', '.join(left)})")
+        try:
+            wt.merge_ff_only(base)
+        except GitError as e:
+            raise WorktreeError(f"{cid}: {branch} cannot fast-forward to the integration tip {base[:12]}: {e}") from e
     if not wt.is_ancestor(base, "HEAD") and wt.merge_head() != base:   # merge_head: a rebase onto base is under way
         raise WorktreeError(f"the worktree {path} does not descend from {cid}'s recorded base {base[:12]}")
     return ContractWorktree(cid, path, base, branch)
