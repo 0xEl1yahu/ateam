@@ -2150,7 +2150,7 @@ def verify(contract_id: str, worktree: Path, base_rev: str | None, result_file: 
         results = v.run_checks(contract.checks, wt_git.root, v.check_env(os.environ, ctx.config.env))
         after = v.snapshot(wt_git, intent, ctx.git, ctx.db.fingerprint(contract_id))
         tamper, warnings = v.compare(before, after)
-        acceptance = v.acceptance_presence(contract, wt_git.root)
+        acceptance = v.acceptance_presence(contract, wt_git.root) + v.interface_presence(contract, wt_git.root)
         outcome = v.decide(scope, results, acceptance, tamper)
 
         for r in results:

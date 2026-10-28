@@ -7,18 +7,22 @@ carries `verifier: minimal` in its checkpoint and transition reasons.
 
 from __future__ import annotations
 
+import ast
+import io
 import os
 import re
 import signal
 import subprocess
 import tempfile
+import tokenize
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 from ateam.config import NamedCheck
-from ateam.contracts.model import Contract
-from ateam.gitops import GitRepo
+from ateam.contracts.model import Contract, normalise_header
+from ateam.gitops import GitError, GitRepo
+from ateam.globs import matches
 from ateam.treecheck import ScopeResult
 
 VERIFIER = "verifier: minimal"
@@ -169,6 +173,84 @@ def acceptance_presence(contract: Contract, root: Path) -> list[AcceptanceResult
                 out.append(AcceptanceResult(a.id, kind, False, f"acceptance test not found: {', '.join(missing)} not defined in {file_part}"))
             else:
                 out.append(AcceptanceResult(a.id, kind, True, f"{ref} is present"))
+    return out
+
+
+def _headers(source: str) -> list[tuple[str | None, str, str]]:
+    """(enclosing class or None, name, normalised header) for each module-level def/class and each def/class directly
+    inside a module-level class. The text runs from the keyword to the closing colon at bracket depth 0."""
+    try:
+        tree = ast.parse(source)
+        tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+    except (SyntaxError, tokenize.TokenError, ValueError):
+        return []
+    lines = source.splitlines(keepends=True)
+    kinds = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+    def text_between(a: tuple[int, int], b: tuple[int, int]) -> str:
+        if a[0] == b[0]:
+            return lines[a[0] - 1][a[1]:b[1]]
+        return lines[a[0] - 1][a[1]:] + "".join(lines[a[0]:b[0] - 1]) + lines[b[0] - 1][:b[1]]
+
+    def header(node: ast.AST) -> str | None:
+        col = len(lines[node.lineno - 1].encode()[:node.col_offset].decode())   # col_offset counts utf-8 bytes
+        start, depth = (node.lineno, col), 0
+        for t in tokens:
+            if t.start < start:
+                continue
+            if t.type == tokenize.OP and t.string in "([{":
+                depth += 1
+            elif t.type == tokenize.OP and t.string in ")]}":
+                depth -= 1
+            elif t.type == tokenize.OP and t.string == ":" and depth == 0:
+                return normalise_header(text_between(start, t.end))
+        return None
+
+    out: list[tuple[str | None, str, str]] = []
+    for node in tree.body:
+        if isinstance(node, kinds) and (h := header(node)):
+            out.append((None, node.name, h))
+        if isinstance(node, ast.ClassDef):
+            for sub in node.body:
+                if isinstance(sub, kinds) and (h := header(sub)):
+                    out.append((node.name, sub.name, h))
+    return out
+
+
+def interface_presence(contract: Contract, root: Path) -> list[AcceptanceResult]:
+    """For each produced interface in header form: some tracked Python file (at HEAD) within the contract's paths
+    defines the name with the same normalised header. Other interfaces are listed, not checked."""
+    out: list[AcceptanceResult] = []
+    found: list[tuple[str, str | None, str, str]] = []
+    if any(i.kind == "produces" and i.code_header() for i in contract.interfaces):
+        git = GitRepo(root)
+        scope = [*contract.paths, *contract.incidental]
+        for rel in git.files_at("HEAD"):
+            if rel.endswith(".py") and any(matches(p, rel) for p in scope):
+                try:
+                    found += [(rel, cls, name, h) for cls, name, h in _headers(git.show_file("HEAD", rel))]
+                except GitError:
+                    continue
+    for i in contract.interfaces:
+        want = i.code_header() if i.kind == "produces" else None
+        if want is None:
+            out.append(AcceptanceResult(i.name, "interface", None, "not checked by minimal verify"))
+            continue
+        *prefix, last = i.name.split(".")
+        # A dotted prefix that is no class in the file is a module path: module level there.
+        cands: list[str] = []
+        for rel in {f[0] for f in found}:
+            classes = {n for r, c, n, _ in found if r == rel and c is None}
+            in_file = [f for f in found if f[0] == rel]
+            if prefix and prefix[-1] in classes:
+                cands += [h for _, c, n, h in in_file if c == prefix[-1] and n == last]
+            else:
+                cands += [h for _, c, n, h in in_file if c is None and n == last]
+        if want in cands:
+            out.append(AcceptanceResult(i.name, "interface", True, f"{want} is present"))
+        else:
+            seen = "; ".join(cands) if cands else "none defined"
+            out.append(AcceptanceResult(i.name, "interface", False, f"interface not found: expected {want}; found {seen}"))
     return out
 
 
