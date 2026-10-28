@@ -7,6 +7,7 @@ The target repository never contains any of this.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from ateam.config import TargetConfig, save_config
@@ -129,6 +130,51 @@ def commit_intent_files(paths: TargetPaths, message: str, files: list[Path | str
         git.run("reset", "-q", "--", *rel)   # a hook, signing or identity failure: leave nothing staged
         raise
     return git.head()
+
+
+# -- coordinator commits (overlap gate design, owner 2026-10-28) --------------------------------------------------
+# A scheduler writer step (merge, refresh, verify) may commit to the intent repo while sessions run. It records each
+# `ateam:` commit it made, inside its lock, under COORDINATOR_KEY; a session's intent check accepts exactly those.
+# WRITER_KEY is set while a writer step runs, so a session's check waits for its recording instead of guessing.
+
+COORDINATOR_KEY = "coordinator-commit:"
+WRITER_KEY = "intent-writer"
+
+
+def record_coordinator_commits(db, intent: GitRepo, before: str) -> list[str]:
+    """Record the `ateam:` commits in before..HEAD as the coordinator's; any other commit is left unrecorded."""
+    shas = []
+    for line in intent.run("log", "--format=%H %s", f"{before}..HEAD").splitlines():
+        sha, _, subject = line.partition(" ")
+        if subject.startswith("ateam:"):
+            db.set_meta(COORDINATOR_KEY + sha, subject)
+            shas.append(sha)
+    return shas
+
+
+def intent_problems(db, intent: GitRepo, before: str) -> list[str]:
+    """Why the intent repo is not as a session left it, beyond the coordinator's recorded commits: [] when it is."""
+    if not intent.is_clean():
+        return ["intent repo has uncommitted changes"]
+    if intent.head() == before:
+        return []
+    if not intent.is_ancestor(before, "HEAD"):
+        return [f"intent HEAD {intent.head()[:12]} does not descend from {before[:12]}"]
+    return [f"unrecorded intent commit {line[:12]}{line[40:]}"
+            for line in intent.run("log", "--format=%H %s", f"{before}..HEAD").splitlines()
+            if db.get_meta(COORDINATOR_KEY + line[:40]) is None]
+
+
+def settle_intent(db, intent: GitRepo, before: str, *, grace: float = 5.0, cap: float = 900.0, poll: float = 0.5) -> list[str]:
+    """intent_problems, after letting a writer step that is still running record its commits: wait up to `cap` while
+    WRITER_KEY is set, and `grace` otherwise."""
+    start = time.monotonic()
+    while True:
+        problems = intent_problems(db, intent, before)
+        waited = time.monotonic() - start
+        if not problems or waited >= (cap if db.get_meta(WRITER_KEY) is not None else grace):
+            return problems
+        time.sleep(poll)
 
 
 def _ensure_identity(git: GitRepo) -> None:

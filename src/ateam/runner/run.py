@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import dataclasses
 import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
@@ -18,7 +19,7 @@ from ateam.config import TargetConfig
 from ateam.contracts.model import Contract
 from ateam.gitops import GitRepo
 from ateam.guidance import live_guidance, load_guidance
-from ateam.intent import intent_git
+from ateam.intent import intent_git, settle_intent
 from ateam.paths import TargetPaths
 from ateam.records.model import Record
 from ateam.roles import ROLE_SPECS, Role
@@ -28,6 +29,10 @@ from ateam.runner.policy import Policy
 from ateam.state.db import StateDB
 from ateam.tiers import TierSpec, resolve
 from ateam.treecheck import ScopeResult, TreeState, scope_check, tree_state
+
+
+INTENT_GRACE_S = 5.0    # how long a session's intent check waits for a writer step's recording when none is marked active
+INTENT_CAP_S = 900.0    # ... and while one is (overlap gate design, owner 2026-10-28)
 
 
 @dataclass
@@ -189,11 +194,15 @@ async def run_contract_attempt(
     attempt_id = db.start_attempt(contract.id, role.value, tier_name, tier.model, predicted)
 
     intent = intent_git(paths)
-    intent_before = (intent.head(), intent.is_clean())
+    intent_before = intent.head()
     options = worker_options(cwd=worktree, spec=ROLE_SPECS[role], brief_text=brief_text, policy=policy, tier=tier, resume=resume)
     res = await run_worker(prompt or default_prompt(contract, role), options, policy)
-    intent_after = (intent.head(), intent.is_clean())
-    tampered = intent_after != intent_before or not intent_after[1]
+    # The scheduler's own writer steps (merge, refresh, verify) may commit beside this session; their recorded
+    # `ateam:` commits are accepted, anything else is tamper (overlap gate design, owner 2026-10-28).
+    intent_problems = settle_intent(db, intent, intent_before, grace=INTENT_GRACE_S, cap=INTENT_CAP_S)
+    tampered = bool(intent_problems)
+    if tampered:
+        res = dataclasses.replace(res, error="; ".join(filter(None, [res.error, "intent tamper: " + "; ".join(intent_problems)])))
 
     usage = res.usage
     tokens_in = int(usage.get("input_tokens", 0) or 0) + int(usage.get("cache_read_input_tokens", 0) or 0)

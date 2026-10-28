@@ -174,6 +174,71 @@ async def test_attempt_fails_as_tamper_when_intent_repo_changes_during_run(monke
     assert row["outcome"] == "tamper" and row["failure_class"] == "tamper"
 
 
+
+@pytest.mark.asyncio
+async def test_a_recorded_coordinator_commit_during_the_session_is_not_tamper(monkeypatch, target_repo, target_paths, sample_contract, records_three):
+    """A merge or refresh the scheduler made beside the session (overlap gate design, owner 2026-10-28)."""
+    from ateam.config import TargetConfig
+    from ateam.contracts.select import freeze
+    from ateam.gitops import GitRepo
+    from ateam.intent import commit_intent_files, intent_git, record_coordinator_commits
+    from ateam.paths import home_dir
+    from ateam.roles import Role
+    from ateam.runner import run as run_mod
+    from ateam.state.db import StateDB
+    from ateam.tiers import load_tiers
+
+    db = StateDB(home_dir(target_repo) / "state.db"); db.init_schema()
+
+    async def fake_query(prompt, options):
+        before = intent_git(target_paths).head()
+        f = target_paths.intent / "coordinator.txt"; f.write_text("merged\n")
+        commit_intent_files(target_paths, "ateam: integrate C-0002", [f])
+        record_coordinator_commits(db, intent_git(target_paths), before)
+        yield _result()
+
+    monkeypatch.setattr("ateam.runner.run.query", fake_query)
+    contract = freeze(sample_contract, [records_three["R-0001"]])
+    db.upsert_contract(contract.id, contract.plan, contract.status, contract.content_hash())
+    git = GitRepo(target_repo)
+    res, tree, scope, cp = await run_mod.run_contract_attempt(
+        paths=target_paths, config=TargetConfig(), git_worktree=git, worktree=target_repo, base=git.head(),
+        contract=contract, records=records_three, role=Role.build, tiers=load_tiers(), db=db,
+    )
+    row = db.telemetry_rows()[-1]
+    assert row["outcome"] != "tamper", (row, res.error)
+
+
+@pytest.mark.asyncio
+async def test_an_unrecorded_intent_commit_is_tamper_and_named(monkeypatch, target_repo, target_paths, sample_contract, records_three):
+    from ateam.config import TargetConfig
+    from ateam.contracts.select import freeze
+    from ateam.gitops import GitRepo
+    from ateam.intent import commit_intent_files
+    from ateam.paths import home_dir
+    from ateam.roles import Role
+    from ateam.runner import run as run_mod
+    from ateam.state.db import StateDB
+    from ateam.tiers import load_tiers
+
+    async def fake_query(prompt, options):
+        f = target_paths.intent / "planted.txt"; f.write_text("x\n")
+        commit_intent_files(target_paths, "ateam: integrate C-0009", [f])   # looks like ATeam's, but nobody recorded it
+        yield _result()
+
+    monkeypatch.setattr("ateam.runner.run.query", fake_query)
+    monkeypatch.setattr("ateam.runner.run.INTENT_GRACE_S", 0.05)
+    db = StateDB(home_dir(target_repo) / "state.db"); db.init_schema()
+    contract = freeze(sample_contract, [records_three["R-0001"]])
+    db.upsert_contract(contract.id, contract.plan, contract.status, contract.content_hash())
+    git = GitRepo(target_repo)
+    res, tree, scope, cp = await run_mod.run_contract_attempt(
+        paths=target_paths, config=TargetConfig(), git_worktree=git, worktree=target_repo, base=git.head(),
+        contract=contract, records=records_three, role=Role.build, tiers=load_tiers(), db=db,
+    )
+    row = db.telemetry_rows()[-1]
+    assert row["outcome"] == "tamper" and "ateam: integrate C-0009" in (res.error or ""), (row, res.error)
+
 # ---- setup runs once per worktree
 
 def _setup_db(tmp_path):

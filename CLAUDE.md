@@ -50,6 +50,7 @@ Adapted from the Claude Code team's own published practices (Boris Cherny's "how
 - Scheduler worktrees live under ATeam's home (<home>/worktrees/<lane's first cid>); policy tests for home reads must include a worktree under the home, not only one outside it.
 - A lane's contracts share <home>/worktrees/<first cid>; find a contract's worktree with `worktrees.worktree_path`, never from its id.
 - Never signal a process group ATeam did not create; the scheduler interrupts its own children by pid.
+- A test that two sessions overlap makes them meet at a barrier (`_meet` in tests/test_scheduler.py), never a sleep: a sleep passes alone and fails under a loaded suite.
 - A test of a failed git commit must fail it after staging (a real failing hook), not before `git add`; a commit that fails before staging hides the case where files stay staged and `git checkout --` restores nothing.
 - The policy pre-guard guards against slop and accidents, not adversaries. Grade a bypass by ordinary usage: a careless session's path to `rm`, a write outside its paths or a read of ATeam's home is Important; a contrived encoding is Minor and a listed residual unless the fix is a few lines. One fix round on exotic shell grammar, then ask the owner.
 - A new worktree's `.venv` comes from the python.org interpreter (`/Library/Frameworks/Python.framework/Versions/3.14/bin/python3.14 -m venv`); the `python3.14` first on PATH here makes venvs without a standard library.

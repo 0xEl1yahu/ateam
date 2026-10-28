@@ -101,3 +101,109 @@ def test_a_failed_commit_leaves_nothing_staged(paths):
     with pytest.raises(Exception, match="refused by hook"):
         commit_intent_files(paths, "ateam: x", [paths.intent / "plans" / "new.yaml"])
     assert git.run("diff", "--cached", "--name-only").strip() == ""
+
+
+# -- coordinator commits: a session's intent check accepts the scheduler's own commits (owner, 2026-10-28) ----------
+
+import pytest as _pytest  # noqa: E402
+
+
+def _coord_env(target_repo):
+    from ateam.intent import intent_git
+    from ateam.paths import TargetPaths, home_dir
+    from ateam.state.db import StateDB
+
+    paths = TargetPaths.from_root(target_repo)
+    db = StateDB(home_dir(target_repo) / "state.db")
+    db.init_schema()
+    return paths, intent_git(paths), db
+
+
+def _intent_commit(paths, message, name="x.txt"):
+    from ateam.intent import commit_intent_files
+
+    f = paths.intent / name
+    f.write_text(f.read_text() + "+\n" if f.exists() else "+\n")
+    return commit_intent_files(paths, message, [f])
+
+
+@_pytest.mark.parametrize("case, expect_ok", [
+    ("unchanged", True),
+    ("one recorded", True),
+    ("two recorded", True),
+    ("unrecorded", False),
+    ("recorded then unrecorded", False),
+    ("not a descendant", False),
+    ("dirty after", False),
+    ("recorded non-ateam commit is never recorded", False),
+])
+def test_intent_problems_accept_only_recorded_coordinator_commits(target_repo, case, expect_ok):
+    from ateam.intent import intent_problems, record_coordinator_commits
+
+    paths, intent, db = _coord_env(target_repo)
+    try:
+        before = intent.head()
+        if case in ("one recorded", "two recorded", "recorded then unrecorded"):
+            start = intent.head()
+            _intent_commit(paths, "ateam: integrate C-0002")
+            if case == "two recorded":
+                _intent_commit(paths, "ateam: integrate C-0003")
+            record_coordinator_commits(db, intent, start)
+            if case == "recorded then unrecorded":
+                _intent_commit(paths, "ateam: a worker's commit")
+        elif case == "unrecorded":
+            _intent_commit(paths, "ateam: integrate C-0002")
+        elif case == "not a descendant":
+            before = _intent_commit(paths, "ateam: integrate C-0002")   # the session saw this commit...
+            intent.run("reset", "-q", "--hard", "HEAD~1")               # ...and history was rewritten under it
+        elif case == "dirty after":
+            (paths.intent / "stray.txt").write_text("x\n")
+        elif case == "recorded non-ateam commit is never recorded":
+            start = intent.head()
+            _intent_commit(paths, "a stray commit")
+            record_coordinator_commits(db, intent, start)
+        problems = intent_problems(db, intent, before)
+        assert (problems == []) is expect_ok, problems
+        if not expect_ok and case in ("unrecorded", "recorded then unrecorded"):
+            assert any("ateam:" in p for p in problems), problems   # the evidence names the commit
+    finally:
+        db.close()
+
+
+def test_settle_waits_for_an_active_writer_then_accepts_its_recording(target_repo):
+    import threading
+
+    from ateam.intent import WRITER_KEY, record_coordinator_commits, settle_intent
+
+    paths, intent, db = _coord_env(target_repo)
+    try:
+        before = intent.head()
+        db.set_meta(WRITER_KEY, "P-0001")
+        _intent_commit(paths, "ateam: integrate C-0002")
+
+        def finish():
+            from ateam.paths import home_dir
+            from ateam.state.db import StateDB
+
+            with StateDB(home_dir(target_repo) / "state.db") as other:
+                record_coordinator_commits(other, intent, before)
+                other.delete_meta(WRITER_KEY)
+
+        t = threading.Timer(0.3, finish)
+        t.start()
+        assert settle_intent(db, intent, before, grace=0.05, cap=5.0, poll=0.05) == []
+        t.join()
+    finally:
+        db.close()
+
+
+def test_settle_gives_up_after_the_grace_when_no_writer_is_active(target_repo):
+    from ateam.intent import settle_intent
+
+    paths, intent, db = _coord_env(target_repo)
+    try:
+        before = intent.head()
+        _intent_commit(paths, "ateam: integrate C-0002")
+        assert settle_intent(db, intent, before, grace=0.1, cap=5.0, poll=0.02)
+    finally:
+        db.close()

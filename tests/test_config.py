@@ -5,7 +5,7 @@ from ateam.paths import TargetPaths
 def test_defaults_when_missing(target_repo):
     cfg = load_config(TargetPaths.from_root(target_repo))
     assert cfg.target_branch == "main"
-    assert cfg.max_workers == 2
+    assert cfg.max_workers == 8   # a guard, not a limit (owner, 2026-10-28)
     assert cfg.protected_paths == [".claude/**"]
     assert cfg.checks == [] and cfg.setup == [] and cfg.env == {} and cfg.tiers == {}
     assert cfg.serialize_checks is False
