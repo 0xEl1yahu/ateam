@@ -94,8 +94,40 @@ def test_pause_schema_requires_the_five_fields():
     assert "never modify files or state" in prompt and "within the frozen contract" in prompt
 
 
+def test_planner_prompt_fixes_shared_shapes_first():
+    from ateam.roles import PLANNER_SPEC
+    prompt = PLANNER_SPEC.system_prompt
+    for phrase in (
+        "fix the plan's shared shapes first", "each with one owning contract",
+        "consumer depends on its producer", "anywhere in the list",
+        "exact header line", "`def name(...) -> T:`", "`async def ...`", "`class Name(Base):`",
+        "Class.method", "unique across the plan", "`ateam verify --cwd`",
+    ):
+        assert phrase in prompt, phrase
+
+
+def test_reviewer_prompt_makes_shape_conflicts_blocking():
+    from ateam.roles import REVIEWER_SPEC
+    prompt = REVIEWER_SPEC.system_prompt
+    assert "produced by an earlier contract" not in prompt
+    assert "anywhere in the plan" in prompt
+    assert "shape_conflicts" in prompt
+    assert "reported as a blocking finding" in prompt
+    assert "any blocking finding means the verdict is needs_revision" in prompt
+
+
+def test_build_and_test_prompts_run_contract_tests():
+    from ateam.roles import ROLE_SPECS, Role
+    for role in (Role.build, Role.test):
+        prompt = ROLE_SPECS[role].system_prompt
+        assert "contract's own tests" in prompt and "as the brief lists them" in prompt
+        assert "full configured checks" in prompt and "verify" in prompt
+        assert "never run the full" not in prompt.lower()
+
+
 def test_build_and_test_prompts_say_to_stop_own_runs_by_pid_never_by_name():
     """P-0019: one worker's `pkill -f pytest` killed another worker's session (owner, 2026-10-28)."""
+    from ateam.roles import ROLE_SPECS, Role
     for role in (Role.build, Role.test):
         prompt = ROLE_SPECS[role].system_prompt
         assert "by its PID" in prompt and "never by name" in prompt, role

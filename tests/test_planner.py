@@ -290,8 +290,10 @@ def test_planner_schema_requires_interfaces_and_spec_sentences():
     i = items["properties"]["interfaces"]["items"]
     assert i["additionalProperties"] is False and i["required"] == ["kind", "name", "signature", "note"]
     assert i["properties"]["kind"]["enum"] == ["produces", "consumes"]
-    assert "must match the producing contract's signature exactly" in PLANNER_SPEC.system_prompt
-    assert "every consumed interface is produced by an earlier contract" in REVIEWER_SPEC.system_prompt
+    assert "exact header line" in PLANNER_SPEC.system_prompt
+    assert "fix the plan's shared shapes first" in PLANNER_SPEC.system_prompt
+    assert "which may sit anywhere in the list" in PLANNER_SPEC.system_prompt
+    assert "produced by a contract anywhere in the plan" in REVIEWER_SPEC.system_prompt
 
 
 @pytest.mark.parametrize("name", ["StateDB.transition", "store.StateDB.transition", "store.helper"])
