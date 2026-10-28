@@ -1148,7 +1148,7 @@ def test_approve_and_reject_commit_only_their_files(monkeypatch, cli_target):
 from ateam.contracts.model import ContractStatus  # noqa: E402
 
 
-def _verify_setup(cli_target, tmp_path, checks, env=None):
+def _verify_setup(cli_target, tmp_path, checks, env=None, interfaces=()):
     """C-0001 frozen with the given (name, cmd) checks, and a linked worktree off main."""
     from ateam.config import NamedCheck, load_config, save_config
     from ateam.contracts.store import save_contract
@@ -1156,7 +1156,10 @@ def _verify_setup(cli_target, tmp_path, checks, env=None):
     paths = TargetPaths.from_root(cli_target)
     run("records", "approve", "R-0001", "--target", str(cli_target))
     c = load_contracts(paths.contracts)["C-0001"]
-    save_contract(paths.contracts, c.model_copy(update={"checks": [NamedCheck(name=n, cmd=cmd) for n, cmd in checks]}))
+    from ateam.contracts.model import Interface
+
+    save_contract(paths.contracts, c.model_copy(update={"checks": [NamedCheck(name=n, cmd=cmd) for n, cmd in checks],
+                                                        "interfaces": [Interface(kind="produces", name=n, signature=sig) for n, sig in interfaces]}))
     subpaths = ["contracts"]
     if env:
         save_config(paths, load_config(paths).model_copy(update={"env": env}))
@@ -1206,6 +1209,19 @@ def test_verify_passing_work_reaches_verified_in_file_and_store(cli_target, tmp_
     assert intent.is_clean() and intent.run("log", "-1", "--format=%s").strip() == "ateam: verify C-0001 -> verified"
     assert run("brief", "C-0001", "--role", "build", "--target", str(cli_target)).exit_code == 0   # checkpoint shape intact
     assert run("contracts", "validate", "--target", str(cli_target)).exit_code == 0
+
+
+def test_verify_fails_a_contract_missing_a_produced_interface(cli_target, tmp_path):
+    wt = _verify_setup(cli_target, tmp_path, [("unit", "true")],
+                       interfaces=[("routes", "def routes(app: App) -> None:"), ("--flag", "--flag <n>")])
+    _do_work(wt)
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 1 and "C-0001 -> failed (implementation)" in r.output and "unit: passed" in r.output
+    assert "routes [interface]: MISSING" in r.output and "--flag [interface]: not checked by minimal verify" in r.output
+    (wt / "src" / "api" / "x.py").write_text("def routes(app: App) -> None:\n    pass\n")
+    g = GitRepo(wt); g.run("add", "-A"); g.run("commit", "-q", "-m", "routes")
+    r = _verify(cli_target, wt)
+    assert r.exit_code == 0 and "routes [interface]: present" in r.output, r.output
 
 
 def test_verify_failing_check_is_implementation(cli_target, tmp_path):
