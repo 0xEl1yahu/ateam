@@ -92,3 +92,10 @@ def test_pause_schema_requires_the_five_fields():
     assert PAUSE_INVESTIGATE_SPEC.role is Role.investigate and PAUSE_INVESTIGATE_SPEC.tools == ["Read", "Glob", "Grep", "Bash"]
     prompt = PAUSE_INVESTIGATE_SPEC.system_prompt.lower()
     assert "never modify files or state" in prompt and "within the frozen contract" in prompt
+
+
+def test_build_and_test_prompts_say_to_stop_own_runs_by_pid_never_by_name():
+    """P-0019: one worker's `pkill -f pytest` killed another worker's session (owner, 2026-10-28)."""
+    for role in (Role.build, Role.test):
+        prompt = ROLE_SPECS[role].system_prompt
+        assert "by its PID" in prompt and "never by name" in prompt, role
