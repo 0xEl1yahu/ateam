@@ -90,6 +90,17 @@ class FakeWorkers:
         return [c[2] for c in self.calls if c[0] == cid and c[1] == role]
 
 
+def _meet(*pairs, timeout=60.0):
+    """FakeWorkers behaviours that make the named (cid, role) sessions wait for each other: the run fails (a broken
+    barrier) unless the scheduler really runs them at the same time. Deterministic, unlike a sleep."""
+    barrier = threading.Barrier(len(pairs), timeout=timeout)
+
+    def meet(fake, cid, role, worktree, n):
+        barrier.wait()
+        return {}
+    return {pair: meet for pair in pairs}
+
+
 class FakeInvestigator:
     """Stands in for `ateam worker pause-investigate`: writes findings (or a note) on the open pause record."""
 
@@ -195,14 +206,36 @@ def test_dry_run_writes_nothing_and_shows_worst_case(plan3):
 
 
 def test_max_workers_overlap_and_no_session_during_exclusive(plan3):
-    fake = FakeWorkers(delay=0.4)
+    fake = FakeWorkers(_meet(("C-0001", "build"), ("C-0003", "build")))
     s, out = _run(plan3, fake)
     assert s.outcome == "merge_proposed", out
     builds = {cid: (t0, t1) for cid, role, t0, t1, *_ in fake.intervals if role == "build"}
     a, c = builds["C-0001"], builds["C-0003"]
     assert a[0] < c[1] and c[0] < a[1]                                   # the two independent BUILDs overlapped
-    assert all(before == after for *_, before, after in fake.intervals)  # no intent commit during any session
+    _assert_only_coordinator_commits_during_sessions(plan3, fake)
 
+
+
+def _assert_only_coordinator_commits_during_sessions(p, fake):
+    """Intent commits may land while a session runs, but only ones a scheduler writer step recorded (overlap gate
+    design, owner 2026-10-28; this test asserted none at all before)."""
+    from ateam.intent import COORDINATOR_KEY
+
+    intent, db = GitRepo(p.paths.intent), _db(p)
+    for cid, role, _, _, before, after in fake.intervals:
+        for sha in [s for s in intent.run("rev-list", f"{before}..{after}").split() if s]:
+            assert db.get_meta(COORDINATOR_KEY + sha), f"unrecorded intent commit {sha[:12]} during {cid} {role}"
+
+
+def test_a_contract_verifies_merges_and_its_follower_starts_while_another_build_runs(plan3):
+    """C-0003's BUILD runs long. C-0001's verify and merge, and C-0002's worktree and BUILD, must not wait for it
+    (findings T2 and T4; overlap gate design, owner 2026-10-28)."""
+    fake = FakeWorkers(_meet(("C-0003", "build"), ("C-0002", "build")))   # C-0003's BUILD ends only once C-0002's has begun
+    s, out = _run(plan3, fake)
+    assert s.outcome == "merge_proposed", out
+    builds = {cid: (t0, t1) for cid, role, t0, t1, *_ in fake.intervals if role == "build"}
+    assert builds["C-0002"][0] < builds["C-0003"][1], (builds, out)
+    _assert_only_coordinator_commits_during_sessions(plan3, fake)
 
 def test_scope_breach_retries_then_pauses_scope_exceeded(plan3):
     _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
@@ -351,7 +384,10 @@ def test_no_session_starts_after_stop_while_waiting_at_the_gate(plan3):
     fake = FakeWorkers(delay=0.3)
     s, out = _run(plan3, fake, stop=stop, child=child)
     assert s.outcome == "interrupted"
-    assert all(t0 < stamp["at"] for _cid, _role, t0, *_ in fake.intervals)   # nothing launched after Ctrl-C
+    # Nothing launched after Ctrl-C. Verify now runs beside sessions (owner, 2026-10-28), so a session may be mid-launch
+    # at the instant verify starts: it passed the stop check just before, and the fake stamps it just after. Allow
+    # that in-flight launch, never a session that waited and started later.
+    assert all(t0 < stamp["at"] + 1.0 for _cid, _role, t0, *_ in fake.intervals), (stamp, fake.intervals)
 
 
 def test_dependent_waits_for_its_dependency_to_be_integrated(plan3, monkeypatch):
@@ -743,7 +779,7 @@ def test_a_lane_runs_in_one_worktree_and_the_follower_is_based_on_the_verified_h
 
 
 def test_disjoint_lanes_overlap_in_time(plan_lanes):
-    fake = FakeWorkers(delay=0.3)
+    fake = FakeWorkers(_meet(("C-0001", "build"), ("C-0003", "build")))
     s, out = _run(plan_lanes, fake)
     assert s.outcome == "merge_proposed", out
     span = {cid: (t0, t1) for cid, role, t0, t1, *_ in fake.intervals if role == "build"}
