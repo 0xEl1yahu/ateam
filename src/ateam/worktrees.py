@@ -6,8 +6,8 @@ after a crash between the two, cuts from the same commit and never from a newer 
 
 A lane's contracts share one worktree, <home>/worktrees/<first contract id>, on branch ateam/<first contract id>
 (design 2026-10-27, decision 2): a later contract's base is the integration tip at its first call (owner decision 7,
-2026-10-28), and the lane branch is fast-forwarded to it, so its own diff is what scope, tamper and TEST judge. Each contract's lane head (`lane:<cid>`) and base are recorded before anything is
-created and win over any later call, so a re-run never moves a contract.
+2026-10-28), and the lane branch is fast-forwarded to it, so its own diff is what scope, tamper and TEST judge.
+Each contract's lane head (`lane:<cid>`) and base are recorded before anything is created and win over any later call, so a re-run never moves a contract.
 """
 
 from __future__ import annotations
