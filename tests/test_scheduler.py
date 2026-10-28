@@ -724,7 +724,8 @@ def test_approve_prints_the_lanes(plan_lanes):
     assert "lane 1: C-0001 -> C-0002" in plan_lanes.approve_output and "lane 2: C-0003" in plan_lanes.approve_output
 
 
-def test_a_lane_runs_in_one_worktree_and_the_follower_is_based_on_the_verified_head(plan_lanes):
+# Owner decision 7 of the 2026-10-28 design: a follower's base is the integration tip, not its predecessor's head.
+def test_a_lane_runs_in_one_worktree_and_the_follower_is_based_on_the_integration_tip(plan_lanes):
     seen = {}
 
     def note_predecessor(fake, cid, role, worktree, n):
@@ -737,7 +738,8 @@ def test_a_lane_runs_in_one_worktree_and_the_follower_is_based_on_the_verified_h
     assert s.outcome == "merge_proposed", out
     lane = home_dir(plan_lanes.root) / "worktrees" / "C-0001"
     b_build = next(c for c in fake.calls if c[0] == "C-0002" and c[1] == "build")
-    assert b_build[4] == lane and b_build[5] == _db(plan_lanes).latest_checkpoint("C-0001")["head"] == _db(plan_lanes).get_meta("base:C-0002")
+    assert b_build[4] == lane and b_build[5] == _db(plan_lanes).get_meta("base:C-0002")
+    assert GitRepo(lane).is_ancestor(_db(plan_lanes).latest_checkpoint("C-0001")["head"], b_build[5])
     assert _db(plan_lanes).get_meta("lane:C-0002") == "C-0001" and not (home_dir(plan_lanes.root) / "worktrees" / "C-0002").exists()
     assert seen == {"C-0001": "integrated"}
 
@@ -982,15 +984,16 @@ def test_a_rebase_that_cannot_start_pauses(plan3, monkeypatch):
     assert _db(plan3).contract_status("C-0001") == "verified" and _rebase_builds(fake, "C-0001") == []
 
 
-def test_a_rebased_lane_head_is_the_follower_base(plan_lanes):
+# Owner decision 7 of the 2026-10-28 design: a follower's base is the integration tip, which holds the other merge.
+def test_a_follower_after_a_rebased_lane_head_is_based_on_the_integration_tip(plan_lanes):
     fake = FakeWorkers({("C-0001", "build", 0): _conflict_during(plan_lanes)})
     s, out = _run(plan_lanes, fake)
     assert s.outcome == "merge_proposed", out
     db = _db(plan_lanes)
     lane = home_dir(plan_lanes.root) / "worktrees" / "C-0001"
     b_build = _builds(fake, "C-0002")[0]
-    assert b_build[4] == lane and b_build[5] == db.latest_checkpoint("C-0001")["head"]
-    assert GitRepo(lane).is_ancestor(fake.tips[0], b_build[5])   # the rebased head contains the other merge
+    assert b_build[4] == lane and b_build[5] == db.get_meta("base:C-0002")
+    assert GitRepo(lane).is_ancestor(fake.tips[0], b_build[5])   # the integration tip holds the other lane's merge
 
 
 def test_an_integrating_rerun_continues_a_rebase(plan3):

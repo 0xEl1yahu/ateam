@@ -85,35 +85,100 @@ def _verified_head(db, w, cid, name):
     return g.head()
 
 
-def test_a_follower_shares_the_lane_worktree_with_the_head_as_base(target_repo):
+# Owner decision 7 of the 2026-10-28 design: a later contract's base is the integration tip, not its predecessor's head.
+def test_a_follower_fast_forwards_to_the_integration_tip_as_its_base(target_repo, tmp_path):
     from ateam.worktrees import contract_worktree, worktree_path
     paths, db, owner = _setup(target_repo)
-    head = _verified_head(db, contract_worktree(paths, db, owner, "P-0001", "C-1"), "C-1", "one.txt")
+    w1 = contract_worktree(paths, db, owner, "P-0001", "C-1")
+    _verified_head(db, w1, "C-1", "one.txt")
+    owner.run("branch", "-f", "ateam/P-0001", "ateam/C-1")   # the predecessor is integrated
+    tip = _advance_integration(owner, tmp_path, "docs/other.md", "other")
     w = contract_worktree(paths, db, owner, "P-0001", "C-2", after="C-1")
-    assert w.path == home_dir(target_repo) / "worktrees" / "C-1" and w.branch == "ateam/C-1" and w.base == head
-    assert db.get_meta("lane:C-2") == "C-1" and db.get_meta("lane:C-1") == "C-1" and db.get_meta("base:C-2") == head
+    assert w.path == home_dir(target_repo) / "worktrees" / "C-1" and w.branch == "ateam/C-1" and w.base == tip
+    assert db.get_meta("lane:C-2") == "C-1" and db.get_meta("lane:C-1") == "C-1" and db.get_meta("base:C-2") == tip
+    assert GitRepo(w.path).head() == tip and (w.path / "docs" / "other.md").is_file()
     assert worktree_path(paths, db, "C-2") == w.path and not (home_dir(target_repo) / "worktrees" / "C-2").exists()
+
+
+def test_a_follower_holds_a_dependency_integrated_from_another_lane(target_repo, tmp_path):
+    from ateam.worktrees import contract_worktree
+    paths, db, owner = _setup(target_repo)
+    w1 = contract_worktree(paths, db, owner, "P-0001", "C-1")
+    _verified_head(db, w1, "C-1", "one.txt")
+    owner.run("branch", "-f", "ateam/P-0001", "ateam/C-1")
+    _advance_integration(owner, tmp_path, "src/dep/dep.py", "dep")
+    w = contract_worktree(paths, db, owner, "P-0001", "C-2", after="C-1")
+    assert (w.path / "src" / "dep" / "dep.py").is_file() and (w.path / "one.txt").is_file()
+
+
+def test_a_follower_base_is_recorded_once_and_the_fast_forward_completes(target_repo, tmp_path):
+    from ateam.worktrees import WorktreeError, contract_worktree
+    paths, db, owner = _setup(target_repo)
+    w1 = contract_worktree(paths, db, owner, "P-0001", "C-1")
+    owner.run("branch", "-f", "ateam/P-0001", "ateam/C-1")
+    tip = _advance_integration(owner, tmp_path, "docs/a.md", "a")
+    db.set_meta("base:C-2", tip); db.set_meta("lane:C-2", "C-1")   # a crash after recording, before the fast-forward
+    newer = _advance_integration(owner, tmp_path, "docs/b.md", "b")
+    w = contract_worktree(paths, db, owner, "P-0001", "C-2", after="C-1")
+    assert w.base == tip != newer and GitRepo(w.path).head() == tip
+    assert contract_worktree(paths, db, owner, "P-0001", "C-2", after="C-1").base == tip
+    # without `after` nothing fast-forwards: a HEAD behind the base is refused as before
+    db.set_meta("base:C-1", newer)
+    with pytest.raises(WorktreeError, match="does not descend"):
+        contract_worktree(paths, db, owner, "P-0001", "C-1")
+
+
+def test_a_follower_with_leftovers_refuses_before_the_fast_forward(target_repo, tmp_path):
+    from ateam.worktrees import WorktreeError, contract_worktree
+    paths, db, owner = _setup(target_repo)
+    w1 = contract_worktree(paths, db, owner, "P-0001", "C-1")
+    _advance_integration(owner, tmp_path, "docs/a.md", "a")
+    (w1.path / "leftover.txt").write_text("x\n")
+    with pytest.raises(WorktreeError, match=r"the lane worktree has files left by an earlier contract \(leftover.txt\)"):
+        contract_worktree(paths, db, owner, "P-0001", "C-2", after="C-1")
+    assert GitRepo(w1.path).head() == w1.base
+
+
+def test_a_follower_with_a_missing_worktree_is_recreated_or_refused(target_repo, tmp_path):
+    import shutil
+    from ateam.worktrees import WorktreeError, contract_worktree
+    paths, db, owner = _setup(target_repo)
+    w1 = contract_worktree(paths, db, owner, "P-0001", "C-1")
+    tip = _advance_integration(owner, tmp_path, "docs/a.md", "a")
+    owner.run("worktree", "remove", "--force", str(w1.path))
+    w = contract_worktree(paths, db, owner, "P-0001", "C-2", after="C-1")
+    assert w.path == w1.path and GitRepo(w.path).head() == tip == w.base
+    # a branch that neither descends from nor is an ancestor of the base is refused
+    owner.run("worktree", "remove", "--force", str(w.path))
+    owner.run("branch", "-f", "ateam/C-1", owner.run("commit-tree", "-m", "orphan", "HEAD^{tree}").strip())
+    with pytest.raises(WorktreeError, match="does not descend"):
+        contract_worktree(paths, db, owner, "P-0001", "C-2", after="C-1")
 
 
 def test_a_follower_reuses_its_recorded_lane_and_base(target_repo):
     from ateam.worktrees import contract_worktree
     paths, db, owner = _setup(target_repo)
     w1 = contract_worktree(paths, db, owner, "P-0001", "C-1")
-    head = _verified_head(db, w1, "C-1", "one.txt")
-    contract_worktree(paths, db, owner, "P-0001", "C-2", after="C-1")
+    _verified_head(db, w1, "C-1", "one.txt")
+    base = contract_worktree(paths, db, owner, "P-0001", "C-2", after="C-1").base
     _verified_head(db, w1, "C-1", "newer.txt")
-    assert contract_worktree(paths, db, owner, "P-0001", "C-2", after="C-1").base == head
+    assert contract_worktree(paths, db, owner, "P-0001", "C-2", after="C-1").base == base == owner.rev_parse("ateam/P-0001")
 
 
-def test_a_third_contract_follows_the_lane_head_not_its_predecessor(target_repo):
+# Owner decision 7 of the 2026-10-28 design: a third contract is based on the integration tip, not the lane head.
+def test_a_third_contract_follows_the_integration_tip_not_its_predecessor(target_repo, tmp_path):
     from ateam.worktrees import contract_worktree
     paths, db, owner = _setup(target_repo)
     w1 = contract_worktree(paths, db, owner, "P-0001", "C-1")
     _verified_head(db, w1, "C-1", "one.txt")
-    w2 = contract_worktree(paths, db, owner, "P-0001", "C-2", after="C-1")
-    head2 = _verified_head(db, w2, "C-2", "two.txt")
+    owner.run("branch", "-f", "ateam/P-0001", "ateam/C-1")
+    contract_worktree(paths, db, owner, "P-0001", "C-2", after="C-1")
+    head2 = _verified_head(db, w1, "C-2", "two.txt")
+    owner.run("branch", "-f", "ateam/P-0001", "ateam/C-1")
+    tip = _advance_integration(owner, tmp_path, "docs/x.md", "x")
     w3 = contract_worktree(paths, db, owner, "P-0001", "C-3", after="C-2")
-    assert w3.path == w1.path and w3.base == head2 and db.get_meta("lane:C-3") == "C-1"
+    assert w3.path == w1.path and w3.base == tip != head2 and db.get_meta("lane:C-3") == "C-1"
+    assert GitRepo(w3.path).is_ancestor(head2, tip)
 
 
 def test_a_contract_cut_before_lanes_keeps_its_own_worktree(target_repo):
