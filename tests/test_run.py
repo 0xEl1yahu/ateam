@@ -481,3 +481,16 @@ def test_setup_key_covers_the_base(target_repo, ateam_home, tmp_path):
     assert ensure_setup(target_repo, cfg, db, "base-one") == []
     assert ensure_setup(target_repo, cfg, db, "base-two") == cfg.setup
     assert (target_repo / "setup-count").read_text().count("x") == 2
+
+
+def test_build_policy_lets_a_worker_write_its_incidental_paths(target_repo, sample_contract, records_three):
+    """Spec, worker roles: BUILD may not touch files outside `paths` plus `incidental`, so an incidental path is
+    writable. P-0019 C-0083 was refused tests/test_planner.py, its incidental path, and paused (owner, 2026-10-28)."""
+    from ateam.config import TargetConfig
+    from ateam.roles import Role
+    from ateam.runner.run import build_policy
+
+    policy = build_policy(target_repo, Role.build, sample_contract, TargetConfig(), records_three)
+    assert policy.path_writable_abs(str(target_repo / "requirements.txt"))[0]          # incidental
+    assert policy.path_writable_abs(str(target_repo / "src" / "api" / "x.py"))[0]      # declared
+    assert not policy.path_writable_abs(str(target_repo / "src" / "app.py"))[0]        # neither
