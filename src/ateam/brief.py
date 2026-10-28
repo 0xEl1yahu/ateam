@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from fnmatch import fnmatch
+from pathlib import Path, PurePosixPath
 from typing import Literal
 
 import yaml
@@ -38,6 +39,21 @@ def render_record(r: Record) -> str:
     return "\n".join(lines)
 
 
+def _is_test_path(p: str) -> bool:
+    parts = PurePosixPath(p).parts
+    name = parts[-1]
+    return (any(d in ("tests", "test") for d in parts[:-1])
+            or any(fnmatch(name, pat) for pat in ("test_*", "*_test.*", "*.test.*", "*.spec.*")))
+
+
+def contract_tests(contract: Contract) -> list[str]:
+    """The contract's tests: acceptance test references, then literal test-file paths, then test globs (shown, not expanded)."""
+    refs = [a.check.ref for a in contract.acceptance if a.check.type == "test" and a.check.ref]
+    literal = [p for p in contract.paths if not any(c in p for c in "*?[") and _is_test_path(p)]
+    globs = [p for p in contract.paths if any(c in p for c in "*?[") and _is_test_path(p)]
+    return list(dict.fromkeys(refs + literal + globs))
+
+
 def _task(contract: Contract, scratch_dir: Path | None, role: Role | None = None) -> str:
     lines = [
         f"Contract {contract.id} ({contract.plan}): {contract.title}",
@@ -56,13 +72,21 @@ def _task(contract: Contract, scratch_dir: Path | None, role: Role | None = None
     for a in contract.acceptance:
         how = f"{a.check.type}" + (f" {a.check.ref}" if a.check.ref else "")
         lines.append(f"- {a.id}: {a.statement}  [{how}]")
+    worker = role is not Role.investigate
+    if worker:
+        tests = contract_tests(contract)
+        lines.append("")
+        lines.append("Tests for this contract:" if tests else "Tests for this contract: none.")
+        for t in tests:
+            glob = any(c in t for c in "*?[")
+            lines.append(f"- {t}" + ("  (a glob, not expanded: run only the test files the contract adds or changes under it)" if glob else ""))
     if contract.interfaces:
         lines.append("")
         lines.append("Interfaces (follow these exactly; other contracts depend on them):")
         lines += [f"- {i.kind}: {_one_line(i.signature)}" + (f"  ({_one_line(i.note)})" if i.note else "") for i in contract.interfaces]
     if contract.checks:
         lines.append("")
-        lines.append("Deterministic checks:")
+        lines.append("Checks verify runs after your work finishes:" if worker else "Deterministic checks:")
         lines.extend(f"- {c.name}: `{c.cmd}`" for c in contract.checks)
     b = contract.budget
     lines.append("")

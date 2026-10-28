@@ -809,6 +809,34 @@ def _is_rm(words: list[str]) -> bool:
     return bool(cw) and cw[0].rsplit("/", 1)[-1] == "rm"
 
 
+SIGNAL_REASON = ("signal only processes you started, by numeric PID (`kill <pid>`, `kill -TERM <pid>`); pkill, killall and "
+                 "kill by name, job, group or expansion are not allowed: they reach other workers and the owner's processes")
+_SIGNAL_SPEC = re.compile(r"-(?:[0-9]+|[A-Za-z][A-Za-z0-9+]*)")
+_PID = re.compile(r"[1-9][0-9]*")
+
+
+def _signal_denied(words: list[str]) -> bool:
+    """pkill and killall in any form; kill unless every target is a literal positive PID (owner, 2026-10-28). A
+    negative or zero target signals a process group or everything; %job, $VAR and substitutions are not literal."""
+    cw = _command_words(words)
+    if not cw:
+        return False
+    name = cw[0].rsplit("/", 1)[-1]
+    if name in ("pkill", "killall"):
+        return True
+    if name != "kill":
+        return False
+    args, i = cw[1:], 0
+    if i < len(args) and args[i] in ("-s", "-n"):
+        i += 2
+    elif i < len(args) and args[i] not in ("-l", "-L") and _SIGNAL_SPEC.fullmatch(args[i]):
+        i += 1
+    if i < len(args) and args[i] == "--":
+        i += 1
+    targets = args[i:]
+    return not targets or not all(_PID.fullmatch(a) for a in targets)
+
+
 def _inner_command(words: list[str]) -> str | None:
     """The literal text an `eval` or a `bash -c` / `sh -c` ... would run as shell code, else None. A non-literal
     argument ($x, $(...)) is re-lexed as written; what it expands to at run time is a residual."""
@@ -1320,6 +1348,8 @@ class Policy:
                 rest = rest.replace(sp, " ")
             if _is_rm(words):
                 return False, "rm is not allowed for workers; use `git rm` for tracked files, cleanup happens at integration"
+            if _signal_denied(words):
+                return False, SIGNAL_REASON
             if _follows_symlinks(words):
                 return False, FOLLOW_LINKS_REASON
             cw = _command_words(words)

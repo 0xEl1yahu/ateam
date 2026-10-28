@@ -123,3 +123,11 @@ def test_build_and_test_prompts_run_contract_tests():
         assert "contract's own tests" in prompt and "as the brief lists them" in prompt
         assert "full configured checks" in prompt and "verify" in prompt
         assert "never run the full" not in prompt.lower()
+
+
+def test_build_and_test_prompts_say_to_stop_own_runs_by_pid_never_by_name():
+    """P-0019: one worker's `pkill -f pytest` killed another worker's session (owner, 2026-10-28)."""
+    from ateam.roles import ROLE_SPECS, Role
+    for role in (Role.build, Role.test):
+        prompt = ROLE_SPECS[role].system_prompt
+        assert "by its PID" in prompt and "never by name" in prompt, role

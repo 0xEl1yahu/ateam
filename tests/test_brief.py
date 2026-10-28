@@ -374,3 +374,48 @@ def test_pause_brief_log_tail_is_capped(sample_contract, records_three, tmp_path
     text = _pause_log_brief(sample_contract, records_three, {"log": str(log)}, runs)
     why = text[text.index("## Why the plan paused"):text.index("## Attempt history")]
     assert why.count("x") <= DOC_CAP
+
+
+# --- contract tests and verify's checks in the task section ---
+
+from ateam.brief import _task, contract_tests
+from ateam.roles import Role as _Role
+
+
+def test_brief_lists_the_contracts_tests(sample_contract):
+    c = sample_contract.model_copy(update={"paths": ["src/api/**", "tests/api/test_books.py", "tests/api/**", "test/x.py", "src/a_test.py", "src/b.py"]})
+    assert contract_tests(c) == [
+        "tests/api/test_books.py::test_reading_state_present",
+        "tests/api/test_books.py",
+        "test/x.py",
+        "src/a_test.py",
+        "tests/api/**",
+    ]
+    b = assemble_brief(c, [], None, Role.build)
+    assert "tests/api/**" in b.task and "run only the test files" in b.task
+    tests_line = [l for l in b.task.splitlines() if l.startswith("- tests/api/test_books.py")]
+    assert tests_line == ["- tests/api/test_books.py::test_reading_state_present", "- tests/api/test_books.py"]
+    t = assemble_brief(c, [], None, Role.test)
+    assert "test/x.py" in t.task and "src/api/**" in t.task
+    none = sample_contract.model_copy(update={"paths": ["src/api/**"], "acceptance": []})
+    assert contract_tests(none) == []
+    assert "Tests for this contract: none." in assemble_brief(none, [], None, Role.build).task
+
+
+def test_brief_labels_checks_as_verifys(sample_contract):
+    from ateam.config import NamedCheck
+    c = sample_contract.model_copy(update={"checks": [NamedCheck(name="unit", cmd="pytest -q")]})
+    for role in (Role.build, Role.test):
+        task = assemble_brief(c, [], None, role).task
+        assert "Checks verify runs after your work finishes:\n- unit: `pytest -q`" in task
+
+
+def test_investigate_brief_keeps_the_plain_checks_label(sample_contract):
+    from ateam.brief import assemble_pause_brief
+    from ateam.config import NamedCheck
+    c = sample_contract.model_copy(update={"checks": [NamedCheck(name="unit", cmd="pytest -q")]})
+    task = _task(c, None, _Role.investigate)
+    assert "Deterministic checks:\n- unit: `pytest -q`" in task
+    assert "Tests for this contract" not in task and "verify runs" not in task
+    brief = assemble_pause_brief(c, [], {"reason": "r"}, [], None, [])
+    assert "Tests for this contract" not in brief
