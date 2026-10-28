@@ -738,6 +738,7 @@ def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, force
     from ateam.contracts.select import freeze, select_records
     from ateam.contracts.store import load_contracts, save_contract
     from ateam.gitops import GitError
+    from ateam.planner import shape_problems, shapes_table, signature_form_notes
     from ateam.plans.model import PlanHistoryEntry, PlanStatus
     from ateam.plans.store import load_plans, save_plan
     from ateam.records.graph import RecordGraph
@@ -781,6 +782,15 @@ def approve(plan_id: str, tier_specs: tuple[str, ...], skip_records: bool, force
                   f"pass --force to approve without superseding")
     tiers = load_tiers(ctx.config.tiers)
     overrides = _parse_tier_overrides(tier_specs, plan_.contracts, list(tiers))
+
+    # Shared-shape conflicts refuse before the records walk and before any write.
+    shape_contracts = [c for cid, c in load_contracts(ctx.paths.contracts).items() if cid in plan_.contracts]
+    problems = shape_problems(shape_contracts)
+    if problems:
+        _fail(f"{plan_id} has shared-shape conflicts:\n" + "\n".join(f"  - {p}" for p in problems)
+              + f"\nre-plan it: ateam plan --replaces {plan_id} \"<request>\"")
+    for line in [*shapes_table(shape_contracts), *(f"  Note: {n}" for n in signature_form_notes(shape_contracts))]:
+        click.echo(line)
 
     counts = {"approved": 0, "rejected": 0, "skipped": 0}
     if plan_.proposed_records and not skip_records:
@@ -1282,6 +1292,8 @@ def plans_list(target: Path) -> None:
 def plans_show(plan_id: str, target: Path) -> None:
     import yaml
 
+    from ateam.contracts.store import load_contracts
+    from ateam.planner import shapes_table, signature_form_notes
     from ateam.plans.store import load_plans
 
     ctx = _context(target)
@@ -1289,6 +1301,10 @@ def plans_show(plan_id: str, target: Path) -> None:
     if plan_id not in ps:
         _fail(f"unknown plan {plan_id}")
     click.echo(yaml.safe_dump(ps[plan_id].model_dump(mode="json"), sort_keys=False))
+    cs = load_contracts(ctx.paths.contracts)
+    plan_contracts = [cs[cid] for cid in ps[plan_id].contracts if cid in cs]
+    for line in [*shapes_table(plan_contracts), *(f"  Note: {n}" for n in signature_form_notes(plan_contracts))]:
+        click.echo(line)
 
 
 # ---------------------------------------------------------------- records
