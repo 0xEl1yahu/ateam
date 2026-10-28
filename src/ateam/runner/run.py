@@ -92,7 +92,8 @@ def build_policy(
         for g in r.binds.paths:
             bound.setdefault(g, []).append(r)
     return Policy(
-        worktree=worktree, role=role, allowed_paths=list(contract.paths), protected=list(config.protected_paths),
+        # `incidental` is writable too: spec, worker roles, "outside `paths` plus `incidental`" (owner, 2026-10-28)
+        worktree=worktree, role=role, allowed_paths=[*contract.paths, *contract.incidental], protected=list(config.protected_paths),
         bound=bound, scratch_dir=scratch_dir, ateam_home=scratch_dir.parent.parent.parent if scratch_dir else None,
     )
 

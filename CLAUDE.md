@@ -46,6 +46,7 @@ Adapted from the Claude Code team's own published practices (Boris Cherny's "how
 - Test first. Every behaviour change starts with a failing test you watched fail. Table-driven tests for the policy (`tests/test_policy.py`) are the place for new deny and allow strings.
 - Worker sessions use the clean room (`setting_sources=[]`, strict MCP config, slash commands off, auto-memory off, permission mode `default`). Never `--bare`: it does not authenticate with a claude.ai login.
 - Never `str.strip()` the output of `git status --porcelain`.
+- A contract's scope is `paths` plus `incidental` everywhere: the write policy, the scope check, verify and lanes. P-0019's C-0083 paused because the write hook alone left `incidental` out.
 - Workers may `cd` only to an absolute path inside their worktree or their scratch directory; `tests/test_policy.py` holds the allow and deny strings.
 - Scheduler worktrees live under ATeam's home (<home>/worktrees/<lane's first cid>); policy tests for home reads must include a worktree under the home, not only one outside it.
 - A lane's contracts share <home>/worktrees/<first cid>; find a contract's worktree with `worktrees.worktree_path`, never from its id.
