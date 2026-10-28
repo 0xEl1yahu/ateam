@@ -18,16 +18,26 @@ from ateam.state.db import StateDB
 from test_integrate import _commit_on_main, _fake_planner, _set_config, run
 
 NAMES = {"C-0001": "a", "C-0002": "b", "C-0003": "c"}
+LETTERS = {f"C-{i:04d}": name for i, name in enumerate("abcdefgh", 1)}   # the files FakeWorkers commits for each contract
+
+
+def _contract(name, depends_on, shared=False):
+    return {"title": f"Add {name}", "paths": [*(["src/shared/**"] if shared else []), f"src/{name}/**", f"tests/test_{name}.py"],
+            "incidental": [], "depends_on": depends_on,
+            "acceptance": [{"id": "A1", "statement": f"{name}() works", "check": {"type": "test", "ref": f"tests/test_{name}.py::test_{name}"}}],
+            "checks": ["unit"], "allocation": {"complexity": "low", "risk": "low", "uncertainty": "low", "reasoning": "small",
+                                               "tier": {"build": "light", "test": "light", "investigate": "none"}}}
 
 
 def _report3():
-    def contract(name, depends_on):
-        return {"title": f"Add {name}", "paths": [f"src/{name}/**", f"tests/test_{name}.py"], "incidental": [], "depends_on": depends_on,
-                "acceptance": [{"id": "A1", "statement": f"{name}() works", "check": {"type": "test", "ref": f"tests/test_{name}.py::test_{name}"}}],
-                "checks": ["unit"], "allocation": {"complexity": "low", "risk": "low", "uncertainty": "low", "reasoning": "small",
-                                                   "tier": {"build": "light", "test": "light", "investigate": "none"}}}
-    return {"title": "Three parts", "contracts": [contract("a", []), contract("b", [0]), contract("c", [])],
+    return {"title": "Three parts", "contracts": [_contract("a", []), _contract("b", [0]), _contract("c", [])],
             "proposed_records": [], "unknowns": [], "notes": "n"}
+
+
+def _report_of(*specs):
+    """One contract per (shared, depends_on) spec, named a, b, c...: src/<name>/** and its test, plus src/shared/**
+    when shared (so the shared ones form one lane); depends_on holds indices, as the planner reports them."""
+    return {**_report3(), "contracts": [_contract(name, deps, shared) for (shared, deps), name in zip(specs, "abcdefgh")]}
 
 
 @pytest.fixture
@@ -71,7 +81,7 @@ class FakeWorkers:
                     (worktree / rel).write_text(f"# {rel} resolved by {cid}\n")
                 g.run("add", "-A"); g.run("commit", "-q", "--no-edit")
             elif role == "build" and commit:
-                name = NAMES[cid]
+                name = LETTERS[cid]
                 (worktree / "src" / name).mkdir(parents=True, exist_ok=True)
                 (worktree / "src" / name / f"{name}.py").write_text(f"def {name}():\n    return '{name}'  # {n}\n")
                 (worktree / "tests" / f"test_{name}.py").write_text(f"def test_{name}():\n    assert True\n")
@@ -146,9 +156,9 @@ def test_happy_path_merges_at_verify_and_stops_at_merge_proposed(plan3):
     cs = load_contracts(plan3.paths.contracts)
     assert all(cs[c].status == "integrated" for c in NAMES) and all(_db(plan3).contract_status(c) == "integrated" for c in NAMES)
     assert load_plans(plan3.paths.plans)["P-0001"].status == "merge_proposed" and s.proposal and s.proposal.is_file()
-    lane = home_dir(plan3.root) / "worktrees" / "C-0001"   # b depends on a: one lane, one worktree
-    assert (lane / "src" / "a" / "a.py").is_file() and (lane / "src" / "b" / "b.py").is_file()
-    assert not (home_dir(plan3.root) / "worktrees" / "C-0002").exists()
+    # b depends on a, but their files do not overlap: two lanes, two worktrees (owner decision 4, 2026-10-28 design)
+    worktrees = home_dir(plan3.root) / "worktrees"
+    assert (worktrees / "C-0001" / "src" / "a" / "a.py").is_file() and (worktrees / "C-0002" / "src" / "b" / "b.py").is_file()
     assert GitRepo(plan3.root).rev_parse("main") == plan3.main and _db(plan3).run_lock_info() is None
     assert any("C-0001 build completed" in line for line in out)
 
@@ -197,7 +207,7 @@ def test_dry_run_writes_nothing_and_shows_worst_case(plan3):
     s, out = _run(plan3, fake, dry_run=True)
     text = "\n".join(out)
     assert s.outcome == "dry_run" and fake.calls == []
-    assert "2 lane(s), up to 2 at once" in text and "lane 1: C-0001 -> C-0002" in text and "lane 2: C-0003" in text
+    assert "3 lane(s), up to 2 at once" in text and out[2:5] == ["lane 1: C-0001", "lane 2: C-0002", "lane 3: C-0003"]
     attempts = load_contracts(plan3.paths.contracts)["C-0001"].budget.attempts   # the planner's light-tier budget
     per_contract = (1.0 + 1.0) + (attempts - 1) * (2.0 + 2.0)   # first attempt light, the rest escalated to standard
     assert f"worst case ${3 * per_contract:.2f}" in text and "run budget $10.00" in text
@@ -413,7 +423,7 @@ def test_dependent_waits_for_its_dependency_to_be_integrated(plan3, monkeypatch)
         m.setattr(sch, "merge_contract", slow_merge)
         s, out = _run(plan3, FakeWorkers())
     assert s.outcome == "merge_proposed", out
-    assert (home_dir(plan3.root) / "worktrees" / "C-0001" / "src" / "b" / "b.py").is_file()   # b ran in a's lane worktree
+    assert (home_dir(plan3.root) / "worktrees" / "C-0002" / "src" / "b" / "b.py").is_file()   # b is a lane of its own
 
 
 def test_a_verified_result_without_the_store_agreeing_is_not_merged(plan3):
@@ -717,12 +727,15 @@ def _c(paths, incidental=(), depends_on=()):
     pytest.param({"A": _c(["src/m/*.py"]), "B": _c(["src/m/x.py"])}, ["src/m/x.py"], [["A", "B"]], id="overlapping globs"),
     pytest.param({"A": _c(["src/x/**"]), "B": _c(["src/x/new.py"])}, [], [["A", "B"]], id="glob vs literal new file"),
     pytest.param({"A": _c(["src/y/**"]), "B": _c(["src/y/**"])}, [], [["A", "B"]], id="identical globs, no files"),
-    pytest.param({"A": _c(["a/**"]), "B": _c(["b/**"], depends_on=["A"])}, ["a/1", "b/1"], [["A", "B"]], id="dependency only"),
+    # Owner decision 4 of the 2026-10-28 design: only overlapping files join lanes, so dependents of one contract fan out
+    pytest.param({"A": _c(["a/**"]), "B": _c(["b/**"], depends_on=["A"])}, ["a/1", "b/1"], [["A"], ["B"]], id="dependency only"),
     pytest.param({"A": _c(["a/**"], incidental=["shared.cfg"]), "B": _c(["shared.cfg"])}, ["shared.cfg"], [["A", "B"]],
                  id="incidental counts"),
     pytest.param({"A": _c(["a/**"]), "B": _c(["b/**"])}, ["a/1", "b/1"], [["A"], ["B"]], id="disjoint"),
-    pytest.param({"C": _c(["c/**"], depends_on=["B"]), "B": _c(["b/**"], incidental=["a/1"]), "A": _c(["a/**"]), "D": _c(["d/**"])},
-                 ["a/1", "b/1", "c/1", "d/1"], [["A", "B", "C"], ["D"]], id="transitive, ordered by deps then id"),
+    # Files join A-B-C through B; D depends on A but shares no file (owner decision 4, 2026-10-28 design)
+    pytest.param({"C": _c(["c/**"], incidental=["b/1"]), "B": _c(["b/**"], incidental=["a/1"], depends_on=["C"]), "A": _c(["a/**"]),
+                  "D": _c(["d/**"], depends_on=["A"])},
+                 ["a/1", "b/1", "c/1", "d/1"], [["A", "C", "B"], ["D"]], id="transitive, ordered by deps then id"),
     pytest.param({"A": _c(["a/**"], depends_on=["Z"])}, ["a/1"], [["A"]], id="dependency outside the plan ignored"),
 ])
 def test_lanes(contracts, files, expected):
@@ -1127,6 +1140,133 @@ def test_an_uneditable_conflict_is_marked_in_the_pause(target_repo, monkeypatch)
     assert r.exit_code == 4 and "shared.lock" in r.output and "C-0001 may not edit" in r.output, r.output
     out = run("status", "P-0001", "--target", str(p.root)).output
     assert "shared.lock, which C-0001 may not edit" in out and "reject the plan" in out and "ateam resume P-0001" not in out, out
+
+
+# ---- fan-out and the lane hold rule (2026-10-28 design, owner decision 4)
+
+def _spans(fake, cid):
+    times = [(t0, t1) for c, _role, t0, t1, *_ in fake.intervals if c == cid]
+    return min(t for t, _ in times), max(t for _, t in times)
+
+
+def _crashing(fake, cid, role, worktree, n):
+    raise RuntimeError("power cut")
+
+
+def test_dependents_of_one_contract_fan_out_after_it_is_integrated(target_repo, monkeypatch):
+    p = _approve_lanes(target_repo, monkeypatch, max_workers=3, report=_report_of((False, []), (False, [0]), (False, [0]), (False, [0])))
+    assert "4 lane(s), up to 3 at once" in p.approve_output
+    seen, dependents = {}, ("C-0002", "C-0003", "C-0004")
+    together = threading.Barrier(len(dependents), timeout=30)   # worktree creation no longer holds sessions back
+
+    def note(fake, cid, role, worktree, n):
+        with StateDB(home_dir(p.root) / "state.db") as db:   # the scheduler's thread: closed here
+            seen[cid] = db.contract_status("C-0001")
+        try:
+            together.wait()   # every dependent's BUILD is in flight at once
+        except threading.BrokenBarrierError:
+            seen[cid] = "ran alone"
+        return {}
+
+    fake = FakeWorkers({(cid, "build", 0): note for cid in dependents})
+    s, out = _run(p, fake)
+    assert s.outcome == "merge_proposed", out
+    assert seen == {cid: "integrated" for cid in dependents}
+    span = {cid: (t0, t1) for cid, role, t0, t1, *_ in fake.intervals if role == "build"}
+    assert all(span[x][0] < span[y][1] and span[y][0] < span[x][1] for x, y in [dependents[:2], dependents[1:], dependents[::2]])
+    assert all(_builds(fake, cid)[0][4] == home_dir(p.root) / "worktrees" / cid for cid in dependents)
+
+
+@pytest.mark.parametrize("stopper", ["interrupted", "crash"])
+def test_a_started_lane_member_holds_the_lane_across_a_rerun(target_repo, monkeypatch, stopper):
+    """C-0001 is a lane of its own; C-0002 (depending on C-0001) and C-0003 share a lane. C-0003 starts first and is
+    stopped. On the re-run C-0001 is integrated first, so C-0002 could start, but C-0003 has started and holds the lane."""
+    p = _approve_lanes(target_repo, monkeypatch, report=_report_of((False, []), (True, [0]), (True, [])))
+    stop, idle = threading.Event(), {("C-0001", "build", 0): {"code": 130, "outcome": "interrupted", "commit": False}}
+    if stopper == "interrupted":
+        assert _run(p, FakeWorkers({**idle, ("C-0003", "build", 0): _interrupting(stop)}), stop=stop)[0].outcome == "interrupted"
+    else:
+        with pytest.raises(RuntimeError, match="power cut"):
+            _run(p, FakeWorkers({**idle, ("C-0003", "build", 0): _crashing}))
+    db = _db(p)
+    assert db.get_meta("base:C-0003") and db.contract_status("C-0003") == "ready" and db.get_meta("base:C-0002") is None
+    _set_config(p.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)   # C-0001 first, then one at a time
+    seen = {}
+
+    def note(fake, cid, role, worktree, n):
+        with StateDB(home_dir(p.root) / "state.db") as db:   # the scheduler's thread: closed here
+            seen[cid] = {c: db.contract_status(c) for c in ("C-0001", "C-0003")} | {"cut C-0002": db.get_meta("base:C-0002") is not None}
+        return {}
+
+    fake = FakeWorkers({("C-0003", "build", 0): note, ("C-0002", "build", 0): note})
+    s, out = _run(p, fake)
+    assert s.outcome == "merge_proposed", out
+    assert seen["C-0003"]["C-0001"] == "integrated" and not seen["C-0003"]["cut C-0002"]   # C-0002 was ready, C-0003 held
+    assert seen["C-0002"]["C-0003"] == "integrated"
+    lane = home_dir(p.root) / "worktrees" / "C-0003"
+    assert _builds(fake, "C-0003")[0][4] == lane == _builds(fake, "C-0002")[0][4] and _db(p).get_meta("lane:C-0002") == "C-0003"
+
+
+@pytest.mark.parametrize("specs, waiting, dep, later, head", [
+    pytest.param([(True, [2]), (True, []), (False, [])], "C-0001", "C-0003", "C-0002", "C-0002", id="the lane's first member waits"),
+    pytest.param([(True, []), (True, [3]), (True, []), (False, [0])], "C-0002", "C-0004", "C-0003", "C-0001", id="a middle member waits"),
+])
+def test_a_waiting_contract_does_not_block_a_ready_one_later_in_its_lane(target_repo, monkeypatch, specs, waiting, dep, later, head):
+    p = _approve_lanes(target_repo, monkeypatch, report=_report_of(*specs))
+    seen = {}
+
+    def note(fake, cid, role, worktree, n):
+        with StateDB(home_dir(p.root) / "state.db") as db:   # the scheduler's thread: closed here
+            seen[cid] = {c: db.contract_status(c) for c in (dep, later)}
+        return {}
+
+    fake = FakeWorkers({(waiting, "build", 0): note}, delay=0.1)
+    s, out = _run(p, fake)
+    assert s.outcome == "merge_proposed", out
+    built = [c[0] for c in fake.calls if c[1] == "build"]
+    assert built.index(later) < built.index(waiting) and seen[waiting] == {dep: "integrated", later: "integrated"}
+    db, lane = _db(p), home_dir(p.root) / "worktrees" / head
+    w = _builds(fake, waiting)[0]
+    assert w[4] == lane and db.get_meta(f"lane:{waiting}") == head and w[5] == db.get_meta(f"base:{waiting}")
+    assert (lane / "src" / LETTERS[dep] / f"{LETTERS[dep]}.py").is_file()   # its base is the integration tip, which holds dep
+    assert _builds(fake, dep)[0][4] == home_dir(p.root) / "worktrees" / dep   # dep is a lane of its own: the dependency joins nothing
+    members = [cid for cid, (shared, _) in zip(LETTERS, specs) if shared]
+    assert all(_spans(fake, x)[1] <= _spans(fake, y)[0] or _spans(fake, y)[1] <= _spans(fake, x)[0]
+               for i, x in enumerate(members) for y in members[i + 1:])   # two members of one lane never run at once
+    if head != "C-0001":
+        assert not (home_dir(p.root) / "worktrees" / "C-0001").exists()
+
+
+def test_after_is_the_lane_member_already_in_the_worktree(target_repo, monkeypatch):
+    """Lane C-0001 -> C-0002 -> C-0003, with C-0002 waiting on C-0004 (which waits on C-0001): C-0003 runs second and
+    joins the worktree after C-0001, never after C-0002, which has not run."""
+    import ateam.scheduler as sch
+    p = _approve_lanes(target_repo, monkeypatch, report=_report_of((True, []), (True, [3]), (True, []), (False, [0])))
+    real, calls = sch.contract_worktree, []
+
+    def spy(paths, db, owner, plan_id, cid, after=None):
+        calls.append((cid, after, after is None or db.get_meta(f"lane:{after}") is not None))
+        return real(paths, db, owner, plan_id, cid, after=after)
+
+    monkeypatch.setattr(sch, "contract_worktree", spy)
+    s, out = _run(p, FakeWorkers())
+    assert s.outcome == "merge_proposed", out
+    assert {cid: after for cid, after, _ in calls} == {"C-0001": None, "C-0004": None, "C-0003": "C-0001", "C-0002": "C-0001"}
+    assert all(cut for *_, cut in calls)   # `after` is always a member already in the worktree
+
+
+def test_the_p0018_shape_with_a_dependency_prints_two_lanes(target_repo, monkeypatch):
+    """The P-0018 shape with C-0003 depending on C-0001, files disjoint: the dependency alone no longer joins lanes."""
+    _commit_on_main(target_repo, "src/ateam/cli.py", "def main():\n    pass\n")
+    _commit_on_main(target_repo, "src/ateam/runner/policy.py", "POLICY = {}\n")
+    report = _report3()
+    for c, paths, deps in zip(report["contracts"], (["src/ateam/cli.py", "tests/test_a.py"], ["src/ateam/cli.py", "tests/test_b.py"],
+                                                    ["src/ateam/runner/policy.py", "tests/test_c.py"]), ([], [], [0])):
+        c["paths"], c["depends_on"] = paths, deps
+    p = _approve_lanes(target_repo, monkeypatch, report=report)
+    s, out = _run(p, FakeWorkers(), dry_run=True)
+    assert s.outcome == "dry_run"
+    assert out[1:4] == ["2 lane(s), up to 2 at once", "lane 1: C-0001 -> C-0002", "lane 2: C-0003"], out
 
 
 # -- Gate modes (overlap gate design, owner 2026-10-28) ------------------------------------------------------------
