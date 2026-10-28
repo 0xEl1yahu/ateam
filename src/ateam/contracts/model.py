@@ -48,11 +48,26 @@ class Acceptance(BaseModel):
     check: Check
 
 
+HEADER_STARTS = ("def ", "async def ", "class ")
+
+
+def normalise_header(text: str) -> str | None:
+    """Normalise a def/async def/class header line for comparison; None if the text is not a header."""
+    line = " ".join(text.split())
+    if not line.startswith(HEADER_STARTS) or not line.endswith(":"):
+        return None
+    line = re.sub(r"([(\[{]) ", r"\1", line)
+    return re.sub(r" ([)\]}])", r"\1", line)
+
+
 class Interface(BaseModel):
     kind: Literal["produces", "consumes"]
     name: str
     signature: str
     note: str = ""
+
+    def code_header(self) -> str | None:
+        return normalise_header(self.signature)
 
 
 class Allocation(BaseModel):

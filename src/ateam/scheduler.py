@@ -40,7 +40,7 @@ from ateam.gitops import GitError, GitRepo, MergeConflict
 from ateam.globs import matches
 from ateam.integrate import (IntegrateRefused, integration_branch, integration_worktree, merge_contract, prepare_integration,
                              reconcile_contracts, reconcile_feature, reopen_for_rebase)
-from ateam.intent import IntentError, require_clean
+from ateam.intent import WRITER_KEY, IntentError, intent_git, record_coordinator_commits, require_clean
 from ateam.paths import home_dir
 from ateam.plans.ops import dependency_order, plan_contract_ids, set_plan_status
 from ateam.plans.store import load_plans
@@ -74,14 +74,17 @@ class RunSummary:
 
 
 class Gate:
-    """Readers (sessions) share; a writer (a step that commits or creates refs) runs alone. Writer-preferring: while a
-    writer waits, no new reader starts, so commits are not starved by a stream of sessions."""
+    """Three modes. Readers (sessions) share. A writer (a step that commits to the intent repo or merges: refresh,
+    merge-at-verify) runs beside sessions but alone among writers; a running session's tamper check accepts the
+    intent commits it records (overlap gate design, owner 2026-10-28). Exclusive (verify, run start and end) runs
+    alone. Exclusive-preferring: while it waits, no new reader or writer starts, so it is not starved."""
 
     def __init__(self) -> None:
         self._cond = threading.Condition()
         self._readers = 0
-        self._writer = False
-        self._waiting = 0
+        self._writing = False     # a writer is in
+        self._writer = False      # exclusive is in
+        self._waiting = 0         # exclusive steps waiting
 
     @contextmanager
     def shared(self) -> Iterator[None]:
@@ -97,10 +100,23 @@ class Gate:
                 self._cond.notify_all()
 
     @contextmanager
+    def writer(self) -> Iterator[None]:
+        with self._cond:
+            while self._writer or self._writing or self._waiting:
+                self._cond.wait()
+            self._writing = True
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._writing = False
+                self._cond.notify_all()
+
+    @contextmanager
     def exclusive(self) -> Iterator[None]:
         with self._cond:
             self._waiting += 1
-            while self._writer or self._readers:
+            while self._writer or self._writing or self._readers:
                 self._cond.wait()
             self._waiting -= 1
             self._writer = True
@@ -110,6 +126,11 @@ class Gate:
             with self._cond:
                 self._writer = False
                 self._cond.notify_all()
+
+
+@contextmanager
+def _no_lock() -> Iterator[None]:
+    yield
 
 
 class LockedEcho:
@@ -426,6 +447,7 @@ class _Run:
         self.tiers = load_tiers(ctx.config.tiers)
         self.sessions = 0
         self._counter, self._counter_lock = 0, threading.Lock()
+        self._refs = threading.Lock()   # ATeam's own git ref and worktree creation, one at a time; taken after the Gate
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         self.runs_dir = fresh_dir(home_dir(ctx.paths.root) / "runs" / plan_id, f"{stamp}-{os.getpid()}")   # never reused
         self.lanes: list[list[str]] = []
@@ -649,7 +671,7 @@ class _Run:
                 return o
             rebase = o.evidence["paths"]
         elif db.contract_status(cid) == "building":   # a rebase that an interruption, a pause or a crash stopped
-            with self.gate.exclusive():
+            with self.gate.exclusive(), self._refs:
                 o = self._continue_rebase(ctx, cid)
             if isinstance(o, _Outcome):
                 return o
@@ -659,7 +681,7 @@ class _Run:
             elif rebase is None:   # concluded, and the owner resumed since: what failed after it gets an ordinary BUILD
                 prompt = _retry_prompt(load_contracts(ctx.paths.contracts)[cid], "the attempt after its rebase was stopped or did not pass")
         c = load_contracts(ctx.paths.contracts)[cid]
-        with self.gate.exclusive():
+        with self._refs:   # not the Gate: nothing a running session's or a verify's tamper check covers (T4, owner 2026-10-28)
             try:
                 after = self._after(db, cid)
                 w = contract_worktree(ctx.paths, db, ctx.git, self.plan_id, cid, after=after)
@@ -743,7 +765,7 @@ class _Run:
             for stage_used in range(allowed + 1):
                 if self.halt.is_set():
                     return _Outcome(cid, "halted")
-                with self.gate.exclusive():
+                with self._writing(ctx, refs=False):   # beside sessions, never beside another writer (owner, 2026-10-28)
                     rf = self._result_path(cid, "verify")
                     v = self.child([*ateam_argv(), "verify", cid, "--cwd", str(w.path), "--base", w.base, "--result-file", str(rf),
                                     "--target", str(ctx.paths.root)], rf)
@@ -772,8 +794,25 @@ class _Run:
             if o.kind != "rebase":
                 return o
             rebase, prompt = o.evidence["paths"], _rebase_prompt(c, o.evidence["paths"])
-            with self.gate.exclusive():
+            with self.gate.exclusive(), self._refs:
                 w = contract_worktree(ctx.paths, db, ctx.git, self.plan_id, cid)   # its base is now the integration tip
+
+    @contextmanager
+    def _writing(self, ctx, refs: bool = True) -> Iterator[None]:
+        """A writer step (merge, refresh, verify) beside running sessions (overlap gate design, owner 2026-10-28): it
+        reads the intent HEAD inside its locks, marks itself active, and records its own `ateam:` intent commits in a
+        finally, so a session's intent check accepts exactly those. Callers take it; _refresh never does."""
+        with self.gate.writer(), (self._refs if refs else _no_lock()):
+            intent = intent_git(ctx.paths)
+            before = intent.head()
+            ctx.db.set_meta(WRITER_KEY, self.plan_id)
+            try:
+                yield
+            finally:
+                try:
+                    record_coordinator_commits(ctx.db, intent, before)
+                finally:
+                    ctx.db.delete_meta(WRITER_KEY)
 
     def _blocks(self, db, cid: str) -> str:
         """`; blocks C-x, C-y (same lane)` for the lane's other unintegrated members: `cid` holds the lane until it is
@@ -798,7 +837,9 @@ class _Run:
         actual = usd
         try:
             with self.gate.shared():
-                if self.halt.is_set():   # stop or a pause arrived while this session waited at the gate
+                # stop or a pause arrived while this session waited. Ctrl-C sets `stop` at once; `halt` follows only on
+                # the main loop's next poll, and a verify no longer holds sessions back until then (owner, 2026-10-28)
+                if self.halt.is_set() or self.stop.is_set():
                     actual = 0.0
                     return _Outcome(cid, "halted")
                 with self._counter_lock:
@@ -813,12 +854,12 @@ class _Run:
         return r
 
     def _merge(self, ctx, cid: str) -> _Outcome:
-        with self.gate.exclusive():
+        with self._writing(ctx):
             wt = GitRepo(integration_worktree(ctx.paths, self.plan_id))
             try:
                 merge_contract(ctx, wt, self.plan_id, cid, self.say)
             except MergeConflict as e:
-                return self._conflict(ctx, cid, list(e.paths))   # inside the exclusive step: the Gate is not reentrant
+                return self._conflict(ctx, cid, list(e.paths))   # inside the writer step: neither lock is reentrant
             self._refresh(ctx)
         return _Outcome(cid, "done")
 

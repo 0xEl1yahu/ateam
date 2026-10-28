@@ -205,3 +205,86 @@ def test_compare_untracked_output_and_owner_edits_are_warnings_only():
 ])
 def test_walk_to(current, final, walk):
     assert walk_to(current, final) == walk
+
+
+def _git_root(tmp_path, files):
+    from ateam.gitops import GitRepo
+
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    for rel, text in files.items():
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text(text)
+    g = GitRepo(tmp_path)
+    g.run("init", "-q"); g.run("add", "-A")
+    g.run("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x")
+    return tmp_path
+
+
+def _produces(sample_contract, *pairs, kind="produces"):
+    from ateam.contracts.model import Interface
+
+    return sample_contract.model_copy(update={"interfaces": [Interface(kind=kind, name=n, signature=s) for n, s in pairs]})
+
+
+def _presence(sample_contract, tmp_path, files, *pairs, kind="produces"):
+    from ateam.verify import interface_presence
+
+    root = _git_root(tmp_path, files)
+    return {r.id: r for r in interface_presence(_produces(sample_contract, *pairs, kind=kind), root)}
+
+
+def test_interface_presence_matching_header(sample_contract, tmp_path):
+    got = _presence(sample_contract, tmp_path, {"src/api/a.py": "def f(x: int) -> str:\n    return ''\n"},
+                    ("f", "def f(x: int) -> str:"))
+    assert got["f"].ok is True and got["f"].kind == "interface"
+
+
+def test_interface_presence_real_headers(sample_contract, tmp_path):
+    src = (
+        "def a(\n    x: int,\n    y: str = 'k'\n) -> dict[str, list[int]] | None:\n    pass\n\n"
+        "def b(v, sep: str = '):') -> str:\n    pass\n\n"
+        "def c(v: 'Foo') -> 'Bar':\n    pass\n\n"
+        "@deco(1)\ndef d(x):\n    pass\n\n"
+        "async def e(x: int) -> None:\n    pass\n\n"
+        "def contract_worktree(paths: TargetPaths, db: StateDB,\n                      owner: GitRepo) -> ContractWorktree:\n    pass\n"
+    )
+    pairs = [
+        ("a", "def a(x: int, y: str = 'k') -> dict[str, list[int]] | None:"),
+        ("b", "def b(v, sep: str = '):') -> str:"),
+        ("c", "def c(v: 'Foo') -> 'Bar':"),
+        ("d", "def d(x):"),
+        ("e", "async def e(x: int) -> None:"),
+        ("contract_worktree", "def contract_worktree(paths: TargetPaths, db: StateDB, owner: GitRepo) -> ContractWorktree:"),
+    ]
+    got = _presence(sample_contract, tmp_path, {"src/api/m.py": src}, *pairs)
+    assert {k: r.ok for k, r in got.items()} == {n: True for n, _ in pairs}, got
+
+
+def test_interface_presence_mismatch_and_missing(sample_contract, tmp_path):
+    files = {
+        "src/api/a.py": "def f(x: int) -> str:\n    pass\n\nclass K:\n    def only_method(self):\n        pass\n",
+        "elsewhere/b.py": "def outside(x):\n    pass\n",
+    }
+    got = _presence(sample_contract, tmp_path, files, ("f", "def f(x: str) -> str:"), ("outside", "def outside(x):"),
+                    ("only_method", "def only_method(self):"))
+    assert [got[n].ok for n in ("f", "outside", "only_method")] == [False, False, False]
+    assert "def f(x: str) -> str:" in got["f"].detail and "def f(x: int) -> str:" in got["f"].detail
+
+
+def test_interface_presence_methods_classes_and_duplicates(sample_contract, tmp_path):
+    files = {
+        "src/api/a.py": "class K(Base):\n    def m(self, x):\n        pass\n\ndef dup(a):\n    pass\n\ndef dup(a, b):\n    pass\n",
+        "src/api/b.py": "def dup(z):\n    pass\n\ndef g():\n    pass\n",
+    }
+    got = _presence(sample_contract, tmp_path, files,
+                    ("K.m", "def m(self, x):"), ("K.nope", "def nope(self):"), ("K", "class K(Base):"),
+                    ("dup", "def dup(z):"), ("pkg.mod.g", "def g():"))
+    assert [got[n].ok for n in ("K.m", "K.nope", "K", "dup", "pkg.mod.g")] == [True, False, True, True, True]
+
+
+def test_interface_presence_non_code_is_reported_not_failed(sample_contract, tmp_path):
+    got = _presence(sample_contract, tmp_path, {"src/api/a.py": "X = 1\n"},
+                    ("--flag", "--flag <n>"), ("X", "X = 1"), ("free", "does things"))
+    assert all(r.ok is None and r.detail == "not checked by minimal verify" for r in got.values())
+    got = _presence(sample_contract, tmp_path / "c", {"src/api/a.py": "X = 1\n"}, ("f", "def f():"), kind="consumes")
+    assert got["f"].ok is None

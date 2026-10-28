@@ -1787,3 +1787,54 @@ def test_own_worktree_rule_never_opens_a_home_nested_in_the_worktree(tmp_path, r
     assert pol.command_allowed(f"cat {home}/intent/config.yaml") == (False, HOME_REASON)
     assert pol.command_allowed("cat .ateam-home/intent/config.yaml") == (False, HOME_REASON)
     assert pol._decide("Read", {"file_path": f"{home}/intent/config.yaml"}) == (False, READ_HOME_REASON)
+
+
+# -- signals: kill only by numeric PID; never pkill or killall (owner, 2026-10-28) ------------------------------------
+# P-0019: one worker's `pkill -f pytest` killed another worker's session; two BUILD attempts were lost that way.
+
+SIGNAL_DENY = [
+    "pkill -f pytest",
+    "killall python3.14",
+    "/usr/bin/pkill pytest",
+    "nohup pkill -f claude",
+    "env pkill pytest",
+    "timeout 5 killall node",
+    "sleep 1; pkill -f pytest",
+    'bash -c "pkill -f pytest"',
+    "pgrep -f pytest | xargs kill",
+    "pgrep -f pytest | xargs kill -9",
+    "kill $(pgrep -f pytest)",
+    "kill `pgrep -f pytest`",
+    "kill $PID",
+    "kill %1",
+    "kill -9 -1",
+    "kill -s KILL -1",
+    "kill -- -4242",
+    "kill 0",
+    "kill",
+    "kill -9",
+    "kill -l",
+]
+
+SIGNAL_ALLOW = [
+    "kill 12345",
+    "kill -9 12345",
+    "kill -TERM 12345 12346",
+    "kill -s TERM 12345",
+    "kill -- 12345",
+    "/bin/kill 12345",
+]
+
+
+@pytest.mark.parametrize("role_fixture", ["policy_build", "policy_test"])
+@pytest.mark.parametrize("cmd", SIGNAL_DENY)
+def test_signalling_by_name_or_non_numeric_target_is_denied(request, role_fixture, cmd):
+    ok, reason = request.getfixturevalue(role_fixture).command_allowed(cmd)
+    assert not ok, f"should deny: {cmd!r}"
+
+
+@pytest.mark.parametrize("role_fixture", ["policy_build", "policy_test"])
+@pytest.mark.parametrize("cmd", SIGNAL_ALLOW)
+def test_kill_by_numeric_pid_is_allowed(request, role_fixture, cmd):
+    ok, reason = request.getfixturevalue(role_fixture).command_allowed(cmd)
+    assert ok, f"should allow: {cmd!r} ({reason})"
