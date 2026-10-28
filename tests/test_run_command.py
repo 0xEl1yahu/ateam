@@ -35,7 +35,7 @@ def test_dry_run_command(plan3, monkeypatch):
     fake = FakeWorkers()
     _fake(monkeypatch, fake)
     r = run("run", "P-0001", "--dry-run", "--target", str(plan3.root))
-    assert r.exit_code == 0 and "lane 1: C-0001 -> C-0002" in r.output and "lane 2: C-0003" in r.output and "worst case $" in r.output and fake.calls == []
+    assert r.exit_code == 0 and "lane 1: C-0001\n" in r.output and "lane 2: C-0002\n" in r.output and "lane 3: C-0003" in r.output and "worst case $" in r.output and fake.calls == []
 
 
 def test_first_interrupt_sets_stop_and_a_second_exits_130():

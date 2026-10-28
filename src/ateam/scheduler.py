@@ -8,10 +8,13 @@ commits to the intent repo or creates refs runs alone under a writer-preferring 
 sessions and verifies never see another step's commit (owner, 2026-10-26). Retries follow ateam.retry; a run spends
 at most config.run_budget_usd on sessions. `ateam run` never merges into the target branch.
 
-Contracts whose declared paths overlap, or that depend on each other, form a lane (design 2026-10-27): a lane runs
-its contracts one after another in one shared worktree, each starting from the previous contract's verified head once
-that contract is integrated, and lanes run in parallel up to config.max_workers. A verified contract whose merge
-conflicts gets one rebase BUILD in its own worktree, then TEST and verify again (owner, 2026-10-27).
+Contracts whose declared files overlap form a lane (design 2026-10-27); a dependency alone never joins lanes, so the
+dependents of one contract fan out once it is integrated (owner decision 4, 2026-10-28). A lane runs its contracts one
+at a time in one shared worktree, each based on the integration tip, and lanes run in parallel up to
+config.max_workers. A contract starts only when its in-plan dependencies are integrated. A lane member that has started
+and is not integrated holds its lane, decided from the store so a re-run keeps it; otherwise the lane's next contract
+is the first ready one, so a contract waiting on another lane does not block the rest of its own. A verified contract
+whose merge conflicts gets one rebase BUILD in its own worktree, then TEST and verify again (owner, 2026-10-27).
 """
 
 from __future__ import annotations
@@ -354,9 +357,9 @@ def binding_problems(ctx, cids: list[str], cs: dict | None = None, records: dict
 
 def lanes(contracts: dict, cids: list[str], files: list[str]) -> list[list[str]]:
     """The plan's contracts grouped into lanes (design 2026-10-27, decision 1): two contracts share a lane when a file
-    matches a glob of each, when a glob of one names the other's glob taken as a path (a file not created yet), or
-    when one depends on the other; a lane is the connected group. Each lane is in dependency order, ties by id, and
-    lanes are ordered by their first contract."""
+    matches a glob of each, or when a glob of one names the other's glob taken as a path (a file not created yet); a
+    lane is the connected group. A dependency alone joins nothing (owner decision 4, 2026-10-28). Each lane is in
+    dependency order, ties by id, and lanes are ordered by their first contract."""
     globs = {cid: [*contracts[cid].paths, *contracts[cid].incidental] for cid in cids}
     hits = {cid: {f for f in files if any(matches(g, f) for g in globs[cid])} for cid in cids}
     parent = {cid: cid for cid in cids}
@@ -368,7 +371,7 @@ def lanes(contracts: dict, cids: list[str], files: list[str]) -> list[list[str]]
         return cid
 
     def overlap(a: str, b: str) -> bool:
-        if b in contracts[a].depends_on or a in contracts[b].depends_on or hits[a] & hits[b]:
+        if hits[a] & hits[b]:
             return True
         return any(ga == gb or matches(ga, gb) or matches(gb, ga) for ga in globs[a] for gb in globs[b])
 
@@ -426,7 +429,7 @@ class _Run:
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         self.runs_dir = fresh_dir(home_dir(ctx.paths.root) / "runs" / plan_id, f"{stamp}-{os.getpid()}")   # never reused
         self.lanes: list[list[str]] = []
-        self.prev: dict[str, str | None] = {}
+        self.running: dict[str, threading.Thread] = {}
 
     # -- the main loop -------------------------------------------------------
 
@@ -445,9 +448,8 @@ class _Run:
                 raise RunRefused(str(e)) from None
             self._refresh(ctx)
             self.lanes = plan_lanes(ctx, self.plan_id, load_contracts(ctx.paths.contracts), self.cids)
-            self.prev = {cid: (lane[i - 1] if i else None) for lane in self.lanes for i, cid in enumerate(lane)}
 
-        running: dict[str, threading.Thread] = {}
+        running = self.running
         settled: set[str] = set()
         pauses: list[_Outcome] = []
         errors: list[_Outcome] = []
@@ -478,8 +480,11 @@ class _Run:
             if errors or pauses or budget_stops or self.stop.is_set():
                 self.halt.set()
             if not self.halt.is_set():
-                free = ctx.config.max_workers - len(running)
-                for cid in [c for c in order if c not in running and c not in settled and self._startable(db, cs, c)][:max(free, 0)]:
+                for cid in order:   # one at a time: _startable sees each launch, so a lane never gets two
+                    if len(running) >= ctx.config.max_workers:
+                        break
+                    if cid in running or cid in settled or not self._startable(db, cs, cid):
+                        continue
                     t = threading.Thread(target=self._pipeline_thread, args=(cid,), name=f"ateam-run-{cid}", daemon=True)
                     running[cid] = t
                     t.start()
@@ -574,15 +579,35 @@ class _Run:
             if recorded is not None and recorded["findings"] is None and recorded["note"] is None:
                 note(f"investigation {outcome}: {r.get('error') or 'no findings written'}")
 
+    def _lane(self, cid: str) -> list[str]:
+        return next((lane for lane in self.lanes if cid in lane), [cid])
+
+    def _started(self, db, cid: str) -> bool:
+        """Durable, from the store: the contract was cut, has a BUILD attempt, or its status is past ready."""
+        return (db.get_meta(f"base:{cid}") is not None or bool(db.attempts_for(cid, role="build"))
+                or db.contract_status(cid) in ("building", "verifying", "verified", "failed", "paused"))
+
     def _startable(self, db, cs, cid: str) -> bool:
-        """Ready or failed contracts start only when every in-plan dependency, and the contract before them in their
-        lane, is integrated, so nothing is cut before the work it builds on is merged; a verified contract (stopped
-        before its merge) is merged at once."""
+        """A contract runs when it is its lane's next (owner decision 4, 2026-10-28): the lane member that has started
+        and is not integrated holds the lane, across re-runs; with none, the first in lane order that is ready or failed
+        with every in-plan dependency integrated. A verified contract (stopped before its merge) is merged at once and
+        a building one continues its rebase. Two members of a lane never run at once."""
+        lane = self._lane(cid)
+        if any(m in self.running for m in lane if m != cid):   # one just launched may not have recorded its start yet
+            return False
+        holder = next((m for m in lane if db.contract_status(m) != "integrated" and self._started(db, m)), None)
+        if holder is not None and holder != cid:
+            return False
         status = db.contract_status(cid)
-        if status in ("verified", "building"):   # building: only a rebase BUILD an interruption stopped
+        if holder == cid and status in ("verified", "building"):   # building: only a rebase BUILD an interruption stopped
             return True
-        before = [d for d in cs[cid].depends_on if d in self.cids] + ([self.prev[cid]] if self.prev.get(cid) else [])
-        return status in ("ready", "failed") and all(db.contract_status(d) == "integrated" for d in before)
+        due = lambda m: (db.contract_status(m) in ("ready", "failed")   # noqa: E731
+                         and all(db.contract_status(d) == "integrated" for d in cs[m].depends_on if d in self.cids))
+        return due(cid) and (holder == cid or next((m for m in lane if due(m)), None) == cid)
+
+    def _after(self, db, cid: str) -> str | None:
+        """The lane member already in the lane worktree (its lane head recorded), or None when none has been cut."""
+        return next((m for m in self._lane(cid) if m != cid and db.get_meta(f"lane:{m}") is not None), None)
 
     def _summary(self, outcome, statuses, messages, proposal=None) -> RunSummary:
         self.say(f"summary: {outcome}; {self.sessions} session(s), ${self.budget.spent:.2f} spent; "
@@ -636,10 +661,11 @@ class _Run:
         c = load_contracts(ctx.paths.contracts)[cid]
         with self.gate.exclusive():
             try:
-                w = contract_worktree(ctx.paths, db, ctx.git, self.plan_id, cid, after=self.prev.get(cid))
+                after = self._after(db, cid)
+                w = contract_worktree(ctx.paths, db, ctx.git, self.plan_id, cid, after=after)
             except WorktreeError as e:
                 return _Outcome(cid, "pause", "environment_failure", f"{cid}: {e}", evidence={"error": str(e)})
-            if self.prev.get(cid) and not db.attempts_for(cid, role="build"):   # a follower's first BUILD (owner, 2026-10-27)
+            if after is not None and not db.attempts_for(cid, role="build"):   # a follower's first BUILD (owner, 2026-10-27)
                 left = [path for _, path in GitRepo(w.path).status_porcelain()]
                 if left:
                     return _Outcome(cid, "pause", "environment_failure",
@@ -750,10 +776,10 @@ class _Run:
                 w = contract_worktree(ctx.paths, db, ctx.git, self.plan_id, cid)   # its base is now the integration tip
 
     def _blocks(self, db, cid: str) -> str:
-        """`; blocks C-x, C-y (same lane)` for the unfinished contracts after `cid` in its lane, which build on it."""
-        lane = next((lane for lane in self.lanes if cid in lane), [cid])
-        later = [c for c in lane[lane.index(cid) + 1:] if db.contract_status(c) != "integrated"]
-        return f"; blocks {', '.join(later)} (same lane)" if later else ""
+        """`; blocks C-x, C-y (same lane)` for the lane's other unintegrated members: `cid` holds the lane until it is
+        integrated."""
+        others = [c for c in self._lane(cid) if c != cid and db.contract_status(c) != "integrated"]
+        return f"; blocks {', '.join(others)} (same lane)" if others else ""
 
     def _counted_builds(self, db, cid: str) -> list[dict]:
         """BUILD attempts that count toward budget.attempts: those since the contract's latest resume window, and never
