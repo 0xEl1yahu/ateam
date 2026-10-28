@@ -2561,3 +2561,74 @@ def test_pause_investigate_brief_carries_the_log_tail(monkeypatch, cli_target, t
     assert r.exit_code == 0, r.output
     brief = calls[0]["brief_text"]
     assert "step line 80" in brief and "step line 21\n" in brief and "step line 20\n" not in brief
+
+
+# ---- approve and plans show: the shared-shapes table and the shape gate
+
+def _shaped_plan(monkeypatch, cli_target, consumer_sig="def health() -> str:", producers=1, consumer_depends=True):
+    from ateam.contracts.model import Interface
+    from ateam.contracts.store import save_contract
+
+    p = _proposed_plan(monkeypatch, cli_target, two=True)
+    cs = load_contracts(p.contracts)
+    prod = [Interface(kind="produces", name="health", signature="def health() -> str:")]
+    save_contract(p.contracts, cs["C-0002"].model_copy(update={"interfaces": prod}))
+    cons = [Interface(kind="consumes", name="health", signature=consumer_sig)]
+    if producers == 2:
+        cons.append(Interface(kind="produces", name="health", signature="def health() -> str:"))
+    save_contract(p.contracts, cs["C-0003"].model_copy(update={"interfaces": cons, "depends_on": ["C-0002"] if consumer_depends else []}))
+    commit_intent(p, "shapes", ["contracts"])
+    return p
+
+
+def _intent_snapshot(cli_target, p):
+    g = _intent_git(cli_target)
+    db = StateDB(home_dir(cli_target) / "state.db"); db.init_schema()
+    try:
+        state = (db.feature_status("P-0001"), db.contract_status("C-0002"), db.contract_hash("C-0003"))
+    finally:
+        db.close()
+    return (g.run("rev-parse", "HEAD"), g.run("status", "--porcelain"), {f.name: f.read_bytes() for f in p.contracts.glob("*.yaml")}, state)
+
+
+def test_approve_refuses_a_plan_with_a_shape_mismatch(monkeypatch, cli_target):
+    from ateam.plans.store import load_plans
+    p = _shaped_plan(monkeypatch, cli_target, consumer_sig="def health(verbose: bool) -> int:")
+    before = _intent_snapshot(cli_target, p)
+    r = run("approve", "P-0001", "--target", str(cli_target), input="o\n")
+    assert r.exit_code != 0 and "C-0003 consumes" in r.output and "ateam plan --replaces P-0001" in r.output
+    assert "Records proposed" not in r.output
+    assert _intent_snapshot(cli_target, p) == before and load_plans(p.plans)["P-0001"].status == "plan_proposed"
+
+
+def test_approve_refuses_duplicate_producers_and_missing_dependency(monkeypatch, cli_target):
+    from ateam.plans.store import load_plans
+    p = _shaped_plan(monkeypatch, cli_target, producers=2)
+    before = _intent_snapshot(cli_target, p)
+    r = run("approve", "P-0001", "--skip-records", "--target", str(cli_target))
+    assert r.exit_code != 0 and "both produce `health`" in r.output and "ateam plan --replaces P-0001" in r.output
+    assert _intent_snapshot(cli_target, p) == before and load_plans(p.plans)["P-0001"].status == "plan_proposed"
+
+
+def test_approve_refuses_a_consumer_that_does_not_depend_on_its_producer(monkeypatch, cli_target):
+    p = _shaped_plan(monkeypatch, cli_target, consumer_depends=False)
+    before = _intent_snapshot(cli_target, p)
+    r = run("approve", "P-0001", "--skip-records", "--target", str(cli_target))
+    assert r.exit_code != 0 and "does not list C-0002 in depends_on" in r.output
+    assert _intent_snapshot(cli_target, p) == before
+
+
+def test_approve_shows_the_shared_shapes_table(monkeypatch, cli_target):
+    p = _shaped_plan(monkeypatch, cli_target)
+    r = run("approve", "P-0001", "--skip-records", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert "Shared shapes:" in r.output and "health: def health() -> str:  (produced by C-0002; consumed by C-0003)" in r.output
+    assert load_contracts(p.contracts)["C-0002"].status == "ready"
+
+
+def test_plans_show_prints_the_shared_shapes_table(monkeypatch, cli_target):
+    _shaped_plan(monkeypatch, cli_target)
+    r = run("plans", "show", "P-0001", "--target", str(cli_target))
+    assert r.exit_code == 0, r.output
+    assert "add a health function" in r.output and r.output.index("add a health function") < r.output.index("Shared shapes:")
+    assert "health: def health() -> str:  (produced by C-0002; consumed by C-0003)" in r.output
