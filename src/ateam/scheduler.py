@@ -71,14 +71,17 @@ class RunSummary:
 
 
 class Gate:
-    """Readers (sessions) share; a writer (a step that commits or creates refs) runs alone. Writer-preferring: while a
-    writer waits, no new reader starts, so commits are not starved by a stream of sessions."""
+    """Three modes. Readers (sessions) share. A writer (a step that commits to the intent repo or merges: refresh,
+    merge-at-verify) runs beside sessions but alone among writers; a running session's tamper check accepts the
+    intent commits it records (overlap gate design, owner 2026-10-28). Exclusive (verify, run start and end) runs
+    alone. Exclusive-preferring: while it waits, no new reader or writer starts, so it is not starved."""
 
     def __init__(self) -> None:
         self._cond = threading.Condition()
         self._readers = 0
-        self._writer = False
-        self._waiting = 0
+        self._writing = False     # a writer is in
+        self._writer = False      # exclusive is in
+        self._waiting = 0         # exclusive steps waiting
 
     @contextmanager
     def shared(self) -> Iterator[None]:
@@ -94,10 +97,23 @@ class Gate:
                 self._cond.notify_all()
 
     @contextmanager
+    def writer(self) -> Iterator[None]:
+        with self._cond:
+            while self._writer or self._writing or self._waiting:
+                self._cond.wait()
+            self._writing = True
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._writing = False
+                self._cond.notify_all()
+
+    @contextmanager
     def exclusive(self) -> Iterator[None]:
         with self._cond:
             self._waiting += 1
-            while self._writer or self._readers:
+            while self._writer or self._writing or self._readers:
                 self._cond.wait()
             self._waiting -= 1
             self._writer = True

@@ -1088,3 +1088,66 @@ def test_an_uneditable_conflict_is_marked_in_the_pause(target_repo, monkeypatch)
     assert r.exit_code == 4 and "shared.lock" in r.output and "C-0001 may not edit" in r.output, r.output
     out = run("status", "P-0001", "--target", str(p.root)).output
     assert "shared.lock, which C-0001 may not edit" in out and "reject the plan" in out and "ateam resume P-0001" not in out, out
+
+
+# -- Gate modes (overlap gate design, owner 2026-10-28) ------------------------------------------------------------
+
+
+def _hold(cm, entered: threading.Event, release: threading.Event) -> threading.Thread:
+    def body():
+        with cm():
+            entered.set()
+            release.wait(5)
+    t = threading.Thread(target=body, daemon=True)
+    t.start()
+    return t
+
+
+def test_a_writer_enters_while_a_session_holds_the_gate():
+    from ateam.scheduler import Gate
+
+    g = Gate()
+    r_in, r_out, w_in, w_out = threading.Event(), threading.Event(), threading.Event(), threading.Event()
+    _hold(g.shared, r_in, r_out)
+    assert r_in.wait(2)
+    _hold(g.writer, w_in, w_out)
+    assert w_in.wait(2), "a writer must not wait for running sessions"
+    r_out.set(); w_out.set()
+
+
+def test_two_writers_never_overlap():
+    from ateam.scheduler import Gate
+
+    g = Gate()
+    a_in, a_out, b_in, b_out = threading.Event(), threading.Event(), threading.Event(), threading.Event()
+    _hold(g.writer, a_in, a_out)
+    assert a_in.wait(2)
+    _hold(g.writer, b_in, b_out)
+    assert not b_in.wait(0.3)
+    a_out.set()
+    assert b_in.wait(2)
+    b_out.set()
+
+
+def test_exclusive_waits_for_writers_and_sessions_and_holds_back_new_ones():
+    from ateam.scheduler import Gate
+
+    g = Gate()
+    r_in, r_out, w_in, w_out, x_in, x_out = (threading.Event() for _ in range(6))
+    _hold(g.shared, r_in, r_out)
+    _hold(g.writer, w_in, w_out)
+    assert r_in.wait(2) and w_in.wait(2)
+    _hold(g.exclusive, x_in, x_out)
+    time.sleep(0.1)
+    late_r, late_r_out, late_w, late_w_out = (threading.Event() for _ in range(4))
+    _hold(g.shared, late_r, late_r_out)
+    _hold(g.writer, late_w, late_w_out)
+    assert not x_in.wait(0.3), "exclusive (verify) waits for the running session and writer"
+    w_out.set()
+    assert not x_in.wait(0.3)
+    r_out.set()
+    assert x_in.wait(2)
+    assert not late_r.is_set() and not late_w.is_set(), "a waiting or running exclusive holds back new sessions and writers"
+    x_out.set()
+    assert late_r.wait(2) and late_w.wait(2)
+    late_r_out.set(); late_w_out.set()
