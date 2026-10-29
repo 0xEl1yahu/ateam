@@ -22,6 +22,10 @@ from ateam.records.store import next_id
 _CODE_ONLY = {"code", "test", "commit"}
 
 
+def _normalise_statement(statement: str) -> str:
+    return " ".join(statement.casefold().split())
+
+
 @dataclass
 class DiscoveryResult:
     proposed: list[Record] = field(default_factory=list)
@@ -34,11 +38,13 @@ class DiscoveryResult:
 
 def candidates_to_records(
     candidates: list[dict], unknowns: list[str], existing: dict[str, Record], repo_root: Path, records_dir: Path,
-    cap_global: int, by: str = "ateam-init", declared_paths: list[str] | tuple[str, ...] = (),
+    cap_global: int, by: str = "ateam-init", declared_paths: list[str] | tuple[str, ...] = ()
 ) -> DiscoveryResult:
     result = DiscoveryResult(unknowns=list(unknowns))
-    known = {r.fingerprint: r for r in existing.values()}
-    seen_batch: set[str] = set()
+    known: dict[str, list[Record]] = {}
+    for r in existing.values():
+        known.setdefault(r.fingerprint, []).append(r)
+    seen_batch: set[tuple[str, str]] = set()
     counter = int(next_id(records_dir).split("-")[1])
     globals_kept = 0
     now = datetime.now(UTC)
@@ -58,12 +64,16 @@ def candidates_to_records(
             result.dropped.append((cand, "no evidence cited; a record needs at least one reference"))
             continue
         fingerprint = compute_fingerprint(evidence)
-        if fingerprint in known:
-            if known[fingerprint].status == Status.rejected:
-                result.skipped_rejected.append(known[fingerprint].id)
+        statement_key = _normalise_statement(cand["statement"])
+        same_evidence = known.get(fingerprint, [])
+        rejected = next((r for r in same_evidence if r.status == Status.rejected), None)
+        if rejected is not None:
+            result.skipped_rejected.append(rejected.id)
             continue
-        if fingerprint in seen_batch:
-            result.dropped.append((cand, "duplicate of an earlier candidate in this batch (same evidence)"))
+        if any(_normalise_statement(r.statement) == statement_key for r in same_evidence):
+            continue
+        if (fingerprint, statement_key) in seen_batch:
+            result.dropped.append((cand, "duplicate of an earlier candidate in this batch (same evidence and statement)"))
             continue
 
         paths = list(cand.get("paths") or [])
@@ -102,7 +112,7 @@ def candidates_to_records(
             result.dropped.append((cand, f"invalid candidate: {str(e).splitlines()[0]}"))
             continue
         counter += 1
-        seen_batch.add(fingerprint)
+        seen_batch.add((fingerprint, statement_key))
         result.proposed.append(record)
     return result
 

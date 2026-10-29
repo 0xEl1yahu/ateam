@@ -27,7 +27,8 @@ def test_rejected_fingerprint_not_reproposed(target_repo, target_paths, sample_r
 
 def test_existing_fingerprint_skipped_silently(target_repo, target_paths, sample_record):
     ev = [Evidence(type="doc", ref="README.md#rules")]
-    existing = sample_record.model_copy(update={"evidence": ev, "fingerprint": compute_fingerprint(ev), "status": Status.approved})
+    existing = sample_record.model_copy(update={"evidence": ev, "fingerprint": compute_fingerprint(ev), "status": Status.approved,
+                                                "statement": "Routes never read environment variables directly"})
     r = candidates_to_records([cand()], [], {"R-0001": existing}, target_repo, target_paths.records, cap_global=5)
     assert r.proposed == [] and r.skipped_rejected == [] and r.dropped == []
 
@@ -67,7 +68,7 @@ def test_bad_enum_empty_evidence_blank_statement_and_batch_duplicates_are_droppe
         cand(statement="   ", evidence=[{"type": "doc", "ref": "README.md#a"}]),
         cand(evidence=[]),
         cand(statement="one", evidence=[{"type": "doc", "ref": "README.md#dup"}]),
-        cand(statement="two", evidence=[{"type": "doc", "ref": "README.md#dup"}]),
+        cand(statement="ONE ", evidence=[{"type": "doc", "ref": "README.md#dup"}]),
     ]
     r = candidates_to_records(cands, [], {}, target_repo, target_paths.records, cap_global=5)
     assert [p.statement for p in r.proposed] == ["one"]
@@ -96,3 +97,37 @@ def test_pending_path_record_is_dropped_without_a_declaring_contract(target_repo
     assert r.proposed == [] and len(r.dropped) == 1 and "dead glob" in r.dropped[0][1]
     r = candidates_to_records([c], [], {}, target_repo, target_paths.records, cap_global=3)
     assert r.proposed == [] and len(r.dropped) == 1
+
+
+def test_batch_duplicate_needs_same_evidence_and_statement(target_repo, target_paths):
+    same_ev = [{"type": "doc", "ref": "README.md#shared"}]
+    cands = [
+        cand(statement="Routes validate input", evidence=same_ev),
+        cand(statement="Routes authenticate callers", evidence=same_ev),
+        cand(statement="  routes   VALIDATE input ", evidence=same_ev),
+    ]
+    r = candidates_to_records(cands, [], {}, target_repo, target_paths.records, cap_global=5)
+    assert [p.statement for p in r.proposed] == ["Routes validate input", "Routes authenticate callers"]
+    assert all(p.status == Status.proposed for p in r.proposed)
+    assert len(r.dropped) == 1 and "same evidence and statement" in r.dropped[0][1]
+
+
+def test_stored_match_needs_same_statement(target_repo, target_paths, sample_record):
+    ev = [Evidence(type="doc", ref="README.md#rules")]
+    stored = sample_record.model_copy(update={"evidence": ev, "fingerprint": compute_fingerprint(ev), "status": Status.approved,
+                                              "statement": "Routes never read environment variables directly"})
+    same = candidates_to_records([cand(statement="routes never  read environment variables directly")], [], {"R-0001": stored},
+                                 target_repo, target_paths.records, cap_global=5)
+    assert same.proposed == [] and same.dropped == []
+    other = candidates_to_records([cand(statement="Routes return JSON only")], [], {"R-0001": stored},
+                                  target_repo, target_paths.records, cap_global=5)
+    assert [p.statement for p in other.proposed] == ["Routes return JSON only"]
+
+
+def test_rejected_evidence_never_returns_reworded(target_repo, target_paths, sample_record):
+    ev = [Evidence(type="doc", ref="README.md#rules")]
+    rejected = reject(sample_record.model_copy(update={"id": "R-0003", "evidence": ev, "fingerprint": compute_fingerprint(ev),
+                                                      "statement": "Routes never read environment variables directly"}), "no")
+    r = candidates_to_records([cand(statement="Handlers must not touch env vars")], [], {"R-0003": rejected},
+                              target_repo, target_paths.records, cap_global=5)
+    assert r.proposed == [] and r.skipped_rejected == ["R-0003"]
