@@ -12,6 +12,7 @@ from typing import Any
 
 from claude_agent_sdk import HookMatcher, PermissionResultAllow, PermissionResultDeny
 
+from ateam.events import EventLog, policy_denial_payload, record_injected_payload
 from ateam.globs import matches
 from ateam.records.model import Record
 from ateam.roles import Role
@@ -1060,6 +1061,7 @@ class Policy:
     bound: dict[str, list[Record]] = field(default_factory=dict)
     scratch_dir: Path | None = None   # the worker's own scratch dir under ATeam home; the only writable place outside the worktree
     ateam_home: Path | None = None    # the ATeam home base ($ATEAM_HOME or ~/.ateam); everything in it except scratch_dir is off limits
+    events: EventLog | None = None    # the attempt's event log; denials and record injections are emitted after the decision
     denials: list[str] = field(default_factory=list)
     injected: set[str] = field(default_factory=set)
     cwds: set[Path] = field(default_factory=set)  # directories the worker has cd'd into, any role (the Bash tool keeps its cwd between calls)
@@ -1427,6 +1429,8 @@ class Policy:
         if ok:
             return PermissionResultAllow()
         self.denials.append(f"{tool_name}: {reason}")
+        if self.events is not None:
+            self.events.append("policy_denial", policy_denial_payload(tool_name, reason))
         return PermissionResultDeny(message=f"ATeam: {reason}")
 
     async def pre_tool_use(self, input_data: dict[str, Any], tool_use_id: str | None, context: Any) -> dict[str, Any]:
@@ -1435,6 +1439,8 @@ class Policy:
         ok, reason = self._decide(tool_name, tool_input)
         if not ok:
             self.denials.append(f"{tool_name}: {reason}")
+            if self.events is not None:
+                self.events.append("policy_denial", policy_denial_payload(tool_name, reason))
             return {"hookSpecificOutput": {
                 "hookEventName": "PreToolUse", "permissionDecision": "deny",
                 "permissionDecisionReason": f"ATeam: {reason}",
@@ -1446,6 +1452,8 @@ class Policy:
                 if fresh:
                     self.injected.update(r.id for r in fresh)
                     text = "\n\n".join(f"ATeam binding record {r.id} ({r.kind}): {r.statement.strip()}" for r in fresh)
+                    if self.events is not None:
+                        self.events.append("record_injected", record_injected_payload(tool_name, rel, [r.id for r in fresh]))
                     return {"hookSpecificOutput": {
                         "hookEventName": "PreToolUse", "permissionDecision": "allow", "additionalContext": text,
                     }}

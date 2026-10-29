@@ -11,12 +11,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ResultMessage, ToolUseBlock, query
+from claude_agent_sdk import (
+    AssistantMessage, ClaudeAgentOptions, ResultMessage, TextBlock, ToolResultBlock, ToolUseBlock, UserMessage, query,
+)
 
 from ateam.brief import assemble_brief, render_brief
 from ateam.checkpoint import Checkpoint, collect
 from ateam.config import TargetConfig
 from ateam.contracts.model import Contract
+from ateam.events import (
+    EventLog, assistant_text_payload, error_payload, open_event_log, report_payload, session_end_payload,
+    session_start_payload, tool_call_payload, tool_result_payload,
+)
 from ateam.gitops import GitRepo
 from ateam.guidance import live_guidance, load_guidance
 from ateam.intent import intent_git, settle_intent
@@ -53,21 +59,47 @@ class WorkerResult:
     text: str = field(default="")
 
 
-async def run_worker(prompt: str, options: ClaudeAgentOptions, policy: Policy) -> WorkerResult:
+async def run_worker(prompt: str, options: ClaudeAgentOptions, policy: Policy, events: EventLog | None = None) -> WorkerResult:
+    events = events if events is not None else policy.events   # the policy hooks and the stream share one log
     t0 = time.time()
     tool_uses: list[dict] = []
     result: ResultMessage | None = None
     error: str | None = None
+    turn = 0
+    if events is not None:
+        events.append("session_start", session_start_payload(
+            getattr(options, "model", None), str(getattr(options, "cwd", "") or ""), getattr(options, "resume", None), events.started_at))
     try:
         async for m in query(prompt=prompt, options=options):
             if isinstance(m, AssistantMessage):
+                turn += 1
+                texts = [b.text for b in m.content if isinstance(b, TextBlock)]
+                if events is not None and (texts or m.error):
+                    events.append("assistant_text", assistant_text_payload("\n".join(texts), turn, m.message_id, m.error))
                 for block in m.content:
                     if isinstance(block, ToolUseBlock):
                         tool_uses.append({"tool": block.name, "input": block.input})
+                        if events is not None:
+                            events.append("tool_call", tool_call_payload(block.id, block.name, block.input, turn, m.message_id))
+            elif isinstance(m, UserMessage):
+                if events is not None and isinstance(m.content, list):
+                    for block in m.content:
+                        if isinstance(block, ToolResultBlock):
+                            events.append("tool_result", tool_result_payload(block.tool_use_id, block.content, block.is_error))
             elif isinstance(m, ResultMessage):
                 result = m
+                if events is not None and isinstance(m.structured_output, dict):
+                    events.append("report", report_payload(m.structured_output))
     except Exception as e:  # noqa: BLE001  (ResultError, CLI errors, transport errors)
         error = f"{type(e).__name__}: {e}"
+        if events is not None:
+            events.append("error", error_payload(error))
+    if events is not None and error is None:
+        if result is None:
+            events.append("session_end", session_end_payload("no_result", True, 0, None, None))
+        else:
+            events.append("session_end", session_end_payload(
+                result.subtype, bool(result.is_error), result.num_turns, float(result.total_cost_usd or 0.0), result.session_id))
     wall = time.time() - t0
     if result is None:
         return WorkerResult("no_result", True, None, None, 0, None, {}, {}, None, tool_uses, list(policy.denials), error, wall)
@@ -193,11 +225,17 @@ async def run_contract_attempt(
     brief_text = render_brief(assemble_brief(contract, selected, prev, role, scratch_dir=scratch, instructions=instructions))
     predicted = {k: contract.allocation.model_dump()[k] for k in ("complexity", "risk", "uncertainty")}
     attempt_id = db.start_attempt(contract.id, role.value, tier_name, tier.model, predicted)
+    row = db.attempt(attempt_id)
+    events = open_event_log(paths, attempt_id, contract.id, role.value, row["started_at"] if row else "")
+    policy.events = events
 
-    intent = intent_git(paths)
-    intent_before = intent.head()
-    options = worker_options(cwd=worktree, spec=ROLE_SPECS[role], brief_text=brief_text, policy=policy, tier=tier, resume=resume)
-    res = await run_worker(prompt or default_prompt(contract, role), options, policy)
+    try:
+        intent = intent_git(paths)
+        intent_before = intent.head()
+        options = worker_options(cwd=worktree, spec=ROLE_SPECS[role], brief_text=brief_text, policy=policy, tier=tier, resume=resume)
+        res = await run_worker(prompt or default_prompt(contract, role), options, policy)
+    finally:
+        events.close()
     # The scheduler's own writer steps (merge, refresh, verify) may commit beside this session; their recorded
     # `ateam:` commits are accepted, anything else is tamper (overlap gate design, owner 2026-10-28).
     intent_problems = settle_intent(db, intent, intent_before, grace=INTENT_GRACE_S, cap=INTENT_CAP_S)

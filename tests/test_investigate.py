@@ -168,3 +168,33 @@ async def test_investigation_in_a_worktree_sees_a_shared_ref_change_as_tamper(mo
     r = await run_investigation(paths=inv_env["paths"], config=inv_env["config"], target_git=GitRepo(wt), name="C-0001",
                                 spec=DISCOVERY_SPEC, prompt="go", brief_text="B", tier=inv_env["tier"], db=inv_env["db"])
     assert any("refs changed" in t for t in r.tampered) and r.res.report is None
+
+
+@pytest.mark.asyncio
+async def test_investigation_writes_event_log(monkeypatch, inv_env, target_paths):
+    from ateam.events import EventLog, read_events
+
+    async def fake_query(prompt, options):
+        yield _result({"candidates": [], "unknowns": [], "notes": "n"})
+
+    monkeypatch.setattr("ateam.runner.run.query", fake_query)
+    r = await _run(inv_env, name="P-0042")
+    evs = read_events(target_paths.logs / f"A-{r.attempt_id:04d}.jsonl")
+    assert [e.type for e in evs] == ["session_start", "report", "session_end"]
+    assert all(e.contract == "P-0042" and e.role == "investigate" and e.attempt == r.attempt_id for e in evs)
+
+    closed = []
+    real_close = EventLog.close
+
+    def spy_close(self):
+        closed.append(self)
+        real_close(self)
+
+    def snapshot_fails(*a):
+        raise ValueError("snap")
+
+    monkeypatch.setattr(EventLog, "close", spy_close)
+    monkeypatch.setattr("ateam.runner.investigate.changed", snapshot_fails)
+    with pytest.raises(ValueError):
+        await _run(inv_env, name="P-0043")
+    assert closed
