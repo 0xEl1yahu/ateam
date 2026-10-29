@@ -513,3 +513,125 @@ async def test_no_result_cost_is_unknown(monkeypatch, policy_build, raises):
 
     monkeypatch.setattr("ateam.runner.run.query", with_result)
     assert (await run_worker("p", ClaudeAgentOptions(), policy_build)).cost_usd == 0.25
+
+
+# ---- C-0097: the event log
+
+def _events_msgs(big=None):
+    from claude_agent_sdk import ToolResultBlock, UserMessage
+    out = big if big is not None else "file contents"
+    return [
+        AssistantMessage(content=[TextBlock(text="looking"), ToolUseBlock(id="t1", name="Read", input={"file_path": "a.py"})], model="haiku", message_id="m1"),
+        UserMessage(content=[ToolResultBlock(tool_use_id="t1", content=out, is_error=False)], tool_use_result={"secret": "RAWRESULT"}),
+        _result(),
+    ]
+
+
+async def _logged_attempt(monkeypatch, target_repo, target_paths, sample_contract, records_three, msgs, exc=None):
+    from ateam.roles import Role
+    run_mod, db, contract, seen = _attempt_harness(monkeypatch, target_repo, target_paths, sample_contract, records_three)
+
+    async def fq(prompt, options):
+        for m in msgs:
+            yield m
+        if exc:
+            raise exc
+
+    monkeypatch.setattr("ateam.runner.run.query", fq)
+    res = await _attempt(run_mod, target_repo, target_paths, contract, records_three, db, Role.build)
+    return db, contract, res
+
+
+def _read(target_paths, n=1):
+    from ateam.events import read_events
+    return read_events(target_paths.logs / f"A-{n:04d}.jsonl")
+
+
+@pytest.mark.asyncio
+async def test_fake_worker_run_writes_gapless_parseable_log(monkeypatch, target_repo, target_paths, sample_contract, records_three):
+    db, contract, _ = await _logged_attempt(monkeypatch, target_repo, target_paths, sample_contract, records_three, _events_msgs())
+    evs = _read(target_paths)
+    row = db.attempt(1)
+    assert [e.seq for e in evs] == list(range(1, len(evs) + 1))
+    assert [e.type for e in evs] == ["session_start", "assistant_text", "tool_call", "tool_result", "report", "session_end"]
+    assert evs[0].payload["started_at"] == row["started_at"]
+    assert all(e.attempt == 1 and e.contract == row["contract_id"] == contract.id and e.role == row["role"] for e in evs)
+
+
+@pytest.mark.asyncio
+async def test_every_written_payload_has_exactly_its_types_keys(monkeypatch, target_repo, target_paths, sample_contract, records_three):
+    from ateam.events import PAYLOAD_KEYS
+    msgs = _events_msgs()[:2] + [AssistantMessage(content=[TextBlock(text="x")], model="h", error="rate_limit"), _result()]
+    await _logged_attempt(monkeypatch, target_repo, target_paths, sample_contract, records_three, msgs)
+    evs = _read(target_paths)
+    assert evs and all(set(e.payload) == PAYLOAD_KEYS[e.type] for e in evs)
+    await _logged_attempt(monkeypatch, target_repo, target_paths, sample_contract, records_three, msgs[:1], exc=RuntimeError("x"))
+    evs = _read(target_paths, 2)
+    assert evs[-1].type == "error" and all(set(e.payload) == PAYLOAD_KEYS[e.type] for e in evs)
+
+
+@pytest.mark.asyncio
+async def test_error_event_only_for_a_stream_exception(monkeypatch, policy_build, tmp_path):
+    from ateam.events import EventLog, read_events
+    msgs = {"exc": [AssistantMessage(content=[TextBlock(text="hi")], model="h")],
+            "none": [AssistantMessage(content=[TextBlock(text="hi")], model="h", error="rate_limit")]}
+    results = {}
+    for name, exc in (("exc", RuntimeError("boom")), ("none", None)):
+        async def fq(prompt, options, name=name, exc=exc):
+            for m in msgs[name]:
+                yield m
+            if exc:
+                raise exc
+        monkeypatch.setattr("ateam.runner.run.query", fq)
+        log = EventLog(tmp_path / f"{name}.jsonl", 1, "C-1", "build", "t")
+        results[name] = await run_worker("p", ClaudeAgentOptions(), policy_build, log)
+        log.close()
+    exc_ev = read_events(tmp_path / "exc.jsonl")
+    assert [e.type for e in exc_ev] == ["session_start", "assistant_text", "error"] and "boom" in exc_ev[-1].payload["error"]
+    none_ev = read_events(tmp_path / "none.jsonl")
+    assert [e.type for e in none_ev] == ["session_start", "assistant_text", "session_end"]
+    assert none_ev[1].payload["sdk_error"] == "rate_limit" and none_ev[-1].payload["subtype"] == "no_result"
+    assert results["none"].subtype == "no_result" and results["none"].error is None and results["exc"].error == "RuntimeError: boom"
+
+
+@pytest.mark.asyncio
+async def test_full_tool_output_never_reaches_the_log(monkeypatch, target_repo, target_paths, sample_contract, records_three):
+    from ateam.events import TOOL_RESULT_LIMIT
+    big = "".join(chr(65 + i % 26) for i in range(TOOL_RESULT_LIMIT + 500))
+    await _logged_attempt(monkeypatch, target_repo, target_paths, sample_contract, records_three, _events_msgs(big))
+    raw = (target_paths.logs / "A-0001.jsonl").read_text()
+    assert big not in raw and "RAWRESULT" not in raw
+    tr = [e for e in _read(target_paths) if e.type == "tool_result"][0].payload
+    assert tr["truncated"] and tr["length"] == len(big) and len(tr["content"]) == TOOL_RESULT_LIMIT and len(tr["sha256"]) == 64
+
+
+@pytest.mark.asyncio
+async def test_worker_killed_mid_stream_leaves_readable_partial_log(tmp_path):
+    import subprocess
+    import sys
+    import textwrap
+    from ateam.events import read_events
+    log_path = tmp_path / "A-0001.jsonl"
+    code = textwrap.dedent(f'''
+        import asyncio, os, signal
+        from pathlib import Path
+        from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock
+        from ateam.events import EventLog
+        from ateam.roles import Role
+        from ateam.runner import run as run_mod
+        from ateam.runner.policy import Policy
+
+        async def fq(prompt, options):
+            yield AssistantMessage(content=[TextBlock(text="one")], model="h")
+            yield AssistantMessage(content=[TextBlock(text="two")], model="h")
+            os.kill(os.getpid(), signal.SIGKILL)
+
+        run_mod.query = fq
+        pol = Policy(worktree=Path("."), role=Role.build, allowed_paths=[], protected=[])
+        log = EventLog(Path({str(log_path)!r}), 1, "C-1", "build", "t")
+        asyncio.run(run_mod.run_worker("p", ClaudeAgentOptions(), pol, log))
+    ''')
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert proc.returncode != 0
+    evs = read_events(log_path)
+    assert [e.seq for e in evs] == [1, 2, 3] and [e.type for e in evs] == ["session_start", "assistant_text", "assistant_text"]

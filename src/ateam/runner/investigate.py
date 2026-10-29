@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ateam.config import TargetConfig
+from ateam.events import open_event_log
 from ateam.gitops import GitRepo
 from ateam.intent import intent_git
 from ateam.paths import TargetPaths
@@ -50,6 +51,9 @@ async def run_investigation(
     intent_before = (intent.head(), intent.is_clean())
     checkout_before = take(target_git)
     attempt_id = db.start_attempt(name, Role.investigate.value, tier_name, tier.model, {})
+    row = db.attempt(attempt_id)
+    events = open_event_log(paths, attempt_id, name, Role.investigate.value, row["started_at"] if row else "")
+    policy.events = events
     try:
         options = worker_options(cwd=checkout, spec=spec, brief_text=brief_text, policy=policy, tier=tier, resume=resume)
         res = await run_worker(prompt, options, policy)
@@ -60,6 +64,8 @@ async def run_investigation(
     except Exception:
         db.finish_attempt(attempt_id, "failed", "environment", 0, 0, 0.0, 0, 0.0, None)
         raise
+    finally:
+        events.close()
     usage = res.usage
     tokens_in = int(usage.get("input_tokens", 0) or 0) + int(usage.get("cache_read_input_tokens", 0) or 0)
     tokens_out = int(usage.get("output_tokens", 0) or 0)

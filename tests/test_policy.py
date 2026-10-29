@@ -1838,3 +1838,85 @@ def test_signalling_by_name_or_non_numeric_target_is_denied(request, role_fixtur
 def test_kill_by_numeric_pid_is_allowed(request, role_fixture, cmd):
     ok, reason = request.getfixturevalue(role_fixture).command_allowed(cmd)
     assert ok, f"should allow: {cmd!r} ({reason})"
+
+
+# ---- C-0097: the policy hooks write the event log
+
+@pytest.mark.asyncio
+async def test_denials_and_record_injections_are_logged(policy_build, tmp_path):
+    from ateam.events import EventLog, read_events
+    log = EventLog(tmp_path / "A-0001.jsonl", 1, "C-1", "build", "t")
+    policy_build.events = log
+    bad = {"command": "git push"}
+    await policy_build.can_use_tool("Bash", bad, None)
+    await policy_build.pre_tool_use({"tool_name": "Bash", "tool_input": bad}, None, None)
+    read = {"tool_name": "Read", "tool_input": {"file_path": str(policy_build.worktree / "src/api/x.py")}}
+    out = await policy_build.pre_tool_use(read, None, None)
+    again = await policy_build.pre_tool_use(read, None, None)
+    log.close()
+    evs = read_events(tmp_path / "A-0001.jsonl")
+    assert [e.type for e in evs] == ["policy_denial", "policy_denial", "record_injected"]
+    assert evs[0].payload["tool"] == "Bash" and "ATeam binding record" in out["hookSpecificOutput"]["additionalContext"] and again == {}
+    assert evs[2].payload["path"] == "src/api/x.py" and evs[2].payload["records"] == ["R-0001"] and len(policy_build.denials) == 2
+
+
+class _FailingFile:
+    def write(self, data):
+        raise OSError("disk full")
+
+    def flush(self):
+        pass
+
+    def close(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_event_write_failure_never_changes_a_decision_or_the_session(monkeypatch, policy_build, tmp_path):
+    from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ResultMessage, TextBlock
+    from ateam.events import EventLog
+    from ateam.runner.run import run_worker
+    log = EventLog(tmp_path / "A-0001.jsonl", 1, "C-1", "build", "t")
+    log._fh = _FailingFile()
+    policy_build.events = log
+    bad = {"command": "git push"}
+    assert isinstance(await policy_build.can_use_tool("Bash", bad, None), PermissionResultDeny)
+    out = await policy_build.pre_tool_use({"tool_name": "Bash", "tool_input": bad}, None, None)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert isinstance(await policy_build.can_use_tool("Edit", {"file_path": str(policy_build.worktree / "src/api/x.py")}, None), PermissionResultAllow)
+    inj = await policy_build.pre_tool_use({"tool_name": "Read", "tool_input": {"file_path": "src/api/x.py"}}, None, None)
+    assert inj["hookSpecificOutput"]["permissionDecision"] == "allow"
+
+    async def fq(prompt, options):
+        yield AssistantMessage(content=[TextBlock(text="hi")], model="h")
+        yield ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False, num_turns=2, session_id="s",
+                            total_cost_usd=0.01, usage={}, structured_output={"status": "done"})
+
+    monkeypatch.setattr("ateam.runner.run.query", fq)
+    a = await run_worker("p", ClaudeAgentOptions(), policy_build, log)
+    b = await run_worker("p", ClaudeAgentOptions(), policy_build)
+    assert (a.subtype, a.report, a.cost_usd, a.num_turns, a.error) == (b.subtype, b.report, b.cost_usd, b.num_turns, b.error)
+    assert log.failures > 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role_fixture", ["policy_build", "policy_test", "policy_investigate"])
+@pytest.mark.parametrize("under_home", [False, True])
+async def test_worker_cannot_read_event_logs(request, role_fixture, under_home, tmp_path):
+    pol = request.getfixturevalue(role_fixture)
+    home = tmp_path / ".ateam"
+    logf = home / "repo-id" / "logs" / "A-0001.jsonl"
+    logf.parent.mkdir(parents=True)
+    logf.write_text("{}\n")
+    scratch = home / "repo-id" / "scratch" / "C-0001"
+    scratch.mkdir(parents=True)
+    pol.ateam_home, pol.scratch_dir = home, scratch
+    if under_home:
+        wt = home / "repo-id" / "worktrees" / "C-0001"
+        wt.mkdir(parents=True)
+        pol.worktree = wt
+    for tool, inp in (("Read", {"file_path": str(logf)}), ("Glob", {"pattern": "*.jsonl", "path": str(logf.parent)}),
+                      ("Grep", {"pattern": "x", "path": str(logf)})):
+        assert isinstance(await pol.can_use_tool(tool, inp, None), PermissionResultDeny), tool
+    for cmd in (f"cat {logf}", f"ls {logf.parent}", f"grep x {logf}", f"head -n 1 {logf}"):
+        assert not pol.command_allowed(cmd)[0], cmd
