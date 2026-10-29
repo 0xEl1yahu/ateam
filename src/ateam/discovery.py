@@ -38,7 +38,7 @@ class DiscoveryResult:
 
 def candidates_to_records(
     candidates: list[dict], unknowns: list[str], existing: dict[str, Record], repo_root: Path, records_dir: Path,
-    cap_global: int, by: str = "ateam-init", declared_paths: list[str] | tuple[str, ...] = (),
+    cap_global: int, by: str = "ateam-init", declared_paths: list[str] | tuple[str, ...] = ()
 ) -> DiscoveryResult:
     result = DiscoveryResult(unknowns=list(unknowns))
     known: dict[str, list[Record]] = {}
