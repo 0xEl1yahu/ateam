@@ -31,6 +31,7 @@ from ateam.plans.store import load_plans
 from ateam.proposal import ProposalError, ProposalHeader, parse_header, proposal_relpath, render_proposal
 from ateam.records.store import load_records
 from ateam.runner.run import SetupError, ensure_setup
+from ateam.tiers import load_tiers
 
 WALK = ["plan_approved", "executing", "integrating", "merge_proposed"]
 # Movement outside the integration worktree during the final checks: something else committed in parallel. The run is
@@ -191,6 +192,7 @@ def integrate(ctx, plan_id: str, echo: Callable[[str], None]) -> IntegrateResult
         risks=_risks(db, plan, cs, cids, warnings),
         telemetry=[a for a in db.telemetry_rows() if a["contract_id"] in cids],
         final_checks=[r.fact() for r in results],
+        tiers=load_tiers(ctx.config.tiers),
     )
     proposal = paths.intent / proposal_relpath(plan_id)
     proposal.parent.mkdir(parents=True, exist_ok=True)

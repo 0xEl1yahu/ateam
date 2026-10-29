@@ -442,3 +442,18 @@ def test_reconcile_completes_a_rebase_whose_store_step_was_lost(verified, tmp_pa
     else:
         with pytest.raises(IntegrateRefused):
             reconcile_contracts(ctx.db, owner, cs, ["C-0001"], "ateam/P-0001", out.append)
+
+
+def test_proposal_counts_unknown_cost_at_cap(verified):
+    ctx = Context(verified.root)
+    try:
+        known = ctx.db.start_attempt("C-0001", "build", "light", "haiku", {})
+        ctx.db.finish_attempt(known, "completed", None, 1, 1, 0.25, 3, 0.1, "s")
+        ctx.db.interrupt_attempt(ctx.db.start_attempt("C-0002", "build", "standard", "sonnet", {}))   # NULL cost
+    finally:
+        ctx.close()
+    res, out, _ = _integrate(verified.root)
+    assert res.outcome == "merge_proposed", out
+    text = res.proposal.read_text()
+    assert "| C-0002 | build | interrupted | unknown (cap 2.00) | 0 |" in text
+    assert "Total: 2.25 USD over 2 attempt(s), 1 counted at its tier cap (cost unknown)" in text

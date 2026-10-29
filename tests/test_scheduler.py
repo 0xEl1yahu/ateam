@@ -114,8 +114,8 @@ def _meet(*pairs, timeout=60.0):
 class FakeInvestigator:
     """Stands in for `ateam worker pause-investigate`: writes findings (or a note) on the open pause record."""
 
-    def __init__(self, report=None, outcome="completed", write=True):
-        self.calls, self.outcome, self.write = [], outcome, write
+    def __init__(self, report=None, outcome="completed", write=True, cost=0.2):
+        self.calls, self.outcome, self.write, self.cost = [], outcome, write, cost
         self.report = report or {"summary": "s", "evidence": [], "failure_class": "implementation",
                                  "needs_owner_decision": None, "suggested_instruction": "use x"}
 
@@ -128,7 +128,7 @@ class FakeInvestigator:
                 findings = self.report if self.outcome == "completed" else None
                 db.set_pause_findings(pause["pause_id"], cid, None, findings, None if findings else f"{self.outcome}: x")
         r = {"code": 0 if self.outcome == "completed" else 1, "outcome": self.outcome, "attempt_id": None,
-             "cost_usd": 0.2, "error": None}
+             "cost_usd": self.cost, "error": None}
         result_file.write_text(json.dumps(r))
         return r
 
@@ -1551,3 +1551,23 @@ def test_rebase_prompt_requires_commit():
     prompt = _rebase_prompt(SimpleNamespace(id="C-9", title="t"), ["f.txt"])
     assert "git commit" in prompt and "conclude the merge" in prompt
     assert "pauses" in prompt and "plan" in prompt
+
+
+# ---- unknown costs count at the tier cap (P-0020, C-0092)
+
+def test_no_result_session_settles_at_cap(plan3):
+    s, out = _run(plan3, FakeWorkers({("C-0001", "build"): {"cost_usd": None}}))
+    assert s.outcome == "merge_proposed", out
+    # the light BUILD cap ($1) for the session with no cost, $0.10 for each of the five that reported one
+    assert s.spent_usd == pytest.approx(1.0 + 5 * 0.1) and s.capped_sessions == 1
+    assert any("C-0001 build completed $1.00" in line for line in out) and any("C-0002 build completed $0.10" in line for line in out)
+
+
+def test_summary_names_sessions_counted_at_cap(plan3):
+    unknown = {("C-0001", "build"): {"cost_usd": None},
+               ("C-0001", "test"): {"cost_usd": None, "code": 5, "test_outcome": "failed", "test_class": "requirements"}}
+    s, out = _run(plan3, FakeWorkers(unknown), investigate=FakeInvestigator(cost=None))
+    assert s.outcome == "paused", out
+    assert s.capped_sessions == 3      # the BUILD, the TEST and the pause investigation reported no cost
+    summary = next(line for line in out if line.startswith("summary:"))
+    assert "3 settled at the tier cap (cost unknown)" in summary, summary

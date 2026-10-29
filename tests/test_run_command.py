@@ -523,3 +523,13 @@ def test_resume_after_the_tip_moved_keeps_the_open_merge(plan3, monkeypatch):
     assert r.exit_code == 0 and "merge_proposed" in r.output, r.output
     assert json.loads(_sdb(plan3).get_meta("rebase:C-0001"))["tip"] == tip   # the open merge was kept, not restarted
     assert len(_rebase_builds(fake, "C-0001")) == 1
+
+
+def test_status_spend_counts_unknown_at_cap(plan3):
+    with _sdb(plan3) as db:
+        known = db.start_attempt("C-0001", "build", "light", "haiku", {})
+        db.finish_attempt(known, "completed", None, 1, 1, 0.25, 3, 0.1, "s")
+        db.interrupt_attempt(db.start_attempt("C-0002", "test", "standard", "sonnet", {}))   # NULL cost: the $2 cap
+    r = run("status", "P-0001", "--target", str(plan3.root))
+    assert r.exit_code == 0, r.output
+    assert "spend: $2.25 over 2 attempt(s), 1 counted at its tier cap (cost unknown)" in r.output, r.output

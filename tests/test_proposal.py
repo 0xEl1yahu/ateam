@@ -32,3 +32,16 @@ def test_render_lists_risks_and_empty_sections_say_none():
     text = _render(records=[], telemetry=[])
     assert "- A3 (judgment) not checked" in text
     assert text.count("none") >= 2
+
+
+def test_total_counts_unknown_cost_at_cap():
+    from ateam.tiers import load_tiers
+    telemetry = [{"contract_id": "C-0002", "role": "build", "tier": "standard", "outcome": "completed", "cost_usd": 0.5, "turns": 7},
+                 {"contract_id": "C-0002", "role": "test", "tier": "light", "outcome": "interrupted", "cost_usd": None, "turns": None}]
+    text = _render(telemetry=telemetry, tiers=load_tiers())
+    assert "| C-0002 | build | completed | 0.50 | 7 |" in text
+    assert "| C-0002 | test | interrupted | unknown (cap 1.00) | 0 |" in text
+    assert "Total: 1.50 USD over 2 attempt(s), 1 counted at its tier cap (cost unknown)" in text
+    assert parse_header(text) == H and text.split("\n---\n")[0] == _render(telemetry=[]).split("\n---\n")[0]
+    legacy = _render(telemetry=telemetry)     # without tiers, the output is what it was
+    assert "| C-0002 | test | interrupted | 0.00 | 0 |" in legacy and "Total: 0.50 USD over 2 attempt(s)\n" in legacy
