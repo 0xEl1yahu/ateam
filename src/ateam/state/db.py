@@ -313,10 +313,7 @@ class StateDB:
             )
             return int(cur.lastrowid)
 
-    def finish_attempt(
-        self, attempt_id: int, outcome: str, failure_class: str | None, tokens_in: int, tokens_out: int,
-        cost_usd: float | None, turns: int, wall_s: float, session_id: str | None,
-    ) -> None:
+    def finish_attempt(self, attempt_id: int, outcome: str, failure_class: str | None, tokens_in: int, tokens_out: int, cost_usd: float | None, turns: int, wall_s: float, session_id: str | None) -> None:
         with self.conn:
             self.conn.execute(
                 "UPDATE attempts SET finished_at=?, outcome=?, failure_class=?, tokens_in=?, tokens_out=?, "
@@ -332,8 +329,7 @@ class StateDB:
             if cur.rowcount == 0:
                 raise KeyError(f"no attempt {attempt_id}")
 
-    def record_step(self, contract_id: str, step: str, head: str, contract_hash: str, passed: bool,
-                    attempt_id: int | None = None) -> None:
+    def record_step(self, contract_id: str, step: str, head: str, contract_hash: str, passed: bool, attempt_id: int | None = None) -> None:
         """Record a TEST or verify result for a contract at a worktree head. Rows are never deleted or updated."""
         if step not in ("test", "verify"):
             raise ValueError(f"step must be 'test' or 'verify', not {step!r}")
