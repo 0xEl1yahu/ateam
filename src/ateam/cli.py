@@ -17,6 +17,7 @@ from ateam.intent import IntentError, commit_intent, commit_intent_files, intent
 from ateam.runner.investigate import INTENT_TAMPER, run_investigation
 from ateam.exclusion import process_alive as _process_alive  # noqa: F401  (moved; kept importable from here)
 from ateam.state.db import StateDB
+from ateam.events import EVENT_TYPES, attempt_label, follow_events, format_event, log_matches, log_path, parse_attempt, read_events
 
 TARGET_OPTION = click.option(
     "--target", "target", type=click.Path(file_okay=False, path_type=Path), default=Path.cwd,
@@ -1864,6 +1865,54 @@ def doctor(target: Path) -> None:
         click.echo(f"target branch {git.current_branch()} (configured target branch {cfg.target_branch})")
     except Exception as e:  # noqa: BLE001
         click.echo(f"git: {e}")
+
+
+# ---------------------------------------------------------------- log
+
+
+@main.command("log")
+@click.argument("attempt")
+@click.option("--type", "types", type=click.Choice(EVENT_TYPES), multiple=True, help="Only events of this type (repeatable).")
+@click.option("--since", type=int, default=None, help="Only events with seq >= SEQ.")
+@click.option("--follow", is_flag=True,
+              help="Keep printing events as they arrive, until session_end or error, or until the attempt is closed in the "
+                   "store. Following an orphan (an open attempt whose session is gone) blocks until Ctrl-C.")
+@TARGET_OPTION
+def log_cmd(attempt: str, types: tuple[str, ...], since: int | None, follow: bool, target: Path) -> None:
+    """Print one attempt's event log, e.g. A-0042. Read-only: the store, the intent repo and the log are not changed."""
+    try:
+        number = parse_attempt(attempt)
+    except ValueError as e:
+        raise click.BadParameter(str(e), param_hint="'ATTEMPT'") from e
+    ctx = _context(target)
+    label = attempt_label(number)
+    row = ctx.db.attempt(number)
+    if row is None:
+        _fail(f"no attempt {label} in the state store", 4)
+    path = log_path(ctx.paths.logs, number)
+    if not path.exists():
+        _fail(f"{label} has no event log at {path}")
+    if not log_matches(path, row):
+        _fail(f"the event log of {label} does not match its attempt row (the store may have been rebuilt): {path}")
+    kinds = tuple(types) or None
+
+    def is_open() -> bool:
+        current = ctx.db.attempt(number)
+        return current is not None and current["finished_at"] is None
+
+    def on_stale(quiet_s: float) -> None:
+        click.echo(f"{label}: no event for {int(quiet_s // 60)} min; the session may be gone; the attempt is still open "
+                   f"in the store; Ctrl-C to stop")
+
+    try:
+        if follow:
+            events = follow_events(path, is_open, kinds, since, on_stale=on_stale)
+        else:
+            events = sorted(read_events(path, kinds, since), key=lambda e: e.seq)
+        for event in events:
+            click.echo(format_event(event))
+    except ValueError as e:
+        _fail(f"{label}'s event log is malformed: {e}")
 
 
 # ---------------------------------------------------------------- brief, worker
