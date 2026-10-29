@@ -58,6 +58,7 @@ ateam reject P-0001 "reason"                   # a proposed plan, a merge propos
 ateam contracts refresh [P-0001]               # draft -> ready once every dependency is verified; stops on drift
 ateam run P-0001 [--dry-run]                   # execute the plan to merge_proposed or a pause (0 / 1 / 4 / 130)
 ateam stop P-0001                              # pause a running plan through the state store (0 / 4)
+ateam log A-0042 [--type T] [--since SEQ] [--follow]   # one attempt's event log (read-only); --follow tails it until session_end, error or the attempt closes (an orphan blocks until Ctrl-C) (0 / 1 / 4)
 ateam status P-0001                            # why it paused, the investigation's findings, how to resume
 ateam resume P-0001 [--note T | --adopt] [--contract C-0002] [--no-run]   # guidance, fresh attempts, run (4 refused)
 ateam integrate P-0001                         # integration branch, merges, full checks, merge proposal (0 / 1 / 3 / 4)
