@@ -64,3 +64,9 @@ def test_home_dir_honours_env(tmp_path, monkeypatch):
     monkeypatch.setenv("ATEAM_HOME", str(tmp_path / "h"))
     h = home_dir(tmp_path)
     assert h.parent == tmp_path / "h" and h.name == repo_id(tmp_path) and h.is_dir()
+
+
+def test_logs_dir_is_under_home_not_target_or_intent(target_repo):
+    p = TargetPaths.from_root(target_repo)
+    assert p.logs == p.scratch_root.parent / "logs" == home_dir(target_repo) / "logs"
+    assert p.logs not in (p.intent, p.root) and p.intent not in p.logs.parents and p.root not in p.logs.parents

@@ -554,3 +554,13 @@ def test_set_attempt_outcome(tmp_path):
             assert after[k] == before[k]
         with pytest.raises(KeyError):
             db.set_attempt_outcome(999, "completed", None)
+
+
+def test_attempt_lookup_and_running_attempts(tmp_path):
+    db = fresh(tmp_path)
+    a = db.start_attempt("C-0001", "build", "t", "m", {})
+    b = db.start_attempt("C-0002", "test", "t", "m", {})
+    c = db.start_attempt("C-0001", "test", "t", "m", {})
+    db.finish_attempt(b, "ok", None, 1, 1, 0.1, 1, 1.0, None)
+    assert db.attempt(a)["contract_id"] == "C-0001" and db.attempt(999) is None
+    assert [r["attempt_id"] for r in db.running_attempts()] == [a, c]
