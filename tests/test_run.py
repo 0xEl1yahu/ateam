@@ -494,3 +494,22 @@ def test_build_policy_lets_a_worker_write_its_incidental_paths(target_repo, samp
     assert policy.path_writable_abs(str(target_repo / "requirements.txt"))[0]          # incidental
     assert policy.path_writable_abs(str(target_repo / "src" / "api" / "x.py"))[0]      # declared
     assert not policy.path_writable_abs(str(target_repo / "src" / "app.py"))[0]        # neither
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raises", [True, False])
+async def test_no_result_cost_is_unknown(monkeypatch, policy_build, raises):
+    async def fake_query(prompt, options):
+        yield AssistantMessage(content=[TextBlock(text="hi")], model="haiku")
+        if raises:
+            raise RuntimeError("connection lost")
+
+    monkeypatch.setattr("ateam.runner.run.query", fake_query)
+    r = await run_worker("p", ClaudeAgentOptions(), policy_build)
+    assert r.subtype == "no_result" and r.cost_usd is None
+
+    async def with_result(prompt, options):
+        yield _result(total_cost_usd=0.25)
+
+    monkeypatch.setattr("ateam.runner.run.query", with_result)
+    assert (await run_worker("p", ClaudeAgentOptions(), policy_build)).cost_usd == 0.25

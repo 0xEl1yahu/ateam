@@ -2632,3 +2632,22 @@ def test_plans_show_prints_the_shared_shapes_table(monkeypatch, cli_target):
     assert r.exit_code == 0, r.output
     assert "add a health function" in r.output and r.output.index("add a health function") < r.output.index("Shared shapes:")
     assert "health: def health() -> str:  (produced by C-0002; consumed by C-0003)" in r.output
+
+
+def test_worker_run_no_result_writes_null_cost(monkeypatch, cli_target, tmp_path):
+    from types import SimpleNamespace
+    from ateam.runner.run import WorkerResult
+
+    async def fake(**kw):
+        res = WorkerResult("no_result", True, None, None, 0, None, {}, {}, None, [], [], "RuntimeError: lost", 0.1)
+        return res, SimpleNamespace(changed_vs_base=[]), SimpleNamespace(ok=True, outside=[], dirty=[]), None
+
+    monkeypatch.setattr("ateam.runner.run.run_contract_attempt", fake)
+    _frozen_target(cli_target)
+    wt = tmp_path / "wt-nores"; GitRepo(cli_target).worktree_add(wt, "wt-nores", "main")
+    out = tmp_path / "nores.json"
+    r = run("worker", "run", "C-0001", "--role", "build", "--cwd", str(wt), "--result-file", str(out), "--target", str(cli_target))
+    assert r.exit_code == 1, r.output
+    d = _read(out)
+    assert d["cost_usd"] is None and d["outcome"] == "failed" and "TypeError" not in (d["error"] or "")
+    assert "cost unknown" in r.output
