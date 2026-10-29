@@ -1954,6 +1954,96 @@ def log_cmd(attempt: str, types: tuple[str, ...], since: int | None, follow: boo
         _fail(f"{label}'s event log is malformed: {e}")
 
 
+# ---------------------------------------------------------------- watch
+
+
+WATCH_REFRESH_S = 2.0
+
+
+def _watched_attempts(ctx: Context, plan_id: str | None) -> list[dict[str, Any]]:
+    """The attempts watch follows: a plan's open attempts (as `ateam status P-xxxx` shows), else every unfinished one."""
+    if plan_id is None:
+        return ctx.db.running_attempts()
+    from ateam.plans.store import load_plans
+
+    plan = load_plans(ctx.paths.plans)[plan_id]
+    return ctx.db.open_attempts(_plan_contract_ids(ctx, plan))
+
+
+def _status_pane_tick(target: Path, plan_id: str | None) -> None:
+    """One refresh of the status window: the status output, the watched attempts, and a window for any new one."""
+    from ateam import watch as watch_mod
+    from ateam.scheduler import ateam_argv
+
+    with click.Context(status) as outer:   # closes the store connections opened below when the block ends
+        outer.invoke(status, plan_id=plan_id, target=target)
+        ctx = _context(target)
+        attempts = _watched_attempts(ctx, plan_id)
+        for line in _open_attempt_lines(ctx, attempts, datetime.now(UTC)):
+            click.echo(line)
+        session = watch_mod.session_name(ctx.paths, plan_id)
+    listed = watch_mod.run_tmux(["list-windows", "-t", session, "-F", "#{window_name}"])
+    if listed.returncode != 0:
+        return
+    existing = set(listed.stdout.split())
+    ids = [a["attempt_id"] for a in attempts]
+    for argv in watch_mod.new_attempt_windows(session, ateam_argv(), target, ids, existing):
+        watch_mod.run_tmux(argv)
+
+
+def _pauses_pane_tick(target: Path, plan_id: str | None) -> None:
+    from ateam import watch as watch_mod
+    from ateam.plans.store import load_plans
+
+    with click.Context(status):
+        ctx = _context(target)
+        plan_ids = [plan_id] if plan_id else sorted(load_plans(ctx.paths.plans))
+        for line in watch_mod.pause_lines(ctx.db, plan_ids):
+            click.echo(line)
+
+
+@main.command("watch")
+@click.argument("plan_id", required=False)
+@click.option("--pane", type=click.Choice(["status", "pauses"]), hidden=True, help="Run one window's refresh loop.")
+@TARGET_OPTION
+def watch_cmd(plan_id: str | None, pane: str | None, target: Path) -> None:
+    """Watch a run in tmux: a status window, a pauses window and one window per running attempt. Read-only: closing it
+    changes nothing and a run goes on; watch never kills a session or a window."""
+    import os
+    import shutil
+    import time
+
+    from ateam import watch as watch_mod
+    from ateam.plans.store import load_plans
+    from ateam.scheduler import ateam_argv
+
+    if pane is not None:
+        tick = _status_pane_tick if pane == "status" else _pauses_pane_tick
+        while True:
+            click.echo("\033[H\033[2J", nl=False)
+            try:
+                tick(target, plan_id)
+            except (SystemExit, click.ClickException):
+                pass   # a store or intent repo in flux must not close the window; the next tick tries again
+            time.sleep(WATCH_REFRESH_S)
+    if shutil.which("tmux") is None:
+        _fail("tmux is not on PATH; use `ateam log A-<id> --follow` instead", code=1)
+    ctx = _context(target)
+    if plan_id is not None and plan_id not in load_plans(ctx.paths.plans):
+        _fail(f"unknown plan {plan_id}", code=4)
+    session = watch_mod.session_name(ctx.paths, plan_id)
+    inside = bool(os.environ.get("TMUX"))
+    if watch_mod.run_tmux(["has-session", "-t", session]).returncode == 0:
+        commands = [watch_mod.attach_command(session, inside)]
+    else:
+        ids = [a["attempt_id"] for a in _watched_attempts(ctx, plan_id)]
+        commands = watch_mod.start_commands(session, ateam_argv(), target, plan_id, ids, inside)
+    for argv in commands:
+        done = watch_mod.run_tmux(argv)
+        if done.returncode != 0:
+            _fail(f"tmux {argv[0]} failed: {(done.stderr or '').strip()}", code=1)
+
+
 # ---------------------------------------------------------------- brief, worker
 
 
