@@ -37,6 +37,7 @@ from typing import Literal
 from ateam.checkpoint import collect
 from ateam.contracts.select import drift
 from ateam.contracts.store import load_contracts
+from ateam.events import prune_logs
 from ateam.gitops import GitError, GitRepo, MergeConflict
 from ateam.globs import matches
 from ateam.treecheck import DEFAULT_IGNORE
@@ -310,12 +311,26 @@ def run_plan(ctx_factory: Callable[[], object], plan_id: str, echo: Callable[[st
             plan, cs, cids = _preflight(ctx, plan_id, say, dry_run)
             if dry_run:
                 return _dry_run(ctx, plan_id, cs, cids, say)
+            _prune_logs(ctx, say)
             return _Run(ctx_factory, ctx, plan_id, cids, say, stop, launch, child, investigate).execute()
         finally:
             if acquired:
                 ctx.db.release_run_lock(plan_id)
     finally:
         ctx.close()   # after the lock is released, in the thread that made it
+
+
+def _prune_logs(ctx, say: Callable[[str], None]) -> None:
+    """Remove event logs of attempts finished more than config.log_retention_days ago. Never commits to the intent repo,
+    so it is not a writer step; a failure is reported in one line and the run goes on."""
+    days = ctx.config.log_retention_days
+    try:
+        removed = prune_logs(ctx.paths.logs, ctx.db.telemetry_rows(), days, datetime.now(UTC))
+    except OSError as e:
+        say(f"could not prune event logs: {e}")
+        return
+    if removed:
+        say(f"pruned {len(removed)} event log(s) older than {days} day(s)")
 
 
 def _preflight(ctx, plan_id: str, say, dry_run: bool):
