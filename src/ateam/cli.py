@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn
 
 import click
 
@@ -17,7 +18,7 @@ from ateam.intent import IntentError, commit_intent, commit_intent_files, intent
 from ateam.runner.investigate import INTENT_TAMPER, run_investigation
 from ateam.exclusion import process_alive as _process_alive  # noqa: F401  (moved; kept importable from here)
 from ateam.state.db import StateDB
-from ateam.events import EVENT_TYPES, attempt_label, follow_events, format_event, log_matches, log_path, parse_attempt, read_events
+from ateam.events import EVENT_TYPES, _parse_time, attempt_label, follow_events, format_event, log_matches, log_path, parse_attempt, read_events, summarise
 
 TARGET_OPTION = click.option(
     "--target", "target", type=click.Path(file_okay=False, path_type=Path), default=Path.cwd,
@@ -1757,6 +1758,42 @@ def _echo_lanes(ctx: Context, plan) -> None:
             click.echo(line)
 
 
+QUIET_AFTER = timedelta(minutes=10)   # an open attempt idle this long is shown as maybe gone (C-0099)
+
+
+def _open_attempt_lines(ctx: Context, attempts: list[dict[str, Any]], now: datetime) -> list[str]:
+    """One line per open attempt: label, contract, role, tier, elapsed time, turns and latest event. The log is read for
+    display only (C-0099); a missing, mismatched or unreadable log shows as no event yet and never stops status."""
+    now = now if now.tzinfo else now.replace(tzinfo=UTC)
+    lines = []
+    for a in attempts:
+        started = _parse_time(a["started_at"])
+        events = []
+        try:
+            path = log_path(ctx.paths.logs, a["attempt_id"])
+            if log_matches(path, a):
+                events = read_events(path)
+        except Exception:   # a log is for display; whatever is wrong with it, status still prints the row
+            events = []
+        head = f"    {attempt_label(a['attempt_id'])} {a['contract_id']} {a['role']} {a['tier']}:"
+        parts = []
+        if started is not None:
+            parts.append(f"elapsed {int((now - started).total_seconds() // 60)} min")
+        if events:
+            parts.append(f"{summarise(events).turns} turn(s)")
+            last_at = _parse_time(events[-1].at)
+            parts.append(f"latest {events[-1].type} {int((now - last_at).total_seconds())} s ago" if last_at
+                         else f"latest {events[-1].type}")
+            idle_since = last_at or started
+        else:
+            parts.append("0 turn(s), no event yet")
+            idle_since = started
+        if idle_since is not None and now - idle_since > QUIET_AFTER:
+            parts.append(f"quiet for {int((now - idle_since).total_seconds() // 60)} min, may be gone")
+        lines.append(" ".join([head, *parts]))
+    return lines
+
+
 def _status_plan(ctx: Context, plan) -> None:
     from ateam.gitops import GitError
     from ateam.guidance import load_guidance
@@ -1779,6 +1816,8 @@ def _status_plan(ctx: Context, plan) -> None:
             except GitError as e:   # a broken worktree must not stop status from printing (P-0020 review)
                 step, why = "?", f"the worktree cannot be read ({str(e).splitlines()[-1]})"
             click.echo(f"    restarts at {step}: {why}")
+    for line in _open_attempt_lines(ctx, ctx.db.open_attempts(cids), datetime.now(UTC)):
+        click.echo(line)
     attempts = [a for a in ctx.db.telemetry_rows() if a["contract_id"] in cids]
     usd, capped = spend_total(attempts, load_tiers(ctx.config.tiers))   # an unknown cost counts at its tier cap
     click.echo(f"spend: ${usd:.2f} over {len(attempts)} attempt(s), {capped} counted at its tier cap (cost unknown)")

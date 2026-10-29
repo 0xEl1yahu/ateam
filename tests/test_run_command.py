@@ -593,3 +593,99 @@ def test_status_shows_restart_point(plan3, monkeypatch):
     r = run("status", "P-0001", "--target", str(plan3.root))
     assert r.exit_code == 0 and any(line.startswith("    restarts at ?: the worktree cannot be read")
                                     for line in r.output.splitlines()), r.output
+
+
+# ---- status shows each open attempt's progress from its event log (C-0099)
+
+def _iso(ago_s):
+    from datetime import UTC, datetime, timedelta
+    return (datetime.now(UTC) - timedelta(seconds=ago_s)).isoformat()
+
+
+def _backdate(db, n, ago_s):
+    """Give the attempt row a started_at ago_s seconds back; returns it so the log can carry the same value."""
+    started = _iso(ago_s)
+    with db.conn:
+        db.conn.execute("UPDATE attempts SET started_at=? WHERE attempt_id=?", (started, n))
+    return started
+
+
+def _log(p, n, cid, role, started_at, events=()):
+    """Write A-NNNN.jsonl the way the event log does; events are (seconds ago, type, payload)."""
+    import json
+    from ateam.events import log_path
+    p.paths.logs.mkdir(parents=True, exist_ok=True)
+    rows = [{"seq": 1, "at": started_at, "attempt": n, "contract": cid, "role": role, "type": "session_start",
+             "payload": {"model": "m", "cwd": "/w", "resume": None, "started_at": started_at}}]
+    for seq, (ago, typ, payload) in enumerate(events, start=2):
+        rows.append({"seq": seq, "at": _iso(ago), "attempt": n, "contract": cid, "role": role, "type": typ,
+                     "payload": payload})
+    log_path(p.paths.logs, n).write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+
+def _tool(turn):
+    return {"tool_use_id": f"t{turn}", "name": "Read", "input": {}, "turn": turn, "message_id": f"m{turn}"}
+
+
+def test_status_shows_open_attempts_with_progress(plan3):
+    from ateam.events import attempt_label
+    with _sdb(plan3) as db:
+        a = db.start_attempt("C-0002", "build", "light", "haiku", {})
+        done = db.start_attempt("C-0001", "build", "light", "haiku", {})
+        db.finish_attempt(done, "completed", None, 1, 1, 0.1, 3, 0.1, "s")
+        started = _backdate(db, a, 5 * 60)
+        _log(plan3, a, "C-0002", "build", started,
+             [(120, "tool_call", _tool(1)), (40, "tool_call", _tool(2)),
+              (30, "assistant_text", {"text": "ok", "turn": 2, "message_id": "m2", "sdk_error": False})])
+    out = run("status", "P-0001", "--target", str(plan3.root)).output
+    line = next(x for x in out.splitlines() if x.startswith(f"    {attempt_label(a)} "))
+    for text in ("C-0002", "build", "light", "elapsed 5 min", "2 turn(s)", "latest assistant_text", "30 s ago"):
+        assert text in line, (text, line)
+    assert attempt_label(done) not in out                            # finished, so no progress line
+
+
+def test_status_open_attempt_without_log(plan3):
+    from ateam.events import attempt_label, log_path
+    with _sdb(plan3) as db:
+        none = db.start_attempt("C-0001", "build", "light", "haiku", {})            # no log at all
+        mismatched = db.start_attempt("C-0002", "build", "light", "haiku", {})      # a log of another run
+        _log(plan3, mismatched, "C-0002", "build", _iso(60 * 60))
+        unreadable = db.start_attempt("C-0003", "build", "light", "haiku", {})      # a log that is a directory
+        log_path(plan3.paths.logs, unreadable).mkdir(parents=True)
+        ids = [attempt_label(n) for n in (none, mismatched, unreadable)]
+    r = run("status", "P-0001", "--target", str(plan3.root))
+    assert r.exit_code == 0, r.output
+    lines = [x for x in r.output.splitlines() if x.startswith("    A-")]
+    assert [x.split()[0] for x in lines] == ids, r.output
+    assert all("no event yet" in x for x in lines), r.output
+
+
+def test_status_marks_a_quiet_open_attempt(plan3):
+    from ateam.events import attempt_label
+    with _sdb(plan3) as db:
+        stale = db.start_attempt("C-0001", "build", "light", "haiku", {})
+        silent = db.start_attempt("C-0002", "build", "light", "haiku", {})
+        busy = db.start_attempt("C-0003", "build", "light", "haiku", {})
+        _log(plan3, stale, "C-0001", "build", _backdate(db, stale, 30 * 60), [(12 * 60, "tool_call", _tool(1))])
+        _log(plan3, silent, "C-0002", "build", _backdate(db, silent, 30 * 60))
+        _log(plan3, busy, "C-0003", "build", _backdate(db, busy, 30 * 60), [(60, "tool_call", _tool(1))])
+        before = db.attempt(stale)
+    out = run("status", "P-0001", "--target", str(plan3.root)).output
+    lines = {x.split()[0]: x for x in out.splitlines() if x.startswith("    A-")}
+    assert "quiet for 12 min, may be gone" in lines[attempt_label(stale)], out
+    assert "quiet for 30 min, may be gone" in lines[attempt_label(silent)], out
+    assert "quiet" not in lines[attempt_label(busy)], out
+    with _sdb(plan3) as db:
+        assert db.attempt(stale) == before and before["finished_at"] is None
+
+
+def test_status_keeps_restart_and_spend_lines_with_open_attempts(plan3):
+    from ateam.events import attempt_label
+    with _sdb(plan3) as db:
+        open_id = db.start_attempt("C-0002", "build", "light", "haiku", {})
+        done = db.start_attempt("C-0001", "build", "light", "haiku", {})
+        db.finish_attempt(done, "completed", None, 1, 1, 0.25, 3, 0.1, "s")
+    out = run("status", "P-0001", "--target", str(plan3.root)).output
+    assert "  C-0002 " in out and "restarts at build: no worktree yet" in out, out
+    assert "spend: $1.25 over 2 attempt(s), 1 counted at its tier cap (cost unknown)" in out, out   # open: its $1 cap
+    assert f"{attempt_label(open_id)} C-0002" in out and attempt_label(done) not in out, out
