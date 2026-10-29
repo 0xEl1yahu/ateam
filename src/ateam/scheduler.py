@@ -39,6 +39,7 @@ from ateam.contracts.select import drift
 from ateam.contracts.store import load_contracts
 from ateam.gitops import GitError, GitRepo, MergeConflict
 from ateam.globs import matches
+from ateam.treecheck import DEFAULT_IGNORE
 from ateam.guidance import GuidanceEntry, live_guidance, load_guidance
 from ateam.integrate import (IntegrateRefused, integration_branch, integration_worktree, merge_contract, prepare_integration,
                              reconcile_contracts, reconcile_feature, reopen_for_rebase)
@@ -856,7 +857,7 @@ class _Run:
         uncommitted changes is not recorded: it says nothing about any commit."""
         g = GitRepo(w.path)
         head = g.head()
-        if passed and step == "test" and g.status_porcelain():
+        if passed and step == "test" and _dirty(g):
             return
         tests = db.attempts_for(cid, role="test") if step == "test" else []
         db.record_step(cid, step, head, db.contract_hash(cid) or "", passed, tests[-1]["attempt_id"] if tests else None)
@@ -968,6 +969,14 @@ class _Run:
             build = builds[-1] if builds else None
             if build is None or build["attempt_id"] <= meta["after"] or build.get("outcome") not in ("completed", "scope_breach"):
                 return "no completed BUILD attempt since the rebase began"
+            # Only within that BUILD's own window: after a resume, or guidance as new as it, a BUILD runs again so the
+            # owner's note reaches one (owner, 2026-10-29; P-0020 review).
+            if build["attempt_id"] <= db.window_start(cid):
+                return "the owner resumed since the rebase BUILD"
+            done = datetime.fromisoformat(build["finished_at"])
+            if any((e.at if e.at.tzinfo else e.at.replace(tzinfo=UTC)) >= done
+                   for e in live_guidance(load_guidance(ctx.paths.guidance, cid), db.contract_hash(cid) or "")):
+                return "new guidance since the rebase BUILD"
             c = load_contracts(ctx.paths.contracts)[cid]
             conflicted = meta["paths"] if "paths" in meta else g.unmerged_paths()   # meta written before 'paths' was
             problem = rebase_conclusion_problem(g, tip, conflicted, [*c.paths, *c.incidental])
@@ -1039,7 +1048,7 @@ def _after_pass(db: StateDB, cid: str, g: GitRepo, contract_hash: str | None,
     last, head = passes[-1], g.head()
     if last["head"] != head:
         return "build", f"HEAD {head[:8]} is not {last['head'][:8]}, where TEST passed"
-    if g.status_porcelain():
+    if _dirty(g):
         return "build", "the worktree has uncommitted changes"
     if contract_hash is None or last["contract_hash"] != contract_hash:
         return "build", "re-frozen since TEST passed"
@@ -1072,6 +1081,16 @@ def _marker_line(line: str) -> bool:
     return line == "=======" or (line[:7] in ("<<<<<<<", "|||||||", ">>>>>>>") and line[7:8] in ("", " "))
 
 
+def _ignored(path: str) -> bool:
+    return any(matches(x, path) for x in DEFAULT_IGNORE)
+
+
+def _dirty(g: GitRepo) -> list[tuple[str, str]]:
+    """Porcelain entries the scope check counts: .claude/** is ignored here as in treecheck.scope_check (owner,
+    2026-10-29; P-0020 review)."""
+    return [(xy, p) for xy, p in g.status_porcelain() if not _ignored(p)]
+
+
 def rebase_conclusion_problem(g: GitRepo, tip: str, conflicted: list[str], globs: list[str]) -> str | None:
     """Why an open rebase merge onto `tip` may not be concluded, or None. Measured on git, not on the porcelain scope
     check (which counts the files the tip brought in): (a) no path is unmerged; (b) no tracked file among the merge's
@@ -1085,10 +1104,10 @@ def rebase_conclusion_problem(g: GitRepo, tip: str, conflicted: list[str], globs
         f = g.root / rel
         if rel in tracked and f.is_file() and any(_marker_line(x) for x in f.read_text(errors="replace").splitlines()):
             return f"marker in {rel}"
-    outside = [p for p in g.diff_names(tip) if not any(matches(x, p) for x in globs)]
+    outside = [p for p in g.diff_names(tip) if not any(matches(x, p) for x in globs) and not _ignored(p)]
     if outside:
         return f"{', '.join(outside)} outside the contract's paths"
-    loose = [p for xy, p in g.status_porcelain() if xy == "??" or xy[1] != " "]
+    loose = [p for xy, p in _dirty(g) if xy == "??" or xy[1] != " "]
     if loose:
         return f"unstaged or untracked {', '.join(loose)}"
     return None

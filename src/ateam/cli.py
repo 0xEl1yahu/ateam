@@ -1757,6 +1757,7 @@ def _echo_lanes(ctx: Context, plan) -> None:
 
 
 def _status_plan(ctx: Context, plan) -> None:
+    from ateam.gitops import GitError
     from ateam.guidance import load_guidance
     from ateam.plans.ops import plan_contract_ids
     from ateam.scheduler import restart_point
@@ -1771,8 +1772,11 @@ def _status_plan(ctx: Context, plan) -> None:
         last = ctx.db.latest_attempt(cid)
         click.echo(f"  {cid}  {ctx.db.contract_status(cid)}" + (f"  last attempt: {last['role']} {last['outcome'] or 'running'}" if last else ""))
         if ctx.db.contract_status(cid) != "integrated":   # where a re-run or a resume starts it (C-0094)
-            step, why = restart_point(ctx.db, cid, worktree_path(ctx.paths, ctx.db, cid), ctx.db.contract_hash(cid),
-                                      load_guidance(ctx.paths.guidance, cid))
+            try:
+                step, why = restart_point(ctx.db, cid, worktree_path(ctx.paths, ctx.db, cid), ctx.db.contract_hash(cid),
+                                          load_guidance(ctx.paths.guidance, cid))
+            except GitError as e:   # a broken worktree must not stop status from printing (P-0020 review)
+                step, why = "?", f"the worktree cannot be read ({str(e).splitlines()[-1]})"
             click.echo(f"    restarts at {step}: {why}")
     attempts = [a for a in ctx.db.telemetry_rows() if a["contract_id"] in cids]
     usd, capped = spend_total(attempts, load_tiers(ctx.config.tiers))   # an unknown cost counts at its tier cap

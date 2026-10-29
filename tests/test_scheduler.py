@@ -1394,6 +1394,7 @@ def _resolve(g, text="A = 'both'\n"):
     ("outside", "src/app.py outside the contract's paths"),
     ("unstaged", "unstaged or untracked src/a/a.py"),
     ("untracked", "unstaged or untracked src/a/new.py"),
+    ("claude", None),   # .claude/** is ignored, as scope_check ignores it
 ])
 def test_rebase_conclusion_conditions_table(target_repo, case, expected):
     from ateam.scheduler import rebase_conclusion_problem
@@ -1406,6 +1407,8 @@ def test_rebase_conclusion_conditions_table(target_repo, case, expected):
         (target_repo / "src/a/a.py").write_text("A = 'later'\n")
     elif case == "untracked":
         (target_repo / "src/a/new.py").write_text("x\n")
+    elif case == "claude":
+        (target_repo / ".claude").mkdir(); (target_repo / ".claude/notes.md").write_text("x\n")
     assert ("A ", "docs/other.md") in g.status_porcelain()   # staged from the tip, outside the paths: allowed
     assert rebase_conclusion_problem(g, tip, ["src/a/a.py"], ["src/a/**", "tests/test_a.py"]) == expected
 
@@ -1546,6 +1549,30 @@ def test_rebase_merge_not_concluded_names_condition(plan3, case, expected):
     assert detail.startswith("C-0001 rebase BUILD did not conclude the merge") and expected in detail, detail
 
 
+@pytest.mark.parametrize("note", [True, False], ids=["note", "no-note"])
+def test_rebase_reentry_after_a_resume_builds_again(plan3, note):
+    """A re-entry concludes without a BUILD only within the rebase BUILD's own window: after the owner resumed, the
+    rebase BUILD runs again, so a resume note reaches a BUILD (owner, 2026-10-29; P-0020 review)."""
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+
+    def hook(fake, worktree):
+        hooks = worktree.parent / "hooks"
+        hooks.mkdir(exist_ok=True); (hooks / "pre-commit").write_text("#!/bin/sh\nexit 1\n"); (hooks / "pre-commit").chmod(0o755)
+        GitRepo(worktree).run("config", "core.hooksPath", str(hooks))
+    fake = FakeWorkers({("C-0001", "build", 0): _conflict_and_other(plan3), ("C-0001", "build", 1): _stages(then=hook)})
+    s, out = _run(plan3, fake)
+    wt = GitRepo(fake.calls[0][4])
+    assert s.outcome == "paused" and wt.merge_in_progress(), out
+    wt.run("config", "--unset", "core.hooksPath")   # the owner fixes the hook: the conditions now hold
+    args = ["resume", "P-0001", "--no-run", "--target", str(plan3.root)] + (["--note", "keep both constants"] if note else [])
+    assert run(*args).exit_code == 0
+    fake = FakeWorkers()
+    s, out = _run(plan3, fake)
+    assert s.outcome == "merge_proposed", out
+    assert [c[1] for c in fake.calls if c[0] == "C-0001"] == ["build", "test"]
+    assert any("owner resumed since the rebase BUILD" in m for m in out), out
+
+
 def test_rebase_prompt_requires_commit():
     from ateam.scheduler import _rebase_prompt
     prompt = _rebase_prompt(SimpleNamespace(id="C-9", title="t"), ["f.txt"])
@@ -1583,6 +1610,11 @@ def _rows(p, cid="C-0001", step=None):
     return [(r["step"], r["head"], r["passed"]) for r in _db(p).step_results(cid) if step in (None, r["step"])]
 
 
+def _claude_pass(fake, cid, role, worktree, n):
+    (worktree / ".claude").mkdir(exist_ok=True); (worktree / ".claude" / "notes.md").write_text("x\n")
+    return {}
+
+
 def _dirty_pass(fake, cid, role, worktree, n):
     fake.dirty_head = GitRepo(worktree).head()
     (worktree / "src" / "a" / "stray.py").write_text("X = 1\n")   # inside the contract's paths: the retry BUILD commits it
@@ -1593,7 +1625,7 @@ _NOT_MET = {"code": 5, "test_outcome": "failed", "test_class": "implementation",
             "report": {"verdicts": [{"id": "A1", "verdict": "not_met", "evidence": "no"}]}}
 
 
-@pytest.mark.parametrize("case", ["passes", "not_met", "pause", "interrupted", "dirty", "environment"])
+@pytest.mark.parametrize("case", ["passes", "not_met", "pause", "interrupted", "dirty", "environment", "claude"])
 def test_records_test_results_not_met_is_failure(plan3, case):
     _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
     stop = threading.Event()
@@ -1601,12 +1633,13 @@ def test_records_test_results_not_met_is_failure(plan3, case):
               "pause": {("C-0001", "test"): {"code": 5, "test_outcome": "failed", "test_class": "requirements"}},
               "interrupted": {("C-0001", "test", 0): _interrupting(stop)},
               "dirty": {("C-0001", "test", 0): _dirty_pass},
+              "claude": {("C-0001", "test", 0): _claude_pass},   # .claude/** is ignored, as scope_check ignores it
               "environment": {("C-0001", "test", 0): {"code": 1, "outcome": "failed", "subtype": None, "error": "transport"}}}[case]
     fake = FakeWorkers(script)
     s, out = _run(plan3, fake, stop=stop)
     db, head = _db(plan3), _wt(plan3).head()
     tests = _rows(plan3, step="test")
-    if case == "passes":
+    if case in ("passes", "claude"):
         assert s.outcome == "merge_proposed" and tests == [("test", head, True)], out
         [row] = [r for r in db.step_results("C-0001") if r["step"] == "test"]
         assert row["contract_hash"] == db.contract_hash("C-0001")
@@ -1754,6 +1787,7 @@ def _branch_tip(g):
     ("verified", "merge", "verified"),
     ("ready_no_pass", "build", "no TEST pass"),
     ("ready_pass", "verify", "TEST passed on "),
+    ("ready_pass_claude", "verify", "TEST passed on "),
     ("failed_pass", "verify", "TEST passed on "),
     ("rebase_open", "rebase", "rebase merge onto "),
     ("rebase_concluded_pass", "verify", "TEST passed on "),
@@ -1778,7 +1812,9 @@ def test_restart_point_table(target_repo, tmp_path, case, step, reason):
                 db.resume_pause(None, ["C-0001"]); db.finish_attempt(db.start_attempt("C-0001", "build", "light", "m", {}),
                                                                      "completed", None, 1, 1, 0.1, 1, 0.1, "s")
                 db.resume_pause(None, ["C-0001"])
-        if case in ("ready_pass", "failed_pass", "rebase_concluded_pass"):
+        if case == "ready_pass_claude":
+            (target_repo / ".claude").mkdir(); (target_repo / ".claude/notes.md").write_text("x\n")
+        if case in ("ready_pass", "ready_pass_claude", "failed_pass", "rebase_concluded_pass"):
             db.record_step("C-0001", "test", g.head(), "h1", True)
         got = restart_point(db, "C-0001", None if case == "no_worktree" else target_repo, "h1", [])
     assert got[0] == step and reason in got[1], got

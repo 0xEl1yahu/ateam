@@ -589,3 +589,7 @@ def test_status_shows_restart_point(plan3, monkeypatch):
     (_wt(plan3, "C-0003").root / "src" / "c" / "stray.py").write_text("X = 1\n")
     out = run("status", "P-0001", "--target", str(plan3.root)).output
     assert "    restarts at build: the worktree has uncommitted changes" in out.splitlines(), out
+    (_wt(plan3, "C-0003").root / ".git").write_text("gitdir: /nonexistent\n")   # a broken worktree: status still prints
+    r = run("status", "P-0001", "--target", str(plan3.root))
+    assert r.exit_code == 0 and any(line.startswith("    restarts at ?: the worktree cannot be read")
+                                    for line in r.output.splitlines()), r.output

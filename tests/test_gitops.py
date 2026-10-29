@@ -41,6 +41,17 @@ def test_diff_names(target_repo):
     assert g.diff_names(base) == ["src/app.py"]
 
 
+def test_name_lists_show_both_sides_of_a_rename(target_repo):
+    """A rename lists its source too, whatever the machine's rename settings: otherwise `git mv outside inside` hides
+    the deletion of an out-of-scope file from the scope check (P-0020 review)."""
+    g = GitRepo(target_repo); base = g.head()
+    g.run("config", "diff.renames", "true"); g.run("config", "status.renames", "true")
+    g.run("mv", "src/app.py", "src/api/app.py")
+    assert sorted(p for _, p in g.status_porcelain()) == ["src/api/app.py", "src/app.py"]
+    g.run("commit", "-q", "-m", "mv")
+    assert sorted(g.diff_names(base)) == ["src/api/app.py", "src/app.py"]
+
+
 def test_worktree_add_remove(target_repo, tmp_path):
     g = GitRepo(target_repo)
     wt = tmp_path / "wt"

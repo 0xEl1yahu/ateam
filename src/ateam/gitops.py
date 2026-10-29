@@ -37,7 +37,9 @@ class GitRepo:
         return self.run("rev-parse", "HEAD").strip()
 
     def status_porcelain(self) -> list[tuple[str, str]]:
-        out = self.run("status", "--porcelain", "--untracked-files=all", "-z")
+        # --no-renames: a rename lists its source as deleted, so a scope check sees it, whatever the machine's
+        # status.renames says (P-0020 review)
+        out = self.run("status", "--porcelain", "--untracked-files=all", "--no-renames", "-z")
         entries: list[tuple[str, str]] = []
         parts = out.split("\0")
         i = 0
@@ -62,7 +64,7 @@ class GitRepo:
         )
 
     def diff_names(self, base: str) -> list[str]:
-        out = self.run("diff", "--name-only", base)
+        out = self.run("diff", "--name-only", "--no-renames", base)   # both sides of a rename, as status lists them
         return [line for line in out.splitlines() if line]
 
     def commit_paths(self, paths: list[str], message: str) -> str:
