@@ -32,6 +32,37 @@ def test_append_writes_one_flushed_json_line_per_event(tmp_path):
     lg.close(); lg.close()
 
 
+class _ShortFile:
+    """A raw file whose write stores only part of the line and returns the count, as FileIO may on a full disk."""
+
+    def __init__(self, path):
+        self.path = path
+        self.calls = 0
+
+    def write(self, data):
+        self.calls += 1
+        with open(self.path, "ab") as f:
+            f.write(data[:5])
+        return 5
+
+    def flush(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def test_a_short_write_stops_the_log_so_earlier_lines_stay_readable(tmp_path):
+    lg = mk(tmp_path)
+    assert lg.append("error", err("a")) == 1
+    short = _ShortFile(tmp_path / "A-0001.jsonl")
+    lg._fh = short
+    assert lg.append("error", err("b")) is None and lg.failures == 1
+    assert lg.append("error", err("c")) is None and lg.failures == 2
+    assert short.calls == 1   # nothing is joined onto the fragment
+    assert [e.seq for e in read_events(tmp_path / "A-0001.jsonl")] == [1]
+
+
 def test_payload_builders_return_exactly_the_keys_of_their_type():
     class Bad:
         def __str__(self):

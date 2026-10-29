@@ -28,7 +28,7 @@ class TargetConfig(BaseModel):
     run_budget_usd: float = 10.0   # `ateam run` stops launching sessions before this would be exceeded (owner, 2026-10-26)
     global_record_cap: int = 5
     tiers: dict[str, dict] = Field(default_factory=dict)
-    log_retention_days: int = Field(default=14, ge=0)   # event logs of attempts finished longer ago are pruned (owner, 2026-10-29)
+    log_retention_days: int = Field(default=14, ge=1)   # event logs of attempts finished longer ago are pruned (owner, 2026-10-29)
     brief_docs: list[str] = Field(default_factory=list)  # target-relative files included in investigation briefs
 
 

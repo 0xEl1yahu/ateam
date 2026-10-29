@@ -46,6 +46,7 @@ def test_log_retention_days_defaults_to_14_and_loads(target_repo):
     p.intent.mkdir(parents=True, exist_ok=True)
     p.config_file.write_text("log_retention_days: 3\n")
     assert load_config(p).log_retention_days == 3
-    p.config_file.write_text("log_retention_days: -1\n")
-    with pytest.raises(ValidationError):
-        load_config(p)
+    for bad in (-1, 0):   # 0 could prune the log of an attempt closed as interrupted while its orphan still writes
+        p.config_file.write_text(f"log_retention_days: {bad}\n")
+        with pytest.raises(ValidationError):
+            load_config(p)

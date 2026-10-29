@@ -24,6 +24,8 @@ Each entry gives the evidence, the effect, a proposed fix, and whether the fix i
 | F10 | P-0019 R1-R3 and P4: an uncommitted rebase merge paused the plan; resume re-ran a passed TEST; killed sessions read $0; distinct record proposals were dropped | P-0019 | P-0020 (a08c9a5): the scheduler concludes a resolved rebase merge, resume restarts after the last passed step, no result means cost unknown at the tier cap, dedupe matches evidence plus statement |
 | F11 | The interface check rejected an equivalent header with black's trailing comma; three contracts each spent an attempt rewriting it | P-0020 C-0089, C-0092, C-0095 | `normalise_header` drops a comma before a closing bracket |
 | F12 | P-0020 review: a rebase re-entry concluded after an owner resume, dropping the note; renames hid an out-of-scope deletion; `.claude/**` blocked the new cleanliness checks; `status` raised on a broken worktree | Staff review of P-0020 | Conclusion only within the BUILD's window with no newer guidance; `--no-renames`; `.claude/**` ignored as in `scope_check`; `status` reports it (owner, 2026-10-29) |
+| F13 | V1: no live progress view; following a run took raw `sqlite3` queries | P-0018 to P-0020 heartbeats | P-0021: per-attempt event logs, `ateam log`, `ateam watch` (tmux) and open-attempt lines in `ateam status`. "Verify running" and "waiting at the gate" wait for coordinator events (backlog) |
+| F14 | P-0021 review: the B7 test compared two runs that both used the failing log; a short raw write could join two events into one bad line; a non-OS prune error stopped the run; a renamed optional SDK field would fail every session; a run refused at integration setup had already pruned | Staff review of P-0021 | Test runs truly without a log; a short write stops the log; prune catches every error and runs after integration setup; optional SDK fields via `getattr`; `log_retention_days` at least 1 (owner, 2026-10-29) |
 
 ## Open: wall-clock time
 
@@ -37,7 +39,6 @@ Most of the time in P-0018 went to waiting, not working: 2 h 10 min wall clock a
 
 | # | Finding | Evidence | Proposed fix | Owner's call? |
 |---|---|---|---|---|
-| V1 | No live progress view. Following the run took raw `sqlite3` queries on `state.db` and tailing a log file | This session's heartbeats | `ateam status P` shows open attempts with elapsed time, the current step (BUILD, TEST, verify, waiting at the gate) and spend so far. That is the spec's deferred event log and `watch`, in small form | No |
 | V2 | `status` offers `ateam resume --note` for a pause during final integration, which `resume` then refuses | `ateam status P-0018` output | Offer only the commands resume accepts for that pause (deferred-minor class) | No |
 | V3 | Worker sessions show as interactive, messageable peers (`c-0078-05`, `c-0079-ef`, `c-0080-4a`) | `ListAgents` during the run | Check whether a headless worker can receive cross-session messages. If so, turn that off in the clean-room options: it bypasses the brief and the policy | Possibly: a clean-room change |
 

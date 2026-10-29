@@ -1894,9 +1894,12 @@ async def test_event_write_failure_never_changes_a_decision_or_the_session(monke
 
     monkeypatch.setattr("ateam.runner.run.query", fq)
     a = await run_worker("p", ClaudeAgentOptions(), policy_build, log)
+    failures = log.failures
+    assert failures > 0
+    policy_build.events = None   # b runs with no log at all, not the same failing one through the policy
     b = await run_worker("p", ClaudeAgentOptions(), policy_build)
+    assert log.failures == failures
     assert (a.subtype, a.report, a.cost_usd, a.num_turns, a.error) == (b.subtype, b.report, b.cost_usd, b.num_turns, b.error)
-    assert log.failures > 0
 
 
 @pytest.mark.asyncio

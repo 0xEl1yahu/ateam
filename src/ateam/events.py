@@ -216,7 +216,13 @@ class EventLog:
                 line = json.dumps({"seq": seq, "at": datetime.now(timezone.utc).isoformat(), "attempt": self.attempt,
                                    "contract": self.contract, "role": self.role, "type": type, "payload": payload},
                                   default=str) + "\n"
-                self._fh.write(line.encode("utf-8"))
+                data = line.encode("utf-8")
+                written = self._fh.write(data)
+                if written is not None and written != len(data):
+                    # a raw write may store part of a line; appending after it would join two events into one bad
+                    # line, so the log stops here and the fragment stays an unterminated last line the reader drops
+                    self._closed = True
+                    raise OSError(f"short write ({written} of {len(data)} bytes); event log stopped")
                 self._fh.flush()
                 self._seq = seq
                 return seq

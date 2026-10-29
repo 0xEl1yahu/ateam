@@ -311,7 +311,6 @@ def run_plan(ctx_factory: Callable[[], object], plan_id: str, echo: Callable[[st
             plan, cs, cids = _preflight(ctx, plan_id, say, dry_run)
             if dry_run:
                 return _dry_run(ctx, plan_id, cs, cids, say)
-            _prune_logs(ctx, say)
             return _Run(ctx_factory, ctx, plan_id, cids, say, stop, launch, child, investigate).execute()
         finally:
             if acquired:
@@ -326,7 +325,7 @@ def _prune_logs(ctx, say: Callable[[str], None]) -> None:
     days = ctx.config.log_retention_days
     try:
         removed = prune_logs(ctx.paths.logs, ctx.db.telemetry_rows(), days, datetime.now(UTC))
-    except OSError as e:
+    except Exception as e:  # noqa: BLE001  (a locked state.db as much as a file error; the log is never needed to run)
         say(f"could not prune event logs: {e}")
         return
     if removed:
@@ -490,6 +489,7 @@ class _Run:
                 raise RunRefused(str(e)) from None
             self._refresh(ctx)
             self.lanes = plan_lanes(ctx, self.plan_id, load_contracts(ctx.paths.contracts), self.cids)
+        _prune_logs(ctx, self.say)   # only once integration setup passed: a refused run prunes nothing (owner, 2026-10-29)
 
         running = self.running
         settled: set[str] = set()

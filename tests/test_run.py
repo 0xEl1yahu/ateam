@@ -595,6 +595,36 @@ async def test_error_event_only_for_a_stream_exception(monkeypatch, policy_build
 
 
 @pytest.mark.asyncio
+async def test_a_renamed_sdk_field_does_not_fail_the_session(monkeypatch, policy_build, tmp_path):
+    from claude_agent_sdk import ToolResultBlock, UserMessage
+    from ateam.events import EventLog, read_events
+    # only optional SDK fields: a renamed required one is a breaking release, not this case
+    gone = {AssistantMessage: {"error", "message_id"}, ToolResultBlock: {"content", "is_error"},
+            ResultMessage: {"structured_output"}}
+
+    def without(cls):
+        class Renamed(cls):
+            def __getattribute__(self, name):
+                if name in gone[cls]:
+                    raise AttributeError(name)
+                return super().__getattribute__(name)
+        return Renamed
+
+    async def fq(prompt, options):
+        yield without(AssistantMessage)(content=[TextBlock(text="hi")], model="h")
+        yield UserMessage(content=[without(ToolResultBlock)(tool_use_id="t1", content="out", is_error=False)])
+        yield without(ResultMessage)(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False, num_turns=1,
+                                     session_id="s", total_cost_usd=0.01, usage={})
+
+    monkeypatch.setattr("ateam.runner.run.query", fq)
+    log = EventLog(tmp_path / "A-0001.jsonl", 1, "C-1", "build", "t")
+    r = await run_worker("p", ClaudeAgentOptions(), policy_build, log)
+    log.close()
+    assert r.error is None and r.subtype == "success"
+    assert [e.type for e in read_events(tmp_path / "A-0001.jsonl")] == ["session_start", "assistant_text", "tool_result", "session_end"]
+
+
+@pytest.mark.asyncio
 async def test_full_tool_output_never_reaches_the_log(monkeypatch, target_repo, target_paths, sample_contract, records_three):
     from ateam.events import TOOL_RESULT_LIMIT
     big = "".join(chr(65 + i % 26) for i in range(TOOL_RESULT_LIMIT + 500))

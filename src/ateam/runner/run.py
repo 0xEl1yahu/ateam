@@ -74,21 +74,24 @@ async def run_worker(prompt: str, options: ClaudeAgentOptions, policy: Policy, e
             if isinstance(m, AssistantMessage):
                 turn += 1
                 texts = [b.text for b in m.content if isinstance(b, TextBlock)]
-                if events is not None and (texts or m.error):
-                    events.append("assistant_text", assistant_text_payload("\n".join(texts), turn, m.message_id, m.error))
+                # optional SDK fields go through getattr: a renamed one costs its log detail, never the session
+                sdk_error, message_id = getattr(m, "error", None), getattr(m, "message_id", None)
+                if events is not None and (texts or sdk_error):
+                    events.append("assistant_text", assistant_text_payload("\n".join(texts), turn, message_id, sdk_error))
                 for block in m.content:
                     if isinstance(block, ToolUseBlock):
                         tool_uses.append({"tool": block.name, "input": block.input})
                         if events is not None:
-                            events.append("tool_call", tool_call_payload(block.id, block.name, block.input, turn, m.message_id))
+                            events.append("tool_call", tool_call_payload(block.id, block.name, block.input, turn, message_id))
             elif isinstance(m, UserMessage):
                 if events is not None and isinstance(m.content, list):
                     for block in m.content:
                         if isinstance(block, ToolResultBlock):
-                            events.append("tool_result", tool_result_payload(block.tool_use_id, block.content, block.is_error))
+                            events.append("tool_result", tool_result_payload(
+                                block.tool_use_id, getattr(block, "content", None), getattr(block, "is_error", None)))
             elif isinstance(m, ResultMessage):
                 result = m
-                if events is not None and isinstance(m.structured_output, dict):
+                if events is not None and isinstance(getattr(m, "structured_output", None), dict):
                     events.append("report", report_payload(m.structured_output))
     except Exception as e:  # noqa: BLE001  (ResultError, CLI errors, transport errors)
         error = f"{type(e).__name__}: {e}"
@@ -104,7 +107,8 @@ async def run_worker(prompt: str, options: ClaudeAgentOptions, policy: Policy, e
     if result is None:
         return WorkerResult("no_result", True, None, None, 0, None, {}, {}, None, tool_uses, list(policy.denials), error, wall)
     model_usage = {k: (v.__dict__ if hasattr(v, "__dict__") else v) for k, v in (result.model_usage or {}).items()}
-    report = result.structured_output if isinstance(result.structured_output, dict) else None
+    report = getattr(result, "structured_output", None)
+    report = report if isinstance(report, dict) else None
     return WorkerResult(
         subtype=result.subtype, is_error=bool(result.is_error), terminal_reason=result.terminal_reason,
         session_id=result.session_id, num_turns=result.num_turns, cost_usd=float(result.total_cost_usd or 0.0),

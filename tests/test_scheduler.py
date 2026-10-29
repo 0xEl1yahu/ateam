@@ -2,6 +2,7 @@
 refresh, merge and integrate. Contracts: C-0001 (a), C-0002 (b, depends on a), C-0003 (c)."""
 
 import json
+import sqlite3
 import threading
 import time
 from types import SimpleNamespace
@@ -1882,9 +1883,23 @@ def test_dry_run_and_refused_runs_prune_nothing(scenario, plan3):
     assert old_log.exists()
 
 
-def test_prune_failure_does_not_stop_the_run(plan3, monkeypatch):
+def test_a_run_refused_at_integration_setup_prunes_nothing(plan3, monkeypatch):
+    from ateam.integrate import IntegrateRefused
+    from ateam.scheduler import RunRefused
+
+    def refuse(*args, **kw):
+        raise IntegrateRefused("integration branch moved")
+    monkeypatch.setattr("ateam.scheduler.prepare_integration", refuse)
+    _, old_log = _attempt_with_log(plan3, finished_days_ago=30)
+    with pytest.raises(RunRefused):
+        _run(plan3, FakeWorkers())
+    assert old_log.exists()
+
+
+@pytest.mark.parametrize("exc", [OSError("disk on fire"), sqlite3.OperationalError("disk on fire")])
+def test_prune_failure_does_not_stop_the_run(plan3, monkeypatch, exc):
     def broken(*args, **kw):
-        raise OSError("disk on fire")
+        raise exc
     monkeypatch.setattr("ateam.scheduler.prune_logs", broken)
     s, out = _run(plan3, FakeWorkers())
     assert s.outcome == "merge_proposed"
