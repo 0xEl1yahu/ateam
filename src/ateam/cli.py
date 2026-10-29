@@ -1757,7 +1757,9 @@ def _echo_lanes(ctx: Context, plan) -> None:
 
 
 def _status_plan(ctx: Context, plan) -> None:
+    from ateam.guidance import load_guidance
     from ateam.plans.ops import plan_contract_ids
+    from ateam.scheduler import restart_point
     from ateam.tiers import load_tiers, spend_total
     from ateam.worktrees import worktree_path
 
@@ -1768,6 +1770,10 @@ def _status_plan(ctx: Context, plan) -> None:
     for cid in cids:
         last = ctx.db.latest_attempt(cid)
         click.echo(f"  {cid}  {ctx.db.contract_status(cid)}" + (f"  last attempt: {last['role']} {last['outcome'] or 'running'}" if last else ""))
+        if ctx.db.contract_status(cid) != "integrated":   # where a re-run or a resume starts it (C-0094)
+            step, why = restart_point(ctx.db, cid, worktree_path(ctx.paths, ctx.db, cid), ctx.db.contract_hash(cid),
+                                      load_guidance(ctx.paths.guidance, cid))
+            click.echo(f"    restarts at {step}: {why}")
     attempts = [a for a in ctx.db.telemetry_rows() if a["contract_id"] in cids]
     usd, capped = spend_total(attempts, load_tiers(ctx.config.tiers))   # an unknown cost counts at its tier cap
     click.echo(f"spend: ${usd:.2f} over {len(attempts)} attempt(s), {capped} counted at its tier cap (cost unknown)")

@@ -39,6 +39,7 @@ from ateam.contracts.select import drift
 from ateam.contracts.store import load_contracts
 from ateam.gitops import GitError, GitRepo, MergeConflict
 from ateam.globs import matches
+from ateam.guidance import GuidanceEntry, live_guidance, load_guidance
 from ateam.integrate import (IntegrateRefused, integration_branch, integration_worktree, merge_contract, prepare_integration,
                              reconcile_contracts, reconcile_feature, reopen_for_rebase)
 from ateam.intent import WRITER_KEY, IntentError, intent_git, record_coordinator_commits, require_clean
@@ -48,6 +49,7 @@ from ateam.plans.store import load_plans
 from ateam.records.store import load_records
 from ateam.retry import StepOutcome, classify, decide, decide_conflict, next_tier
 from ateam.roles import Role
+from ateam.state.db import StateDB
 from ateam.tiers import at_least, load_tiers
 from ateam.worktrees import WorktreeError, contract_worktree, prepare_rebase, rebased_this_window, worktree_path
 
@@ -668,7 +670,7 @@ class _Run:
     def _contract(self, ctx, cid: str) -> _Outcome:
         db = ctx.db
         rebase: list[str] | None = None   # the conflicting paths while this pipeline runs a rebase BUILD
-        retest = False                    # a concluded rebase whose TEST or verify an interruption stopped
+        start = "build"                   # build, test (a concluded rebase) or verify (TEST passed on this commit)
         reentry = False                   # a rebase merge left open by a stopped pipeline: concluded here if resolved
         prompt: str | None = None
         if db.contract_status(cid) == "verified":
@@ -683,7 +685,7 @@ class _Run:
                 return o
             rebase, reentry = o, o is not None
             if rebase is None and json.loads(db.get_meta(f"rebase:{cid}") or "{}").get("window") == db.window_start(cid):
-                rebase, retest = [], True   # concluded in this window: TEST and verify it again, no BUILD (owner, 2026-10-27)
+                rebase, start = [], "test"   # concluded in this window: TEST and verify it again, no BUILD (owner, 2026-10-27)
             elif rebase is None:   # concluded, and the owner resumed since: what failed after it gets an ordinary BUILD
                 prompt = _retry_prompt(load_contracts(ctx.paths.contracts)[cid], "the attempt after its rebase was stopped or did not pass")
         c = load_contracts(ctx.paths.contracts)[cid]
@@ -702,7 +704,7 @@ class _Run:
         if reentry:   # a BUILD resolved and staged the merge, then a stop or a crash came before the conclusion
             why = self._conclude_rebase(ctx, cid, w)
             if why is None:
-                retest = True   # concluded: TEST and verify it, no BUILD
+                start = "test"   # concluded: TEST and verify it, no BUILD
             else:
                 self.say(f"{cid} rebase merge not concluded ({why}); the rebase BUILD runs again")
         frozen = c.allocation.tier["build"]
@@ -710,14 +712,21 @@ class _Run:
         tier = builds[-1]["tier"] if builds and builds[-1]["tier"] in self.tiers else frozen
         escalated = any(a["tier"] != frozen for a in builds)
         allowed = c.budget.attempts
-        if rebase is not None and not retest:
+        if rebase is None or start == "test":   # not about to run a rebase BUILD: start after the last step that passed
+            step, why = restart_point(db, cid, w.path, db.contract_hash(cid), load_guidance(ctx.paths.guidance, cid))
+            if step == "verify":
+                start, prompt = "verify", None
+            if step == "verify" or (rebase is None and db.step_results(cid)):
+                self.say(f"{cid} restarts at {step}: {why}")
+        if rebase is not None and start == "build":
             prompt = _rebase_prompt(c, rebase)
         launched = 0   # BUILDs this pipeline launched that count: one that fails before recording an attempt still does
         while True:
+            first, start = start, "build"
             used = max(len(self._counted_builds(db, cid)), launched)
             if self.halt.is_set():
                 return _Outcome(cid, "halted")
-            if not retest:
+            if first == "build":
                 if used >= allowed:
                     return _Outcome(cid, "pause", "budget_exhausted", f"{cid} has used all {allowed} BUILD attempts")
                 r = self._session(ctx, cid, "build", w, tier if tier != frozen else None, prompt, self.tiers[tier][Role.build].usd)
@@ -747,11 +756,10 @@ class _Run:
                     prompt = _retry_prompt(c, f"the BUILD attempt ended {o.outcome}" + (f": {r['error']}" if r.get("error") else ""))
                     continue
 
-            retest = False
             # TEST never runs below BUILD (spec, Allocation), including after an escalation
             test_tier = at_least(tier, c.allocation.tier["test"])
             retry_build = False
-            for stage_used in range(allowed + 1):
+            for stage_used in range(allowed + 1 if first != "verify" else 0):
                 if self.halt.is_set():
                     return _Outcome(cid, "halted")
                 r = self._session(ctx, cid, "test", w, test_tier if test_tier != c.allocation.tier["test"] else None, None,
@@ -763,6 +771,10 @@ class _Run:
                 o = StepOutcome("test", int(r.get("code", 1)), r.get("outcome") or "failed", subtype=r.get("subtype"),
                                 test_class=r.get("test_class"), refusal=r.get("refusal"))
                 d = decide(classify(o), used, allowed, tier, escalated, None, stage="test", stage_used=stage_used + 1)
+                if d.action == "continue" and r.get("test_outcome") == "completed" and o.code == 0:
+                    self._record(db, cid, "test", w, True)   # only on a clean tree
+                elif d.action in ("retry", "pause"):
+                    self._record(db, cid, "test", w, False)
                 if rebase is not None and d.action != "continue":
                     return _Outcome(cid, "pause", "environment_failure",
                                     f"{cid} test {r.get('test_outcome') or o.outcome} after its rebase BUILD", evidence=r)
@@ -788,6 +800,10 @@ class _Run:
                 o = StepOutcome("verify", int(v.get("code", 1)), v.get("status") or "failed", verify_status=v.get("status"),
                                 failure_class=v.get("failure_class"), refusal=v.get("refusal"))
                 d = decide(classify(o), used, allowed, tier, escalated, None, stage="verify", stage_used=stage_used + 1)
+                if db.contract_status(cid) == "verified":
+                    self._record(db, cid, "verify", w, True)
+                elif d.action in ("retry", "pause"):
+                    self._record(db, cid, "verify", w, False)
                 if rebase is not None and d.action != "continue":
                     return _Outcome(cid, "pause", "environment_failure", f"{cid} verify {v.get('status')} after its rebase BUILD: "
                                     + "; ".join(v.get("reasons") or []), evidence=v)
@@ -834,6 +850,16 @@ class _Run:
         integrated."""
         others = [c for c in self._lane(cid) if c != cid and db.contract_status(c) != "integrated"]
         return f"; blocks {', '.join(others)} (same lane)" if others else ""
+
+    def _record(self, db, cid: str, step: str, w, passed: bool) -> None:
+        """A TEST or verify result at the worktree's HEAD as it is now, after the step (C-0094). A pass on a tree with
+        uncommitted changes is not recorded: it says nothing about any commit."""
+        g = GitRepo(w.path)
+        head = g.head()
+        if passed and step == "test" and g.status_porcelain():
+            return
+        tests = db.attempts_for(cid, role="test") if step == "test" else []
+        db.record_step(cid, step, head, db.contract_hash(cid) or "", passed, tests[-1]["attempt_id"] if tests else None)
 
     def _counted_builds(self, db, cid: str) -> list[dict]:
         """BUILD attempts that count toward budget.attempts: those since the contract's latest resume window, and never
@@ -971,6 +997,60 @@ class _Run:
         with self._counter_lock:
             self._counter += 1
             return self.runs_dir / f"{self._counter:04d}-{cid}-{role}.json"
+
+
+def restart_point(db: StateDB, cid: str, worktree: Path | None, contract_hash: str | None,
+                  guidance: list[GuidanceEntry]) -> tuple[str, str]:
+    """Where a re-run or a resume starts `cid`, and why (C-0094): done when integrated, merge when verified, rebase
+    while a rebase merge is open, verify when TEST passed on the worktree's HEAD and nothing since says otherwise,
+    otherwise build. A concluded rebase with no such pass keeps its rules: TEST again within the window it was
+    started in, an ordinary BUILD after the owner resumed."""
+    status = db.contract_status(cid)
+    if status == "integrated":
+        return "done", "integrated"
+    if status == "verified":
+        return "merge", "verified"
+    exists = worktree is not None and worktree.exists()
+    meta = json.loads(db.get_meta(f"rebase:{cid}") or "{}") if status == "building" else None
+    if meta is not None:
+        tip = meta.get("tip")
+        g = GitRepo(worktree) if exists else None
+        if not tip or g is None or g.merge_in_progress() or not g.is_ancestor(tip, "HEAD"):
+            return "rebase", f"the rebase merge onto {tip[:8] if tip else 'the integration tip'} is still open"
+    if not exists:
+        return "build", "no worktree yet"
+    step, why = _after_pass(db, cid, GitRepo(worktree), contract_hash, guidance)
+    if meta is None or step == "verify":
+        return step, why
+    if meta.get("window") == db.window_start(cid):
+        return "test", "rebase concluded; TEST and verify it again"
+    return "build", "rebase concluded and the owner resumed since; an ordinary BUILD"
+
+
+def _after_pass(db: StateDB, cid: str, g: GitRepo, contract_hash: str | None,
+                guidance: list[GuidanceEntry]) -> tuple[str, str]:
+    """verify when the latest TEST pass is on HEAD, the tree is clean, the frozen hash is the one it passed on, no
+    TEST or verify failed on HEAD since, and no live guidance is as new as the pass; build, naming the first that
+    fails, otherwise."""
+    rows = db.step_results(cid)
+    passes = [r for r in rows if r["step"] == "test" and r["passed"]]
+    if not passes:
+        return "build", "no TEST pass recorded"
+    last, head = passes[-1], g.head()
+    if last["head"] != head:
+        return "build", f"HEAD {head[:8]} is not {last['head'][:8]}, where TEST passed"
+    if g.status_porcelain():
+        return "build", "the worktree has uncommitted changes"
+    if contract_hash is None or last["contract_hash"] != contract_hash:
+        return "build", "re-frozen since TEST passed"
+    failed = [r for r in rows if r["seq"] > last["seq"] and r["head"] == head and not r["passed"]]
+    if failed:
+        return "build", f"{failed[-1]['step']} failed on {head[:8]} after TEST passed"
+    at = datetime.fromisoformat(last["at"])
+    newer = [e for e in live_guidance(guidance, contract_hash) if (e.at if e.at.tzinfo else e.at.replace(tzinfo=UTC)) >= at]
+    if newer:
+        return "build", f"new guidance from {newer[-1].source} since TEST passed"
+    return "verify", f"TEST passed on {head[:8]}"
 
 
 def _unmet(report: dict | None) -> str:
