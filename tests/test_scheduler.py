@@ -1820,3 +1820,73 @@ def test_restart_point_table(target_repo, tmp_path, case, step, reason):
     assert got[0] == step and reason in got[1], got
     if step == "verify":
         assert got[1] == f"TEST passed on {g.head()[:8]}"
+
+
+# ---- event log pruning at the start of a run (C-0101)
+
+def _attempt_with_log(p, finished_days_ago, cid="C-0001", open_attempt=False):
+    """An attempt row and its matching log file. finished_days_ago=None leaves the attempt open."""
+    from datetime import UTC, datetime, timedelta
+    from ateam.events import log_path
+    with StateDB(home_dir(p.root) / "state.db") as db:
+        db.init_schema()
+        aid = db.start_attempt(cid, "build", "light", "fake", {})
+        started = db.attempts_for(cid)[-1]["started_at"]
+        if not open_attempt:
+            finished = datetime.now(UTC) - timedelta(days=finished_days_ago)
+            with db.conn:
+                db.conn.execute("UPDATE attempts SET finished_at=? WHERE attempt_id=?", (finished.isoformat(), aid))
+    logs = TargetPaths.from_root(p.root).logs
+    logs.mkdir(parents=True, exist_ok=True)
+    path = log_path(logs, aid)
+    first = {"seq": 1, "at": started, "attempt": aid, "contract": cid, "role": "build", "type": "session_start",
+             "payload": {"started_at": started}}
+    path.write_text(json.dumps(first) + "\n")
+    return aid, path
+
+
+def test_run_prunes_old_logs_at_start(plan3):
+    old, old_log = _attempt_with_log(plan3, finished_days_ago=30)
+    recent, recent_log = _attempt_with_log(plan3, finished_days_ago=1, cid="C-0002")
+    open_one, open_log = _attempt_with_log(plan3, None, cid="C-0003", open_attempt=True)
+    s, out = _run(plan3, FakeWorkers())
+    assert s.outcome == "merge_proposed"
+    assert not old_log.exists()
+    assert recent_log.exists() and open_log.exists()
+    assert "pruned 1 event log(s) older than 14 day(s)" in out
+
+
+def _planning_elsewhere(p):
+    import os
+    with StateDB(home_dir(p.root) / "state.db") as db:
+        db.init_schema()
+        db.transition("feature", "P-0009", "requested", by="owner", reason="r")
+        db.transition("feature", "P-0009", "investigating", by="ateam")
+        db.set_meta("planning:P-0009", str(os.getpid()))
+
+
+@pytest.mark.parametrize("scenario", ["dry_run", "lock_held", "live_planning", "rejected", "dirty_intent"])
+def test_dry_run_and_refused_runs_prune_nothing(scenario, plan3):
+    from ateam.scheduler import RunRefused
+    setups = {"lock_held": _lock_held, "live_planning": _planning_elsewhere, "rejected": _rejected,
+              "dirty_intent": _dirty_intent}
+    if scenario in setups:
+        setups[scenario](plan3)
+    _, old_log = _attempt_with_log(plan3, finished_days_ago=30)
+    if scenario == "dry_run":
+        s, out = _run(plan3, FakeWorkers(), dry_run=True)
+        assert s.outcome == "dry_run"
+    else:
+        with pytest.raises(RunRefused):
+            _run(plan3, FakeWorkers())
+    assert old_log.exists()
+
+
+def test_prune_failure_does_not_stop_the_run(plan3, monkeypatch):
+    def broken(*args, **kw):
+        raise OSError("disk on fire")
+    monkeypatch.setattr("ateam.scheduler.prune_logs", broken)
+    s, out = _run(plan3, FakeWorkers())
+    assert s.outcome == "merge_proposed"
+    failures = [line for line in out if line.startswith("could not prune event logs")]
+    assert failures == ["could not prune event logs: disk on fire"]
