@@ -57,6 +57,12 @@ def test_payload_builders_return_exactly_the_keys_of_their_type():
     assert set(ev.assistant_text_payload(None, "x", 5, 7)) == PAYLOAD_KEYS["assistant_text"]
     assert TERMINAL_TYPES == {"session_end", "error"}
 
+    class NoBool:
+        def __bool__(self):
+            raise RuntimeError("bool")
+    assert set(ev.tool_result_payload("u", "x", NoBool())) == PAYLOAD_KEYS["tool_result"]
+    assert set(ev.session_end_payload("s", NoBool(), 1, None, None)) == PAYLOAD_KEYS["session_end"]
+
 
 def test_append_never_raises_and_counts_failures(tmp_path, caplog):
     lg = mk(tmp_path)

@@ -64,6 +64,13 @@ def _opt_str(value: Any) -> str | None:
     return None if value is None else _str(value)
 
 
+def _bool(value: Any) -> bool:
+    try:
+        return bool(value)
+    except Exception:
+        return True
+
+
 def _int(value: Any) -> int:
     try:
         return int(value)
@@ -97,7 +104,7 @@ def tool_result_payload(tool_use_id: str, content: Any, is_error: bool | None) -
     else:
         text = _str(content)
     digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
-    return {"tool_use_id": _str(tool_use_id), "is_error": None if is_error is None else bool(is_error),
+    return {"tool_use_id": _str(tool_use_id), "is_error": None if is_error is None else _bool(is_error),
             "content": text[:TOOL_RESULT_LIMIT], "truncated": len(text) > TOOL_RESULT_LIMIT,
             "length": len(text), "sha256": digest}
 
@@ -123,7 +130,7 @@ def session_end_payload(subtype: str, is_error: bool, num_turns: int, cost_usd: 
         cost = None if cost_usd is None else float(cost_usd)
     except Exception:
         cost = None
-    return {"subtype": _str(subtype), "is_error": bool(is_error), "num_turns": _int(num_turns), "cost_usd": cost,
+    return {"subtype": _str(subtype), "is_error": _bool(is_error), "num_turns": _int(num_turns), "cost_usd": cost,
             "session_id": _opt_str(session_id)}
 
 
