@@ -496,3 +496,61 @@ def test_leak_check_reports_unclosed_and_cross_thread_dbs(tmp_path, target_repo,
         t.join(10)
         leaked.close()
     assert tracker.leaks(me) == []
+
+
+def test_step_results_table_is_additive(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    with StateDB(path) as db:
+        db.init_schema()
+        db.upsert_contract("C-0001", "P-0001", "ready", "h")
+        db.set_meta("k", "v")
+        db.conn.execute("DROP TABLE step_results")
+        db.conn.commit()
+    with StateDB(path) as db:
+        db.init_schema()
+        assert db.schema_version() == 1
+        assert db.contract_status("C-0001") == "ready" and db.get_meta("k") == "v"
+        assert db.step_results("C-0001") == []
+    with sqlite3.connect(path) as c:
+        assert c.execute("SELECT name FROM sqlite_master WHERE name='step_results'").fetchone()
+
+
+def test_record_step_and_read_back(tmp_path):
+    with fresh(tmp_path) as db:
+        before = db.fingerprint("C-0001")
+        db.record_step("C-0001", "test", "abc", "h1", True, attempt_id=7)
+        db.record_step("C-0002", "verify", "zzz", "h9", True)
+        db.record_step("C-0001", "verify", "def", "h2", False)
+        assert db.fingerprint("C-0001") == before
+        rows = db.step_results("C-0001")
+        assert [(r["step"], r["head"], r["contract_hash"], r["passed"], r["attempt_id"]) for r in rows] == [
+            ("test", "abc", "h1", True, 7), ("verify", "def", "h2", False, None)]
+        assert rows[0]["seq"] < rows[1]["seq"] and rows[0]["contract_id"] == "C-0001" and rows[0]["at"].endswith("+00:00")
+        with pytest.raises(ValueError):
+            db.record_step("C-0001", "build", "abc", "h", True)
+
+
+def test_finish_attempt_unknown_cost_is_null(tmp_path):
+    with fresh(tmp_path) as db:
+        a = db.start_attempt("C-0001", "BUILD", "t", "m", {})
+        db.finish_attempt(a, "completed", None, 1, 1, None, 1, 1.0, "s")
+        b = db.start_attempt("C-0001", "BUILD", "t", "m", {})
+        db.finish_attempt(b, "completed", None, 1, 1, 0.25, 1, 1.0, "s")
+        rows = db.attempts_for("C-0001")
+        assert rows[0]["cost_usd"] is None and rows[1]["cost_usd"] == 0.25
+
+
+def test_set_attempt_outcome(tmp_path):
+    with fresh(tmp_path) as db:
+        a = db.start_attempt("C-0001", "BUILD", "t", "m", {})
+        db.finish_attempt(a, "scope_breach", "scope", 10, 20, 0.5, 3, 2.0, "s")
+        before = db.attempts_for("C-0001")[0]
+        db.set_attempt_outcome(a, "completed", None)
+        after = db.attempts_for("C-0001")[0]
+        assert after["outcome"] == "completed" and after["failure_class"] is None
+        for k in ("cost_usd", "tokens_in", "tokens_out", "finished_at", "turns", "session_id"):
+            assert after[k] == before[k]
+        with pytest.raises(KeyError):
+            db.set_attempt_outcome(999, "completed", None)

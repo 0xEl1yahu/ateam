@@ -74,6 +74,9 @@ CREATE TABLE IF NOT EXISTS pause_contracts (
 CREATE TABLE IF NOT EXISTS attempt_windows (
     window_id INTEGER PRIMARY KEY AUTOINCREMENT, contract_id TEXT NOT NULL, after_attempt_id INTEGER NOT NULL,
     pause_id INTEGER, at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS step_results (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT, contract_id TEXT NOT NULL, step TEXT NOT NULL, head TEXT NOT NULL,
+    contract_hash TEXT NOT NULL, passed INTEGER NOT NULL, attempt_id INTEGER, at TEXT NOT NULL);
 """
 
 
@@ -312,7 +315,7 @@ class StateDB:
 
     def finish_attempt(
         self, attempt_id: int, outcome: str, failure_class: str | None, tokens_in: int, tokens_out: int,
-        cost_usd: float, turns: int, wall_s: float, session_id: str | None,
+        cost_usd: float | None, turns: int, wall_s: float, session_id: str | None,
     ) -> None:
         with self.conn:
             self.conn.execute(
@@ -320,6 +323,29 @@ class StateDB:
                 "cost_usd=?, turns=?, wall_s=?, session_id=? WHERE attempt_id=?",
                 (_now(), outcome, failure_class, tokens_in, tokens_out, cost_usd, turns, wall_s, session_id, attempt_id),
             )
+
+    def set_attempt_outcome(self, attempt_id: int, outcome: str, failure_class: str | None) -> None:
+        """Amend a finished attempt's outcome and failure class; nothing else about it changes."""
+        with self.conn:
+            cur = self.conn.execute("UPDATE attempts SET outcome=?, failure_class=? WHERE attempt_id=?",
+                                    (outcome, failure_class, attempt_id))
+            if cur.rowcount == 0:
+                raise KeyError(f"no attempt {attempt_id}")
+
+    def record_step(self, contract_id: str, step: str, head: str, contract_hash: str, passed: bool,
+                    attempt_id: int | None = None) -> None:
+        """Record a TEST or verify result for a contract at a worktree head. Rows are never deleted or updated."""
+        if step not in ("test", "verify"):
+            raise ValueError(f"step must be 'test' or 'verify', not {step!r}")
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO step_results (contract_id, step, head, contract_hash, passed, attempt_id, at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (contract_id, step, head, contract_hash, int(passed), attempt_id, _now()))
+
+    def step_results(self, contract_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute("SELECT * FROM step_results WHERE contract_id=? ORDER BY seq", (contract_id,))
+        return [{**dict(r), "passed": bool(r["passed"])} for r in rows]
 
     def latest_attempt(self, contract_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
