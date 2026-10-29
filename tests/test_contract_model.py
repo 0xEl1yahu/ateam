@@ -48,9 +48,17 @@ def test_normalise_header_forms():
     for h in headers:
         assert normalise_header(h) == h
     assert normalise_header("def  name( a: int,  b: int )   ->  str:") == "def name(a: int, b: int) -> str:"
-    assert normalise_header("def name(\n        a: int,\n    b: int,\n) -> str | None:") == normalise_header(
-        "def name(a: int, b: int,) -> str | None:"
-    )
+    # A magic trailing comma (black's multi-line form) is the same header (P-0020: C-0089, C-0092, C-0095).
+    same = [
+        ("def name(\n        a: int,\n    b: int,\n) -> str | None:", "def name(a: int, b: int) -> str | None:"),
+        ("def f(self, x: int, session_id: str | None,) -> None:", "def f(self, x: int, session_id: str | None) -> None:"),
+        ("def g(*, tiers: dict[str, dict[Role, TierSpec]] | None = None,\n) -> str:",
+         "def g(*, tiers: dict[str, dict[Role, TierSpec]] | None = None) -> str:"),
+        ("def h(a: dict[\n    str, int,\n]) -> None:", "def h(a: dict[str, int]) -> None:"),
+        ("class Name(\n    Base,\n):", "class Name(Base):"),
+    ]
+    for black, plain in same:
+        assert normalise_header(black) == normalise_header(plain) == plain
     for not_header in ["name(a, b)", "--verbose", '{"a": 1}', "def name(a)", "class", "run the thing:", ""]:
         assert normalise_header(not_header) is None
 

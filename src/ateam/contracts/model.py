@@ -57,7 +57,8 @@ def normalise_header(text: str) -> str | None:
     if not line.startswith(HEADER_STARTS) or not line.endswith(":"):
         return None
     line = re.sub(r"([(\[{]) ", r"\1", line)
-    return re.sub(r" ([)\]}])", r"\1", line)
+    line = re.sub(r" ([)\]}])", r"\1", line)
+    return re.sub(r",([)\]}])", r"\1", line)   # black's magic trailing comma
 
 
 class Interface(BaseModel):
