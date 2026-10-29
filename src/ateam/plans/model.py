@@ -52,7 +52,7 @@ class PlanReview(BaseModel):
     revised: bool = False
     notes: str = ""
     session_id: str | None = None
-    cost_usd: float = 0.0
+    cost_usd: float | None = 0.0   # None: the review session reported no cost
 
 
 class Plan(BaseModel):

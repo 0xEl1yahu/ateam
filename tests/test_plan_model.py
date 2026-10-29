@@ -49,3 +49,9 @@ def test_review_notes_default_empty_and_round_trip():
     assert PlanReview(verdict="unavailable").notes == ""
     r = PlanReview(verdict="defensible", notes="looked at routes.py")
     assert PlanReview.model_validate(r.model_dump(mode="json")).notes == "looked at routes.py"
+
+
+def test_plan_review_cost_may_be_unknown():
+    from ateam.plans.model import PlanReview
+    r = PlanReview(verdict="unavailable", notes="no report", cost_usd=None)
+    assert PlanReview.model_validate(r.model_dump(mode="json")).cost_usd is None

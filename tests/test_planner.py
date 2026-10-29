@@ -468,3 +468,18 @@ def test_signature_form_notes():
     assert len(signature_form_notes([_c("C-0001", [], ("produces", "foo(a)", "returns int"))])) == 1
     assert signature_form_notes([_c("C-0001", [], ("produces", "foo", "def foo(a) -> int:"), ("consumes", "--target", "a path"),
                                     ("produces", "plan.yaml", "YAML file"), ("produces", "ateam integrate", "CLI command"))]) == []
+
+
+def test_plan_session_lines_cost_unknown(capsys):
+    from ateam.cli import _session_lines
+    from ateam.runner.run import WorkerResult
+
+    def res(sid, cost):
+        return WorkerResult("success", False, "completed", sid, 2, cost, {}, {}, None, [], [], None, 0.1)
+
+    _session_lines([res("s1", 0.01), res("s2", None)], 0.5)
+    out = capsys.readouterr().out
+    assert "session s1: 2 turns, $0.0100" in out and "session s2: 2 turns, cost unknown" in out
+    assert "total cost: $0.5100 across 2 sessions" in out and "1 counted at the investigate cap" in out
+    _session_lines([res("s1", 0.01), res("s2", 0.02)], 0.5)
+    assert "counted" not in capsys.readouterr().out

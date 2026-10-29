@@ -65,6 +65,23 @@ def _context(target: Path, require_ateam: bool = True) -> Context:
 _LAST_FAIL: list[str] = []   # the message of the last _fail, for --result-file
 
 
+def _cost_text(cost: float | None) -> str:
+    """A session's cost for a printed line; None (no result arrived) is never shown as $0."""
+    return "cost unknown" if cost is None else f"${cost:.4f}"
+
+
+def _session_lines(sessions: list, cap_usd: float) -> None:
+    """The per-session lines and the total. A session with unknown cost counts at `cap_usd`, the investigate tier cap."""
+    click.echo("")
+    for res in sessions:
+        click.echo(f"session {res.session_id}: {res.num_turns} turns, {_cost_text(res.cost_usd)}")
+    if len(sessions) > 1:
+        unknown = sum(1 for res in sessions if res.cost_usd is None)
+        total = sum(cap_usd if res.cost_usd is None else res.cost_usd for res in sessions)
+        note = f" ({unknown} counted at the investigate cap of ${cap_usd:.2f}, cost unknown)" if unknown else ""
+        click.echo(f"total cost: ${total:.4f} across {len(sessions)} sessions{note}")
+
+
 def _fail(message: str, code: int = 1) -> None:
     _LAST_FAIL[:] = [message]
     click.echo(f"error: {message}")
@@ -284,7 +301,7 @@ def init(remote: str | None, max_candidates: int, tier: str, target: Path) -> No
         n = len(disc.proposed)
         commit_intent(ctx.paths, f"ateam: propose {n} record{'s' if n != 1 else ''} from discovery", ["records"])
     click.echo(render_discovery_report(disc))
-    click.echo(f"\nsession {result.res.session_id}: {result.res.num_turns} turns, ${result.res.cost_usd:.4f}")
+    click.echo(f"\nsession {result.res.session_id}: {result.res.num_turns} turns, {_cost_text(result.res.cost_usd)}")
 
 
 # ---------------------------------------------------------------- plan
@@ -609,7 +626,7 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
         if review is None:
             click.echo(f"warning: review unavailable ({reason}); the plan is unreviewed")
             review = PlanReview(verdict="unavailable", notes=reason, session_id=review_res.session_id if review_res else None,
-                                cost_usd=review_res.cost_usd if review_res else 0.0)
+                                cost_usd=review_res.cost_usd if review_res else 0.0)   # no review session ran: no cost; a no-result one: unknown
         progress["review"] = review
         # one revision round for blocking or important findings (owner, 2026-10-26); minor ones travel with the plan
         if review.verdict != "needs_revision" or not any(f.severity in ("blocking", "important") for f in review.findings):
@@ -672,13 +689,6 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
             raise
         pr.plan = pr.plan.model_copy(update={"review": review})
 
-    def _session_lines() -> None:
-        click.echo("")
-        for res in sessions:
-            click.echo(f"session {res.session_id}: {res.num_turns} turns, ${res.cost_usd:.4f}")
-        if len(sessions) > 1:
-            click.echo(f"total cost: ${sum(res.cost_usd for res in sessions):.4f} across {len(sessions)} sessions")
-
     if pr.covered:
         covered_file = save_plan(ctx.paths.plans, pr.plan)
         covered_msg = f"ateam: plan {pid} covered by {', '.join(pr.plan.covered_by)}"
@@ -690,11 +700,11 @@ def plan(request: str, tier: str, replaces: str | None, no_review: bool, target:
         if replaces:
             click.echo(f"{replaces} is not superseded; only approval supersedes")
         click.echo(render_plan_review(pr, tiers))
-        _session_lines()
+        _session_lines(sessions, tiers[tier][Role.investigate].usd)
         return
     _propose(pr, intent_tampered_by)
     click.echo(render_plan_review(pr, tiers))
-    _session_lines()
+    _session_lines(sessions, tiers[tier][Role.investigate].usd)
     if not proposal["committed"]:
         sys.exit(1)
 
@@ -1961,7 +1971,7 @@ def worker_run(contract_id: str, role: str, worktree: Path, base: str | None, ti
         except ValueError as e:
             _fail(str(e))
         out.update(subtype=res.subtype, error=res.error, cost_usd=res.cost_usd, session_id=res.session_id, report=res.report)
-        click.echo(f"session {res.session_id} subtype={res.subtype} turns={res.num_turns} cost=${res.cost_usd:.4f} wall={res.wall_s:.0f}s")
+        click.echo(f"session {res.session_id} subtype={res.subtype} turns={res.num_turns} {"cost=" + _cost_text(res.cost_usd) if res.cost_usd is not None else _cost_text(None)} wall={res.wall_s:.0f}s")
         if res.denials:
             click.echo("denials: " + "; ".join(res.denials))
         if res.error:

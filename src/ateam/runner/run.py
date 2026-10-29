@@ -42,7 +42,7 @@ class WorkerResult:
     terminal_reason: str | None
     session_id: str | None
     num_turns: int
-    cost_usd: float
+    cost_usd: float | None   # None: no ResultMessage arrived, so the cost is unknown
     usage: dict[str, Any]
     model_usage: dict[str, Any]
     report: dict | None
@@ -70,7 +70,7 @@ async def run_worker(prompt: str, options: ClaudeAgentOptions, policy: Policy) -
         error = f"{type(e).__name__}: {e}"
     wall = time.time() - t0
     if result is None:
-        return WorkerResult("no_result", True, None, None, 0, 0.0, {}, {}, None, tool_uses, list(policy.denials), error, wall)
+        return WorkerResult("no_result", True, None, None, 0, None, {}, {}, None, tool_uses, list(policy.denials), error, wall)
     model_usage = {k: (v.__dict__ if hasattr(v, "__dict__") else v) for k, v in (result.model_usage or {}).items()}
     report = result.structured_output if isinstance(result.structured_output, dict) else None
     return WorkerResult(
