@@ -72,6 +72,7 @@ class RunSummary:
     attempts: int
     messages: list[str] = field(default_factory=list)
     proposal: Path | None = None
+    capped_sessions: int = 0   # sessions this run settled at their tier cap because the cost was unknown
 
 
 class Gate:
@@ -446,7 +447,7 @@ class _Run:
         self.gate, self.halt, self.results = Gate(), threading.Event(), queue.Queue()
         self.budget = Budget(ctx.config.run_budget_usd)
         self.tiers = load_tiers(ctx.config.tiers)
-        self.sessions = 0
+        self.sessions, self.capped = 0, 0
         self._counter, self._counter_lock = 0, threading.Lock()
         self._refs = threading.Lock()   # ATeam's own git ref and worktree creation, one at a time; taken after the Gate
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -594,6 +595,9 @@ class _Run:
                     r = self.investigate(ctx.paths.root, self.plan_id, cid, worktree, self._result_path(cid, "investigate"))
                 cost = r.get("cost_usd")
                 actual = usd if cost is None else float(cost)
+                if cost is None:
+                    with self._counter_lock:
+                        self.capped += 1
             finally:
                 self.budget.settle(usd, actual)
             outcome = r.get("outcome") or "failed"
@@ -633,9 +637,9 @@ class _Run:
         return next((m for m in self._lane(cid) if m != cid and db.get_meta(f"lane:{m}") is not None), None)
 
     def _summary(self, outcome, statuses, messages, proposal=None) -> RunSummary:
-        self.say(f"summary: {outcome}; {self.sessions} session(s), ${self.budget.spent:.2f} spent; "
-                 + ", ".join(f"{c} {s}" for c, s in statuses.items()))
-        return RunSummary(self.plan_id, outcome, statuses, self.budget.spent, self.sessions, messages, proposal)
+        self.say(f"summary: {outcome}; {self.sessions} session(s), {self.capped} settled at the tier cap (cost unknown), "
+                 f"${self.budget.spent:.2f} spent; " + ", ".join(f"{c} {s}" for c, s in statuses.items()))
+        return RunSummary(self.plan_id, outcome, statuses, self.budget.spent, self.sessions, messages, proposal, self.capped)
 
     def _close_open_attempts(self) -> None:
         for a in self.ctx.db.open_attempts(self.cids):
@@ -858,6 +862,9 @@ class _Run:
                 r = self.launch(ctx.paths.root, cid, role, w.path, w.base, tier, prompt, self._result_path(cid, role))
             cost = r.get("cost_usd")
             actual = usd if cost is None else float(cost)   # unknown cost (a crash) counts the whole cap
+            if cost is None:
+                with self._counter_lock:
+                    self.capped += 1
         finally:
             self.budget.settle(usd, actual)
         self.say(f"{cid} {role} {r.get('outcome')} ${actual:.2f}" + (f" tier {tier}" if tier else "")

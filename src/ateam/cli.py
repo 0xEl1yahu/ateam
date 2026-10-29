@@ -1758,14 +1758,19 @@ def _echo_lanes(ctx: Context, plan) -> None:
 
 def _status_plan(ctx: Context, plan) -> None:
     from ateam.plans.ops import plan_contract_ids
+    from ateam.tiers import load_tiers, spend_total
     from ateam.worktrees import worktree_path
 
     pid = plan.id
     live = ctx.db.feature_status(pid) or str(plan.status)
     click.echo(f"{pid}  {live}  {plan.title}")
-    for cid in plan_contract_ids(ctx.db, plan):
+    cids = plan_contract_ids(ctx.db, plan)
+    for cid in cids:
         last = ctx.db.latest_attempt(cid)
         click.echo(f"  {cid}  {ctx.db.contract_status(cid)}" + (f"  last attempt: {last['role']} {last['outcome'] or 'running'}" if last else ""))
+    attempts = [a for a in ctx.db.telemetry_rows() if a["contract_id"] in cids]
+    usd, capped = spend_total(attempts, load_tiers(ctx.config.tiers))   # an unknown cost counts at its tier cap
+    click.echo(f"spend: ${usd:.2f} over {len(attempts)} attempt(s), {capped} counted at its tier cap (cost unknown)")
     _echo_lanes(ctx, plan)
     if live != "paused":
         return
