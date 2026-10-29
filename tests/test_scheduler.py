@@ -1571,3 +1571,216 @@ def test_summary_names_sessions_counted_at_cap(plan3):
     assert s.capped_sessions == 3      # the BUILD, the TEST and the pause investigation reported no cost
     summary = next(line for line in out if line.startswith("summary:"))
     assert "3 settled at the tier cap (cost unknown)" in summary, summary
+
+
+# ---- resume and re-run restart after the last step that passed on the worktree's commit (C-0094)
+
+def _wt(p, cid="C-0001"):
+    return GitRepo(home_dir(p.root) / "worktrees" / cid)
+
+
+def _rows(p, cid="C-0001", step=None):
+    return [(r["step"], r["head"], r["passed"]) for r in _db(p).step_results(cid) if step in (None, r["step"])]
+
+
+def _dirty_pass(fake, cid, role, worktree, n):
+    fake.dirty_head = GitRepo(worktree).head()
+    (worktree / "src" / "a" / "stray.py").write_text("X = 1\n")   # inside the contract's paths: the retry BUILD commits it
+    return {}
+
+
+_NOT_MET = {"code": 5, "test_outcome": "failed", "test_class": "implementation",
+            "report": {"verdicts": [{"id": "A1", "verdict": "not_met", "evidence": "no"}]}}
+
+
+@pytest.mark.parametrize("case", ["passes", "not_met", "pause", "interrupted", "dirty", "environment"])
+def test_records_test_results_not_met_is_failure(plan3, case):
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    stop = threading.Event()
+    script = {"passes": {}, "not_met": {("C-0001", "test", 0): _NOT_MET},
+              "pause": {("C-0001", "test"): {"code": 5, "test_outcome": "failed", "test_class": "requirements"}},
+              "interrupted": {("C-0001", "test", 0): _interrupting(stop)},
+              "dirty": {("C-0001", "test", 0): _dirty_pass},
+              "environment": {("C-0001", "test", 0): {"code": 1, "outcome": "failed", "subtype": None, "error": "transport"}}}[case]
+    fake = FakeWorkers(script)
+    s, out = _run(plan3, fake, stop=stop)
+    db, head = _db(plan3), _wt(plan3).head()
+    tests = _rows(plan3, step="test")
+    if case == "passes":
+        assert s.outcome == "merge_proposed" and tests == [("test", head, True)], out
+        [row] = [r for r in db.step_results("C-0001") if r["step"] == "test"]
+        assert row["contract_hash"] == db.contract_hash("C-0001")
+        assert row["attempt_id"] == db.attempts_for("C-0001", role="test")[-1]["attempt_id"]
+    elif case == "not_met":   # retry: a failure on the first BUILD's commit, then a pass on the second's
+        assert s.outcome == "merge_proposed", out
+        assert [passed for *_, passed in tests] == [False, True] and tests[1][1] == head and tests[0][1] != head
+    elif case == "pause":
+        assert s.outcome == "paused" and tests == [("test", head, False)], out
+    elif case == "interrupted":
+        assert s.outcome == "interrupted" and tests == [], out
+    elif case == "dirty":
+        assert all(h != fake.dirty_head for _, h, _ in tests), (tests, out)
+    else:   # an environment failure retries TEST on the same commit: not a verdict on the code
+        assert s.outcome == "merge_proposed" and tests == [("test", head, True)], out
+
+
+@pytest.mark.parametrize("case", ["passes", "fails", "environment"])
+def test_records_verify_results(plan3, case):
+    from ateam.scheduler import run_child
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    failed = {"fails": {"code": 1, "status": "failed", "failure_class": "implementation", "reasons": ["x"]},
+              "environment": {"code": 1, "status": "failed", "failure_class": "environment", "reasons": ["disk"]}}.get(case)
+    seen = []
+
+    def verify(argv, result_file):
+        if "verify" in argv and "C-0001" in argv and failed and not seen:
+            seen.append(_wt(plan3).head())
+            return dict(failed)
+        return run_child(argv, result_file)
+
+    s, out = _run(plan3, FakeWorkers(), child=verify)
+    assert s.outcome == "merge_proposed", out
+    verifies, head = _rows(plan3, step="verify"), _wt(plan3).head()
+    if case == "fails":
+        assert verifies == [("verify", seen[0], False), ("verify", head, True)] and seen[0] != head
+    else:
+        assert verifies == [("verify", head, True)]
+
+
+def _verify_crashes(monkeypatch, p, cid="C-0001"):
+    """A run in which `cid`'s TEST passes and the process dies as its verify starts."""
+    from ateam.scheduler import run_child
+
+    def crash(argv, result_file):
+        if "verify" in argv and cid in argv:
+            raise SystemExit("killed before verify")
+        return run_child(argv, result_file)
+
+    _set_config(p.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    with pytest.raises(SystemExit):
+        _run(p, FakeWorkers(), child=crash)
+    db = _db(p)
+    assert db.contract_status(cid) == "ready" and [passed for *_, passed in _rows(p, cid)] == [True]
+
+
+def test_rerun_skips_passed_test(plan3, monkeypatch):
+    _verify_crashes(monkeypatch, plan3)
+    head, builds = _wt(plan3).head(), len(_db(plan3).attempts_for("C-0001", role="build"))
+    fake = FakeWorkers()
+    s, out = _run(plan3, fake)
+    assert s.outcome == "merge_proposed", out
+    assert [c for c in fake.calls if c[0] == "C-0001"] == []
+    assert len(_db(plan3).attempts_for("C-0001", role="build")) == builds
+    assert f"C-0001 restarts at verify: TEST passed on {head[:8]}" in out
+    assert _rows(plan3)[-1] == ("verify", head, True)
+
+
+def _move_head(p):
+    g = _wt(p)
+    (g.root / "src" / "a" / "a.py").write_text("def a():\n    return 'moved'\n")
+    g.run("add", "-A"); g.run("commit", "-q", "-m", "moved")
+
+
+def _dirty(p):
+    (_wt(p).root / "src" / "a" / "stray.py").write_text("X = 1\n")
+
+
+def _refreeze(p):
+    from ateam.contracts.store import save_contract
+    from ateam.intent import commit_intent
+    c = load_contracts(p.paths.contracts)["C-0001"]
+    save_contract(p.paths.contracts, c.model_copy(update={"title": "Add a, clarified"}))
+    commit_intent(p.paths, "owner clarifies C-0001", ["contracts"])
+    assert run("contracts", "freeze", "C-0001", "--force", "--target", str(p.root)).exit_code == 0
+
+
+def _failed_after(step):
+    def setup(p):
+        db = _db(p)
+        db.record_step("C-0001", step, _wt(p).head(), db.contract_hash("C-0001"), False)
+    return setup
+
+
+def _guidance(at, stale_hash=False, cid="C-0001"):
+    def setup(p):
+        from datetime import UTC, datetime, timedelta
+
+        from ateam.guidance import GuidanceEntry, append_guidance
+        from ateam.intent import commit_intent
+        when = datetime.now(UTC) + timedelta(seconds=at) if at is not None else datetime(2020, 1, 1, tzinfo=UTC)
+        h = "an-older-hash" if stale_hash else _db(p).contract_hash(cid)
+        append_guidance(p.paths.guidance, cid, GuidanceEntry(at=when, source="owner", contract_hash=h, text="use x"))
+        commit_intent(p.paths, f"guidance for {cid}", ["guidance"])
+    return setup
+
+
+def _rebuild(fake, cid, role, worktree, n):
+    (worktree / "src" / "a" / "a.py").write_text(f"def a():\n    return 'rebuilt {n}'\n")
+    g = GitRepo(worktree); g.run("add", "-A"); g.run("commit", "-q", "-m", f"rebuilt {n}")
+    return {"commit": False}
+
+
+@pytest.mark.parametrize("setup, builds", [
+    (_move_head, True), (_dirty, True), (_refreeze, True), (_failed_after("test"), True), (_failed_after("verify"), True),
+    (_guidance(0), True), (_guidance(None), False), (_guidance(0, stale_hash=True), False), (_guidance(0, cid="C-0003"), False),
+], ids=["head_moved", "dirty", "refrozen", "test_failed", "verify_failed", "guidance", "old_guidance", "stale_guidance",
+        "other_contract_guidance"])
+def test_restart_forces_build(plan3, monkeypatch, setup, builds):
+    _verify_crashes(monkeypatch, plan3)
+    setup(plan3)
+    fake = FakeWorkers({("C-0001", "build"): _rebuild})
+    s, out = _run(plan3, fake)
+    assert s.outcome == "merge_proposed", out
+    roles = [c[1] for c in fake.calls if c[0] == "C-0001"]
+    assert roles == (["build", "test"] if builds else []), (roles, out)
+    assert any(line.startswith("C-0001 restarts at " + ("build" if builds else "verify")) for line in out), out
+
+
+def _restart_db(tmp_path, status, cid="C-0001"):
+    db = StateDB(tmp_path / "state.db"); db.init_schema()
+    db.upsert_contract(cid, "P-0001", status, "h1")
+    return db
+
+
+def _branch_tip(g):
+    g.run("checkout", "-q", "-b", "tip"); (g.root / "tip.txt").write_text("t\n"); g.run("add", "-A"); g.run("commit", "-q", "-m", "tip")
+    tip = g.head()
+    g.run("checkout", "-q", "-"); (g.root / "mine.txt").write_text("m\n"); g.run("add", "-A"); g.run("commit", "-q", "-m", "mine")
+    return tip
+
+
+@pytest.mark.parametrize("case, step, reason", [
+    ("integrated", "done", "integrated"),
+    ("verified", "merge", "verified"),
+    ("ready_no_pass", "build", "no TEST pass"),
+    ("ready_pass", "verify", "TEST passed on "),
+    ("failed_pass", "verify", "TEST passed on "),
+    ("rebase_open", "rebase", "rebase merge onto "),
+    ("rebase_concluded_pass", "verify", "TEST passed on "),
+    ("rebase_concluded_window", "test", "rebase concluded"),
+    ("rebase_concluded_resumed", "build", "rebase concluded"),
+    ("no_worktree", "build", "no worktree"),
+])
+def test_restart_point_table(target_repo, tmp_path, case, step, reason):
+    from ateam.scheduler import restart_point
+    status = {"integrated": "integrated", "verified": "verified", "failed_pass": "failed"}.get(
+        case, "building" if case.startswith("rebase") else "ready")
+    g = GitRepo(target_repo)
+    with _restart_db(tmp_path, status) as db:
+        if case.startswith("rebase"):
+            tip = _branch_tip(g)
+            db.set_meta("rebase:C-0001", json.dumps({"window": 0, "tip": tip, "after": 0, "paths": []}))
+            if case == "rebase_open":
+                g.run("merge", "-q", "--no-ff", "--no-commit", "tip")
+            else:
+                g.run("merge", "-q", "--no-ff", "-m", "rebase", "tip")
+            if case == "rebase_concluded_resumed":
+                db.resume_pause(None, ["C-0001"]); db.finish_attempt(db.start_attempt("C-0001", "build", "light", "m", {}),
+                                                                     "completed", None, 1, 1, 0.1, 1, 0.1, "s")
+                db.resume_pause(None, ["C-0001"])
+        if case in ("ready_pass", "failed_pass", "rebase_concluded_pass"):
+            db.record_step("C-0001", "test", g.head(), "h1", True)
+        got = restart_point(db, "C-0001", None if case == "no_worktree" else target_repo, "h1", [])
+    assert got[0] == step and reason in got[1], got
+    if step == "verify":
+        assert got[1] == f"TEST passed on {g.head()[:8]}"

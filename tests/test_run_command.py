@@ -533,3 +533,59 @@ def test_status_spend_counts_unknown_at_cap(plan3):
     r = run("status", "P-0001", "--target", str(plan3.root))
     assert r.exit_code == 0, r.output
     assert "spend: $2.25 over 2 attempt(s), 1 counted at its tier cap (cost unknown)" in r.output, r.output
+
+
+# ---- resume and re-run restart after the last step that passed (C-0094)
+
+def _two_tests_pass_then_crash(p, monkeypatch):
+    """C-0001's and C-0003's TESTs pass side by side; the process dies at the first verify, before either is verified."""
+    from ateam.scheduler import run_child
+    from test_scheduler import _meet, _run
+
+    def crash(argv, result_file):
+        if "verify" in argv:
+            raise SystemExit("killed at verify")
+        return run_child(argv, result_file)
+
+    with pytest.raises(SystemExit):   # plan3 runs two at once
+        _run(p, FakeWorkers(_meet(("C-0001", "test"), ("C-0003", "test"))), child=crash)
+    db = _sdb(p)
+    assert all([r["passed"] for r in db.step_results(c)] == [True] for c in ("C-0001", "C-0003"))
+    assert db.contract_status("C-0001") == db.contract_status("C-0003") == "ready"
+
+
+def test_resume_note_forces_build_after_crash(plan3, monkeypatch):
+    _two_tests_pass_then_crash(plan3, monkeypatch)
+    assert run("stop", "P-0001", "--target", str(plan3.root)).exit_code == 0   # paused, so it can be resumed
+
+    def dies(*a, **k):
+        raise SystemExit(137)   # resume committed the guidance, then died before the run started
+
+    import ateam.cli
+    real = ateam.cli._run_foreground
+    monkeypatch.setattr("ateam.cli._run_foreground", dies)
+    r = _resume(plan3, "--note", "use x", "--contract", "C-0001")
+    assert r.exit_code == 137 and "C-0001: instruction recorded" in r.output, r.output
+    assert _sdb(plan3).feature_status("P-0001") == "executing"
+    monkeypatch.setattr("ateam.cli._run_foreground", real)
+    from test_scheduler import _rebuild
+    fake = FakeWorkers({("C-0001", "build"): _rebuild})
+    _fake(monkeypatch, fake)
+    r = run("run", "P-0001", "--target", str(plan3.root))
+    assert r.exit_code == 0 and "P-0001 -> merge_proposed" in r.output, r.output
+    assert [c[1] for c in fake.calls if c[0] == "C-0001"] == ["build", "test"]
+    assert [c for c in fake.calls if c[0] == "C-0003"] == []   # its pass still stands
+    assert "C-0001 restarts at build: new guidance" in r.output and "C-0003 restarts at verify: TEST passed on" in r.output
+
+
+def test_status_shows_restart_point(plan3, monkeypatch):
+    from test_scheduler import _verify_crashes, _wt
+    _verify_crashes(monkeypatch, plan3, cid="C-0003")
+    out = run("status", "P-0001", "--target", str(plan3.root)).output
+    lines = out.splitlines()
+    assert f"    restarts at verify: TEST passed on {_wt(plan3, 'C-0003').head()[:8]}" in lines, out
+    assert "    restarts at build: no worktree yet" in lines, out          # C-0002: not started
+    assert sum("restarts at" in line for line in lines) == 2, out             # none for the integrated C-0001
+    (_wt(plan3, "C-0003").root / "src" / "c" / "stray.py").write_text("X = 1\n")
+    out = run("status", "P-0001", "--target", str(plan3.root)).output
+    assert "    restarts at build: the worktree has uncommitted changes" in out.splitlines(), out
