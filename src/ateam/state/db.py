@@ -349,6 +349,15 @@ class StateDB:
         ).fetchone()
         return dict(row) if row else None
 
+    def attempt(self, attempt_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+        return dict(row) if row else None
+
+    def running_attempts(self) -> list[dict[str, Any]]:
+        """Every attempt that has not finished, whatever its contract."""
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM attempts WHERE finished_at IS NULL ORDER BY attempt_id")]
+
     def attempts_for(self, contract_id: str, role: str | None = None) -> list[dict[str, Any]]:
         sql, args = "SELECT * FROM attempts WHERE contract_id=?", [contract_id]
         if role is not None:

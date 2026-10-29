@@ -86,6 +86,11 @@ class TargetPaths:
         )
 
     @property
+    def logs(self) -> Path:
+        """Per-attempt event logs (A-NNNN.jsonl), beside scratch and state.db, outside the intent repo and the target."""
+        return self.scratch_root.parent / "logs"
+
+    @property
     def guidance(self) -> Path:
         """The owner's instructions per contract (guidance/<contract-id>.yaml), committed in the intent repo."""
         return self.intent / "guidance"

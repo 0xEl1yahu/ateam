@@ -35,3 +35,17 @@ def test_brief_docs_default_empty_and_roundtrip(target_repo):
     assert TargetConfig().brief_docs == []
     save_config(p, TargetConfig(brief_docs=["docs/design.md"]))
     assert load_config(p).brief_docs == ["docs/design.md"]
+
+
+def test_log_retention_days_defaults_to_14_and_loads(target_repo):
+    import pytest
+    from pydantic import ValidationError
+
+    p = TargetPaths.from_root(target_repo)
+    assert load_config(p).log_retention_days == 14
+    p.intent.mkdir(parents=True, exist_ok=True)
+    p.config_file.write_text("log_retention_days: 3\n")
+    assert load_config(p).log_retention_days == 3
+    p.config_file.write_text("log_retention_days: -1\n")
+    with pytest.raises(ValidationError):
+        load_config(p)
