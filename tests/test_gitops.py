@@ -187,3 +187,23 @@ def test_merge_keep_conflicts_raises_on_a_failure_that_is_not_a_conflict(target_
     with pytest.raises(GitError):
         g.merge_keep_conflicts(theirs)
     assert not g.merge_in_progress() and g.head() == base
+
+
+def test_commit_no_edit_concludes_merge_and_hook_failure_raises(target_repo):
+    g = GitRepo(target_repo)
+    base = g.head()
+    g.create_branch("other", base)
+    _commit(g, "f.txt", "mine\n", "mine")
+    g.run("checkout", "-q", "other"); theirs = _commit(g, "f.txt", "theirs\n", "theirs"); g.run("checkout", "-q", "main")
+    assert g.merge_keep_conflicts(theirs) == ["f.txt"] and g.unmerged_paths() == ["f.txt"]
+    (target_repo / "f.txt").write_text("both\n"); g.run("add", "f.txt")
+    assert g.unmerged_paths() == []
+    g.run("config", "core.hooksPath", ".git/hooks")   # this scratch repo's own hooks, whatever the machine's settings
+    hook = target_repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\necho rejected by the hook >&2\nexit 1\n"); hook.chmod(0o755)
+    with pytest.raises(GitError, match="rejected by the hook"):
+        g.commit_no_edit()
+    assert g.merge_head() == theirs and g.head() != theirs   # the merge is left open
+    hook.unlink()
+    head = g.commit_no_edit()
+    assert head == g.head() and not g.merge_in_progress() and g.is_ancestor(theirs, head) and g.is_ancestor(base, head)

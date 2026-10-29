@@ -226,7 +226,7 @@ def test_prepare_rebase_records_then_merges_and_is_idempotent(target_repo, tmp_p
     a = db.start_attempt("C-1", "build", "light", "m", {}); db.finish_attempt(a, "completed", None, 1, 1, 0.1, 1, 0.1, "s")
     wt, conflicts = prepare_rebase(paths, db, owner, "P-0001", "C-1", tip)
     assert conflicts == ["f.txt"] and wt.path == w.path and wt.base == tip == db.get_meta("base:C-1")
-    assert json.loads(db.get_meta("rebase:C-1")) == {"window": db.window_start("C-1"), "tip": tip, "after": a}
+    assert json.loads(db.get_meta("rebase:C-1")) == {"window": db.window_start("C-1"), "tip": tip, "after": a, "paths": ["f.txt"]}
     newer = _advance_integration(owner, tmp_path, "g.txt", "newer")
     assert prepare_rebase(paths, db, owner, "P-0001", "C-1", newer)[1] == ["f.txt"]   # the open merge is kept
     assert db.get_meta("base:C-1") == tip and GitRepo(w.path).merge_head() == tip
@@ -277,3 +277,23 @@ def test_prepare_rebase_after_a_concluded_rebase_merges_a_newer_tip(target_repo,
     _, conflicts = prepare_rebase(paths, db, owner, "P-0001", "C-1", newer)
     assert conflicts == ["f.txt"] and GitRepo(w.path).merge_head() == newer
     assert json.loads(db.get_meta("rebase:C-1"))["tip"] == newer == db.get_meta("base:C-1")
+
+
+def test_prepare_rebase_records_conflicting_paths(target_repo, tmp_path):
+    import json
+    from ateam.worktrees import contract_worktree, prepare_rebase
+    paths, db, owner = _setup(target_repo)
+    w = contract_worktree(paths, db, owner, "P-0001", "C-1")
+    tip = _conflicting_tip(owner, tmp_path, w)
+    prepare_rebase(paths, db, owner, "P-0001", "C-1", tip)
+    assert json.loads(db.get_meta("rebase:C-1"))["paths"] == ["f.txt"]
+    g = GitRepo(w.path)
+    (w.path / "f.txt").write_text("both\n"); g.run("add", "f.txt")   # every path staged, the merge still open
+    assert g.unmerged_paths() == [] and g.merge_head() == tip
+    prepare_rebase(paths, db, owner, "P-0001", "C-1", tip)   # re-entry after a crash keeps the recorded set
+    assert json.loads(db.get_meta("rebase:C-1"))["paths"] == ["f.txt"]
+    meta = json.loads(db.get_meta("rebase:C-1"))
+    db.set_meta("rebase:C-1", json.dumps({k: v for k, v in meta.items() if k != "paths"}))   # written before 'paths' existed
+    (w.path / "f.txt").write_text("<<<<<<< ours\n"); g.run("checkout", "-m", "--", "f.txt")   # unmerged again
+    prepare_rebase(paths, db, owner, "P-0001", "C-1", tip)
+    assert json.loads(db.get_meta("rebase:C-1"))["paths"] == ["f.txt"]   # falls back to the unmerged paths
