@@ -21,6 +21,9 @@ Each entry gives the evidence, the effect, a proposed fix, and whether the fix i
 | F7 | T3/T4: capacity idle; worktree preparation and merges waited for every running session | P-0018 and P-0019 run logs | 0649102 lanes; 5f549b7 `max_workers` 8; ddb3e82 worktree prep under a refs lock, not the gate |
 | F8 | One worker's `pkill -f pytest` killed other workers' sessions (exit 143), costing two attempts | P-0019 run log | aa0370c: the policy denies `pkill`, `killall` and `kill` of anything but a numeric PID (owner, 2026-10-28) |
 | F9 | A contract paused `budget_exhausted` because the write policy left out its `incidental` paths | P-0019 C-0083 | 8a4312c: scope is `paths` plus `incidental` in the write policy too |
+| F10 | P-0019 R1-R3 and P4: an uncommitted rebase merge paused the plan; resume re-ran a passed TEST; killed sessions read $0; distinct record proposals were dropped | P-0019 | P-0020 (a08c9a5): the scheduler concludes a resolved rebase merge, resume restarts after the last passed step, no result means cost unknown at the tier cap, dedupe matches evidence plus statement |
+| F11 | The interface check rejected an equivalent header with black's trailing comma; three contracts each spent an attempt rewriting it | P-0020 C-0089, C-0092, C-0095 | `normalise_header` drops a comma before a closing bracket |
+| F12 | P-0020 review: a rebase re-entry concluded after an owner resume, dropping the note; renames hid an out-of-scope deletion; `.claude/**` blocked the new cleanliness checks; `status` raised on a broken worktree | Staff review of P-0020 | Conclusion only within the BUILD's window with no newer guidance; `--no-renames`; `.claude/**` ignored as in `scope_check`; `status` reports it (owner, 2026-10-29) |
 
 ## Open: wall-clock time
 
@@ -42,18 +45,9 @@ Most of the time in P-0018 went to waiting, not working: 2 h 10 min wall clock a
 
 | # | Finding | Evidence | Proposed fix | Owner's call? |
 |---|---|---|---|---|
-| C1 | Planning cost $5.58 at `careful` for four small changes; the whole run cost $3.13 | `ateam plan` output | Claude triage of planning effort (request drafted; project memory note) | Yes: changes the 2025-10-25 ruling |
+| C1 | Planning cost $5.58 at `careful` for four small changes; the whole run cost $3.13 | `ateam plan` output | Claude triage of planning effort (request drafted; project memory note) | Yes: changes the 2026-10-25 ruling |
 | C2 | Each contract worktree is ~337 MB (its own `.venv`) and is never removed | `du` of `~/.ateam/.../worktrees` | A cleanup command after merge or reject, already deferred in the spec. Lanes cut it to one worktree per lane; setup still runs on each new base | No |
 | C3 | Haiku's pause diagnosis misjudged the class and said setup needs a re-freeze | Live test findings | None needed: real pause investigations run at `careful`. Keep in mind if triage lowers tiers | No |
-
-## Open: found in P-0019, planned as P-0020
-
-| # | Finding | Evidence | Fix in P-0020 |
-|---|---|---|---|
-| R1 | A rebase BUILD resolved and staged the merge but did not commit it; the plan paused `environment_failure` and the attempt read `scope_breach` | P-0019 C-0088 | The scheduler concludes a fully resolved, in-scope rebase merge itself |
-| R2 | Resume re-runs BUILD even when the contract's TEST already passed on its current head | P-0019 resumes | A per-commit record of passed steps; resume starts after the last one |
-| R3 | A session killed before its result message is recorded at $0 | P-0019 sessions killed by `pkill` | No result means unknown cost, counted at the tier cap |
-| P4 | Planning dropped distinct record proposals as duplicates because they cited the same evidence | P-0019 planning output | Duplicates match on evidence plus statement; a rejected record still suppresses by evidence alone |
 
 ## Open: process lessons
 
