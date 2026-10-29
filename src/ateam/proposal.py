@@ -57,7 +57,7 @@ def _telemetry(telemetry: list[dict], tiers: dict[str, dict[Role, TierSpec]] | N
 
 def render_proposal(
     header: ProposalHeader, *, diff_stat: str, contracts: list[dict], records: list[str], risks: list[str],
-    telemetry: list[dict], final_checks: list[dict] = (), tiers: dict[str, dict[Role, TierSpec]] | None = None,
+    telemetry: list[dict], final_checks: list[dict] = (), tiers: dict[str, dict[Role, TierSpec]] | None = None
 ) -> str:
     evidence = []
     for c in contracts:
