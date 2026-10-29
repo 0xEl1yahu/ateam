@@ -103,20 +103,25 @@ def prepare_rebase(paths: TargetPaths, db: StateDB, owner: GitRepo, plan_id: str
     """Merge the integration tip into the contract's own worktree, without committing, for the rebase BUILD (owner,
     2026-10-27): workers may not run git merge, so the scheduler starts it and the BUILD concludes it. Idempotent:
     an open merge onto the recorded tip is kept, and a tip HEAD already holds is not merged again. The base moves to the tip only once
-    the merge is under way, so a merge that fails leaves the contract as it was."""
+    the merge is under way, so a merge that fails leaves the contract as it was. The rebase:<cid> meta gains the
+    merge's conflicting paths ('paths') once it is under way; they survive staging, which the unmerged paths do not."""
     wt = GitRepo(worktree_path(paths, db, cid))
     raw = db.get_meta(f"rebase:{cid}")
-    recorded = json.loads(raw)["tip"] if raw else None
-    unmerged = lambda: [p for p in wt.run("diff", "--name-only", "--diff-filter=U").splitlines() if p]  # noqa: E731
+    meta = json.loads(raw) if raw else {}
+    recorded = meta.get("tip")
     if recorded is not None and wt.merge_head() == recorded:
+        if "paths" not in meta:   # a crash after the merge began, or meta written before 'paths' was recorded
+            db.set_meta(f"rebase:{cid}", json.dumps({**meta, "paths": wt.unmerged_paths()}))
         if db.get_meta(f"base:{cid}") != recorded:
             db.set_meta(f"base:{cid}", recorded)
-        return contract_worktree(paths, db, owner, plan_id, cid), unmerged()
+        return contract_worktree(paths, db, owner, plan_id, cid), wt.unmerged_paths()
     if not wt.merge_in_progress() and wt.is_ancestor(tip, "HEAD"):   # the tip is already in: nothing to merge
         return contract_worktree(paths, db, owner, plan_id, cid), []
     after = max((a["attempt_id"] for a in db.attempts_for(cid)), default=0)
-    db.set_meta(f"rebase:{cid}", json.dumps({"window": db.window_start(cid), "tip": tip, "after": after}))
+    meta = {"window": db.window_start(cid), "tip": tip, "after": after}
+    db.set_meta(f"rebase:{cid}", json.dumps(meta))
     conflicts = wt.merge_keep_conflicts(tip)
-    if wt.merge_head() == tip:
+    if wt.merge_head() == tip:   # the conflicting paths, kept so the scheduler can check them once they are staged
+        db.set_meta(f"rebase:{cid}", json.dumps({**meta, "paths": conflicts}))
         db.set_meta(f"base:{cid}", tip)
     return contract_worktree(paths, db, owner, plan_id, cid), conflicts

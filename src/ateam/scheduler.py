@@ -34,6 +34,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
+from ateam.checkpoint import collect
 from ateam.contracts.select import drift
 from ateam.contracts.store import load_contracts
 from ateam.gitops import GitError, GitRepo, MergeConflict
@@ -664,6 +665,7 @@ class _Run:
         db = ctx.db
         rebase: list[str] | None = None   # the conflicting paths while this pipeline runs a rebase BUILD
         retest = False                    # a concluded rebase whose TEST or verify an interruption stopped
+        reentry = False                   # a rebase merge left open by a stopped pipeline: concluded here if resolved
         prompt: str | None = None
         if db.contract_status(cid) == "verified":
             o = self._merge(ctx, cid)
@@ -675,7 +677,7 @@ class _Run:
                 o = self._continue_rebase(ctx, cid)
             if isinstance(o, _Outcome):
                 return o
-            rebase = o
+            rebase, reentry = o, o is not None
             if rebase is None and json.loads(db.get_meta(f"rebase:{cid}") or "{}").get("window") == db.window_start(cid):
                 rebase, retest = [], True   # concluded in this window: TEST and verify it again, no BUILD (owner, 2026-10-27)
             elif rebase is None:   # concluded, and the owner resumed since: what failed after it gets an ordinary BUILD
@@ -693,6 +695,12 @@ class _Run:
                     return _Outcome(cid, "pause", "environment_failure",
                                     f"{cid}: the lane worktree has files left by an earlier contract ({', '.join(left)})",
                                     evidence={"paths": left})
+        if reentry:   # a BUILD resolved and staged the merge, then a stop or a crash came before the conclusion
+            why = self._conclude_rebase(ctx, cid, w)
+            if why is None:
+                retest = True   # concluded: TEST and verify it, no BUILD
+            else:
+                self.say(f"{cid} rebase merge not concluded ({why}); the rebase BUILD runs again")
         frozen = c.allocation.tier["build"]
         builds = self._counted_builds(db, cid)
         tier = builds[-1]["tier"] if builds and builds[-1]["tier"] in self.tiers else frozen
@@ -716,9 +724,12 @@ class _Run:
                 used += 1
                 launched = used
                 if rebase is not None and not self._merge_concluded(db, cid, w):
-                    return _Outcome(cid, "pause", "environment_failure", f"{cid} rebase BUILD did not conclude the merge (build "
-                                    + (r.get("outcome") or "failed") + (f": {r['error']}" if r.get("error") else "") + ")",
-                                    evidence=r, conflict=True)
+                    why = self._conclude_rebase(ctx, cid, w) if r.get("outcome") in ("completed", "scope_breach") else None
+                    if why is not None or not self._merge_concluded(db, cid, w):
+                        return _Outcome(cid, "pause", "environment_failure", f"{cid} rebase BUILD did not conclude the merge (build "
+                                        + (r.get("outcome") or "failed") + (f": {r['error']}" if r.get("error") else "") + ")"
+                                        + (f": {why}" if why else ""), evidence=r, conflict=True)
+                    r = {**r, "code": 0, "outcome": "completed"}   # as its attempt row now says
                 o = StepOutcome("build", int(r.get("code", 1)), r.get("outcome") or "failed", subtype=r.get("subtype"),
                                 refusal=r.get("refusal"))
                 d = decide(classify(o), used, allowed, tier, escalated, o.subtype)
@@ -907,6 +918,40 @@ class _Run:
         g = GitRepo(w.path)
         return not g.merge_in_progress() and g.is_ancestor(json.loads(db.get_meta(f"rebase:{cid}"))["tip"], "HEAD")
 
+    def _conclude_rebase(self, ctx, cid: str, w) -> str | None:
+        """Conclude the rebase merge a BUILD resolved and staged but left open: None when concluded, else the reason
+        naming the failed condition (rebase_conclusion_problem, or the git error of a commit a hook rejected, which
+        leaves the merge open). Only after the contract's latest BUILD attempt, newer than the rebase, ended completed
+        or scope_breach (the merge-staged files of other contracts breach scope until the commit); that attempt becomes
+        completed and gets a fresh checkpoint against the tip. A scheduler step under the exclusive lock the rebase
+        sites use: it commits only the contract's worktree, never the intent repo."""
+        with self.gate.exclusive(), self._refs:
+            db = ctx.db
+            meta = json.loads(db.get_meta(f"rebase:{cid}") or "{}")
+            tip, g = meta.get("tip"), GitRepo(w.path)
+            if not tip or g.merge_head() != tip:
+                return "no merge onto the recorded tip is open"
+            builds = db.attempts_for(cid, role="build")
+            build = builds[-1] if builds else None
+            if build is None or build["attempt_id"] <= meta["after"] or build.get("outcome") not in ("completed", "scope_breach"):
+                return "no completed BUILD attempt since the rebase began"
+            c = load_contracts(ctx.paths.contracts)[cid]
+            conflicted = meta["paths"] if "paths" in meta else g.unmerged_paths()   # meta written before 'paths' was
+            problem = rebase_conclusion_problem(g, tip, conflicted, [*c.paths, *c.incidental])
+            if problem is not None:
+                return problem
+            try:
+                head = g.commit_no_edit()
+            except GitError as e:
+                return f"git commit failed: {e}"
+            if build["outcome"] != "completed":
+                db.set_attempt_outcome(build["attempt_id"], "completed", None)
+            scratch = ctx.paths.scratch_root / cid   # the BUILD's scratch directory (runner.run.prepare_scratch)
+            cp = collect(g, scratch, tip, c, load_records(ctx.paths.records), build.get("session_id"), checks=[])
+            db.set_checkpoint(cid, build["attempt_id"], cp.to_dict())
+            self.say(f"{cid} rebase merge concluded at {head[:12]}")
+            return None
+
     def _refresh(self, ctx) -> None:
         rf = self._result_path("refresh", "contracts")
         r = self.child([*ateam_argv(), "contracts", "refresh", self.plan_id, "--result-file", str(rf), "--target", str(ctx.paths.root)], rf)
@@ -930,8 +975,36 @@ def _unmet(report: dict | None) -> str:
 def _rebase_prompt(contract, paths: list[str]) -> str:
     return (f"Resolve a merge conflict for contract {contract.id}: {contract.title}. The scheduler merged the plan's integration "
             f"branch into this worktree and left conflict markers in: {', '.join(paths) or '(none left; the merge is still open)'}. "
-            "Resolve them keeping the behaviour of both sides and this contract's intent, change nothing else, and conclude "
-            "the merge with git commit. Follow the brief in your system prompt and end with the structured report.")
+            "Resolve them keeping the behaviour of both sides and this contract's intent, and change nothing else. You must "
+            "then conclude the merge yourself: stage the resolved files and run `git commit` (git commit --no-edit keeps the "
+            "merge message). If the merge is still open when you finish, the plan pauses. Follow the brief in your system "
+            "prompt and end with the structured report.")
+
+
+def _marker_line(line: str) -> bool:
+    return line == "=======" or (line[:7] in ("<<<<<<<", "|||||||", ">>>>>>>") and line[7:8] in ("", " "))
+
+
+def rebase_conclusion_problem(g: GitRepo, tip: str, conflicted: list[str], globs: list[str]) -> str | None:
+    """Why an open rebase merge onto `tip` may not be concluded, or None. Measured on git, not on the porcelain scope
+    check (which counts the files the tip brought in): (a) no path is unmerged; (b) no tracked file among the merge's
+    `conflicted` paths holds a marker line; (c) `git diff --name-only <tip>` lies inside `globs` (the contract's paths
+    plus incidental); (d) nothing is unstaged or untracked. Entries staged cleanly from the tip are allowed."""
+    unmerged = g.unmerged_paths()
+    if unmerged:
+        return f"unmerged path {', '.join(unmerged)}"
+    tracked = set(g.run("ls-files", "-z", "--", *conflicted).split("\0")) if conflicted else set()
+    for rel in conflicted:
+        f = g.root / rel
+        if rel in tracked and f.is_file() and any(_marker_line(x) for x in f.read_text(errors="replace").splitlines()):
+            return f"marker in {rel}"
+    outside = [p for p in g.diff_names(tip) if not any(matches(x, p) for x in globs)]
+    if outside:
+        return f"{', '.join(outside)} outside the contract's paths"
+    loose = [p for xy, p in g.status_porcelain() if xy == "??" or xy[1] != " "]
+    if loose:
+        return f"unstaged or untracked {', '.join(loose)}"
+    return None
 
 
 def _retry_prompt(contract, why: str) -> str:

@@ -1330,3 +1330,224 @@ def test_exclusive_waits_for_writers_and_sessions_and_holds_back_new_ones():
     x_out.set()
     assert late_r.wait(2) and late_w.wait(2)
     late_r_out.set(); late_w_out.set()
+
+
+# ---- the scheduler concludes a resolved rebase merge the rebase BUILD left open (C-0093)
+
+def _conflict_and_other(p):
+    """Another merge lands one commit on ateam/P-0001 that conflicts in src/a/a.py and also adds docs/other.md, a file
+    outside C-0001's paths that the rebase merge brings in cleanly."""
+    def lands(fake, cid, role, worktree, n):
+        from ateam.integrate import integration_worktree
+        wt = GitRepo(integration_worktree(p.paths, "P-0001"))
+        (wt.root / "src/a").mkdir(parents=True, exist_ok=True); (wt.root / "src/a/a.py").write_text("A = 'someone else'\n")
+        (wt.root / "docs").mkdir(exist_ok=True); (wt.root / "docs/other.md").write_text("another contract's file\n")
+        wt.run("add", "-A"); wt.run("commit", "-q", "-m", "another merge")
+        fake.tips = getattr(fake, "tips", []) + [wt.head()]
+        return {}
+    return lands
+
+
+def _stages(extra=None, then=None):
+    """A rebase BUILD that resolves and stages every conflict but does not commit; `then` runs after staging."""
+    def stages(fake, cid, role, worktree, n):
+        g = GitRepo(worktree)
+        for rel in g.unmerged_paths():
+            (worktree / rel).write_text(f"# {rel} resolved by {cid}\n")
+            g.run("add", "--", rel)
+        if then:
+            then(fake, worktree)
+        return {"commit": False, **(extra or {})}
+    return stages
+
+
+def _attempts(p, cid, role="build"):
+    return _db(p).attempts_for(cid, role=role)
+
+
+def _rebase_meta(p, cid="C-0001"):
+    return json.loads(_db(p).get_meta(f"rebase:{cid}"))
+
+
+def _open_merge(target_repo):
+    """target_repo on main with an open merge of `other`: src/a/a.py conflicts, docs/other.md arrives cleanly."""
+    g = GitRepo(target_repo)
+    (target_repo / "src/a").mkdir(); (target_repo / "src/a/a.py").write_text("A = 'a'\n")
+    g.run("add", "-A"); g.run("commit", "-q", "-m", "a")
+    g.run("checkout", "-q", "-b", "other", "HEAD~1")
+    (target_repo / "src/a").mkdir(exist_ok=True); (target_repo / "src/a/a.py").write_text("A = 'someone else'\n")
+    (target_repo / "docs").mkdir(); (target_repo / "docs/other.md").write_text("x\n")
+    g.run("add", "-A"); g.run("commit", "-q", "-m", "other"); tip = g.head()
+    g.run("checkout", "-q", "main")
+    assert g.merge_keep_conflicts(tip) == ["src/a/a.py"]
+    return g, tip
+
+
+def _resolve(g, text="A = 'both'\n"):
+    (g.root / "src/a/a.py").write_text(text); g.run("add", "src/a/a.py")
+
+
+@pytest.mark.parametrize("case, expected", [
+    ("resolved", None),
+    ("unmerged", "unmerged path src/a/a.py"),
+    ("marker", "marker in src/a/a.py"),
+    ("outside", "src/app.py outside the contract's paths"),
+    ("unstaged", "unstaged or untracked src/a/a.py"),
+    ("untracked", "unstaged or untracked src/a/new.py"),
+])
+def test_rebase_conclusion_conditions_table(target_repo, case, expected):
+    from ateam.scheduler import rebase_conclusion_problem
+    g, tip = _open_merge(target_repo)
+    if case != "unmerged":
+        _resolve(g, "<<<<<<< HEAD\nA = 'a'\n=======\nA = 'someone else'\n>>>>>>> other\n" if case == "marker" else "A = 'both'\n")
+    if case == "outside":
+        (target_repo / "src/app.py").write_text("changed\n"); g.run("add", "src/app.py")
+    elif case == "unstaged":
+        (target_repo / "src/a/a.py").write_text("A = 'later'\n")
+    elif case == "untracked":
+        (target_repo / "src/a/new.py").write_text("x\n")
+    assert ("A ", "docs/other.md") in g.status_porcelain()   # staged from the tip, outside the paths: allowed
+    assert rebase_conclusion_problem(g, tip, ["src/a/a.py"], ["src/a/**", "tests/test_a.py"]) == expected
+
+
+def test_scheduler_concludes_resolved_rebase_merge(plan3, monkeypatch):
+    import inspect
+    from ateam.scheduler import _Run
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    held = []
+    real = GitRepo.commit_no_edit
+
+    def spy(self):
+        run_ = next(f.frame.f_locals["self"] for f in inspect.stack() if isinstance(f.frame.f_locals.get("self"), _Run))
+        held.append((run_.gate._writer, run_._refs.locked(), self.root))
+        return real(self)
+    monkeypatch.setattr(GitRepo, "commit_no_edit", spy)
+    fake = FakeWorkers({("C-0001", "build", 0): _conflict_and_other(plan3),
+                        ("C-0001", "build", 1): _stages({"code": 3, "outcome": "scope_breach"})})
+    s, out = _run(plan3, fake)
+    assert s.outcome == "merge_proposed", out
+    assert [c[1] for c in fake.calls if c[0] == "C-0001"] == ["build", "test", "build", "test"]
+    wt = GitRepo(fake.calls[0][4])
+    assert held == [(True, True, wt.root)]
+    tip = fake.tips[0]
+    assert _rebase_meta(plan3)["tip"] == tip and wt.is_ancestor(tip, "HEAD") and not wt.merge_in_progress()
+    latest = _attempts(plan3, "C-0001")[-1]
+    assert latest["attempt_id"] > _rebase_meta(plan3)["after"] and latest["outcome"] == "completed"
+    assert load_contracts(plan3.paths.contracts)["C-0001"].status == "integrated"
+
+
+def test_concluded_rebase_records_fresh_checkpoint(plan3):
+    from ateam.brief import _prior
+    from ateam.checkpoint import Checkpoint
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    seen = {}
+
+    def test_sees(fake, cid, role, worktree, n):
+        with StateDB(home_dir(plan3.root) / "state.db") as db:
+            raw = db.latest_checkpoint(cid)   # what TEST's brief is built from (runner.run, role test)
+            seen["build"] = db.latest_checkpoint(cid, role="build")
+        seen["cp"], seen["head"] = Checkpoint.from_dict(raw), GitRepo(worktree).head()
+        return {}
+    fake = FakeWorkers({("C-0001", "build", 0): _conflict_and_other(plan3), ("C-0001", "build", 1): _stages(),
+                        ("C-0001", "test", 1): test_sees})
+    s, out = _run(plan3, fake)
+    assert s.outcome == "merge_proposed", out
+    cp, tip = seen["cp"], fake.tips[0]
+    assert seen["build"] == cp.to_dict() and cp.base == tip and cp.head == seen["head"] and cp.dirty == []
+    assert "docs/other.md" not in cp.diff_names and "src/a/a.py" in cp.diff_names
+    prior = _prior(cp)
+    assert f"Current HEAD: {seen['head']}" in prior and "Uncommitted paths" not in prior and "docs/other.md" not in prior
+
+
+def _stop_after(stop):
+    def then(fake, worktree):
+        stop.set()   # the stop arrives after the BUILD staged everything and before the scheduler concludes
+    return then
+
+
+@pytest.mark.parametrize("resolved", [True, False], ids=["concludes", "builds-again"])
+def test_rebase_conclusion_on_reentry_after_crash(plan3, resolved):
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    stop = threading.Event()
+
+    def unstaged(fake, worktree):
+        (worktree / "src/a/a.py").write_text("# changed after staging\n")
+        stop.set()
+    fake = FakeWorkers({("C-0001", "build", 0): _conflict_and_other(plan3),
+                        ("C-0001", "build", 1): _stages({"code": 3, "outcome": "scope_breach"},
+                                                        then=_stop_after(stop) if resolved else unstaged)})
+    s, out = _run(plan3, fake, stop=stop)
+    wt = GitRepo(fake.calls[0][4])
+    assert s.outcome == "interrupted" and _db(plan3).contract_status("C-0001") == "building", out
+    assert wt.merge_in_progress() and _attempts(plan3, "C-0001")[-1]["outcome"] == "scope_breach"
+    fake = FakeWorkers()
+    s, out = _run(plan3, fake)
+    if resolved:
+        assert s.outcome == "merge_proposed", out
+        assert [c[1] for c in fake.calls if c[0] == "C-0001"] == ["test"]
+        assert _attempts(plan3, "C-0001")[-1]["outcome"] == "completed"
+    else:   # not concluded: the rebase BUILD path as today, here with no attempt left until the owner resumes
+        assert any("rebase merge not concluded (unstaged or untracked src/a/a.py)" in m for m in out), out
+        assert s.outcome == "paused" and _db(plan3).open_pause("P-0001")["reason"] == "budget_exhausted", out
+        assert fake.calls == [] and wt.merge_in_progress()
+        assert run("resume", "P-0001", "--no-run", "--target", str(plan3.root)).exit_code == 0
+        fake = FakeWorkers()
+        s, out = _run(plan3, fake)
+        assert s.outcome == "merge_proposed", out
+        assert [c[1] for c in fake.calls if c[0] == "C-0001"] == ["build", "test"]
+        assert "merge conflict" in _builds(fake, "C-0001")[0][3]
+    assert wt.is_ancestor(_rebase_meta(plan3)["tip"], "HEAD") and not wt.merge_in_progress()
+
+
+def _pause_detail(p):
+    pause = _db(p).open_pause("P-0001")
+    assert pause["conflict"] is True and pause["reason"] == "environment_failure"
+    return pause["contracts"][0]["detail"]
+
+
+@pytest.mark.parametrize("case, expected", [
+    ("unmerged", "unmerged path src/a/a.py"),
+    ("marker", "marker in src/a/a.py"),
+    ("outside", "src/c/c.py outside the contract's paths"),
+    ("untracked", "unstaged or untracked src/a/new.py"),
+    ("hook", "rejected by the hook"),
+    ("tamper", "build tamper"),
+    ("interrupted", None),
+])
+def test_rebase_merge_not_concluded_names_condition(plan3, case, expected):
+    _set_config(plan3.paths, checks=[NamedCheck(name="unit", cmd="true")], max_workers=1)
+    stop = threading.Event()
+
+    def then(fake, worktree):
+        g = GitRepo(worktree)
+        if case == "marker":
+            (worktree / "src/a/a.py").write_text("<<<<<<< HEAD\nA = 1\n=======\nA = 2\n>>>>>>> tip\n"); g.run("add", "src/a/a.py")
+        elif case == "outside":
+            (worktree / "src/c").mkdir(exist_ok=True); (worktree / "src/c/c.py").write_text("x\n"); g.run("add", "src/c/c.py")
+        elif case == "untracked":
+            (worktree / "src/a/new.py").write_text("x\n")
+        elif case == "hook":
+            hooks = worktree.parent / "hooks"   # outside the worktree, so the porcelain stays clean
+            hooks.mkdir(exist_ok=True); (hooks / "pre-commit").write_text("#!/bin/sh\necho rejected by the hook >&2\nexit 1\n")
+            (hooks / "pre-commit").chmod(0o755)
+            g.run("config", "core.hooksPath", str(hooks))
+    rebase_build = {"unmerged": {"commit": False},
+                    "tamper": _stages({"code": 1, "outcome": "tamper"}),
+                    "interrupted": _stages({"code": 130, "outcome": "interrupted"}, then=lambda fake, wt: stop.set())}.get(case, _stages(then=then))
+    fake = FakeWorkers({("C-0001", "build", 0): _conflict_and_other(plan3), ("C-0001", "build", 1): rebase_build})
+    s, out = _run(plan3, fake, stop=stop)
+    wt = GitRepo(fake.calls[0][4])
+    assert wt.merge_in_progress() and [c[1] for c in fake.calls if c[0] == "C-0001"] == ["build", "test", "build"]
+    if case == "interrupted":
+        assert s.outcome == "interrupted", out
+        return
+    assert s.outcome == "paused", out
+    detail = _pause_detail(plan3)
+    assert detail.startswith("C-0001 rebase BUILD did not conclude the merge") and expected in detail, detail
+
+
+def test_rebase_prompt_requires_commit():
+    from ateam.scheduler import _rebase_prompt
+    prompt = _rebase_prompt(SimpleNamespace(id="C-9", title="t"), ["f.txt"])
+    assert "git commit" in prompt and "conclude the merge" in prompt
+    assert "pauses" in prompt and "plan" in prompt

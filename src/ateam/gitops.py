@@ -118,6 +118,16 @@ class GitRepo:
         r = subprocess.run(["git", "rev-parse", "--verify", "--quiet", "MERGE_HEAD"], cwd=self.root, capture_output=True, text=True)
         return r.stdout.strip() if r.returncode == 0 else None
 
+    def unmerged_paths(self) -> list[str]:
+        """The paths an open merge left unmerged; [] once they are staged, or when no merge is open."""
+        return [p for p in self.run("diff", "--name-only", "--diff-filter=U").splitlines() if p]
+
+    def commit_no_edit(self) -> str:
+        """Commit what is staged with git's prepared message (concluding an open merge) and return the new HEAD.
+        Hooks run; a hook that rejects the commit raises GitError and leaves the merge open."""
+        self.run("commit", "--no-edit")
+        return self.head()
+
     def merge_keep_conflicts(self, rev: str) -> list[str]:
         """Start merging `rev` without committing and leave the merge in progress, conflict markers and all; return
         the conflicting paths ([] when it merged cleanly). Rerere is off, so a clone's settings cannot change the
@@ -125,7 +135,7 @@ class GitRepo:
         try:
             self.run("-c", "rerere.enabled=false", "merge", "--no-ff", "--no-commit", rev)
         except GitError:
-            paths = [p for p in self.run("diff", "--name-only", "--diff-filter=U").splitlines() if p] if self.merge_in_progress() else []
+            paths = self.unmerged_paths() if self.merge_in_progress() else []
             if paths:
                 return paths
             if self.merge_in_progress():
@@ -141,7 +151,7 @@ class GitRepo:
         except GitError as e:
             if not self.merge_in_progress():
                 raise
-            paths = [p for p in self.run("diff", "--name-only", "--diff-filter=U").splitlines() if p]
+            paths = self.unmerged_paths()
             self.run("merge", "--abort")
             if paths:
                 raise MergeConflict(paths, f"merging {rev} conflicts in {', '.join(paths)}") from e
